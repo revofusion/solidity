@@ -23,6 +23,7 @@
 
 #include <libsolidity/interface/StandardCompiler.h>
 #include <libsolidity/interface/ImportRemapper.h>
+#include <libsolidity/interface/SolCoreExporter.h>
 
 #include <libsolidity/ast/ASTJsonExporter.h>
 #include <libyul/YulStack.h>
@@ -1595,6 +1596,16 @@ Json StandardCompiler::compileSolidity(StandardCompiler::InputsAndSettings _inpu
 			contractData["storageLayout"] = compilerStack.storageLayout(contractName);
 		if (isArtifactRequested(_inputsAndSettings.outputSelection, file, name, "transientStorageLayout", false))
 			contractData["transientStorageLayout"] = compilerStack.transientStorageLayout(contractName);
+		if (
+			isArtifactRequested(_inputsAndSettings.outputSelection, file, name, std::vector<std::string>{"solcore", "solcoreOrigins"}, false)
+		)
+		{
+			auto solcoreArtifacts = solcore::exportContract(compilerStack, contractName);
+			if (isArtifactRequested(_inputsAndSettings.outputSelection, file, name, "solcore", false))
+				contractData["solcore"] = std::move(solcoreArtifacts.solcore);
+			if (isArtifactRequested(_inputsAndSettings.outputSelection, file, name, "solcoreOrigins", false))
+				contractData["solcoreOrigins"] = std::move(solcoreArtifacts.origins);
+		}
 		if (isArtifactRequested(_inputsAndSettings.outputSelection, file, name, "metadata", wildcardMatchesExperimental))
 			contractData["metadata"] = compilerStack.metadata(contractName);
 		if (isArtifactRequested(_inputsAndSettings.outputSelection, file, name, "userdoc", wildcardMatchesExperimental))

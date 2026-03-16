@@ -1878,6 +1878,110 @@ BOOST_AUTO_TEST_CASE(dependency_tracking_of_abstract_contract_yul)
 	BOOST_REQUIRE(result["sources"].size() == 1);
 }
 
+BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
+{
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore", "solcoreOrigins"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.0;
+				contract C {
+					mapping(address => uint256) balances;
+					uint256 total;
+
+					function credit(address to, uint256 amount) external {
+						balances[to] += amount;
+						total += amount;
+					}
+
+					function sameBalance(address a, address b) external view returns (bool) {
+						return balances[a] == balances[b];
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "C");
+	BOOST_REQUIRE(contractResult.is_object());
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	BOOST_REQUIRE(contractResult["solcoreOrigins"].is_object());
+
+	Json const& solcore = contractResult["solcore"];
+	BOOST_CHECK_EQUAL(solcore["schemaVersion"].get<std::string>(), "0.1.0");
+	BOOST_CHECK_EQUAL(solcore["compilerVersion"].get<std::string>(), VersionString);
+	BOOST_CHECK_EQUAL(solcore["crate_name"].get<std::string>(), "C");
+	BOOST_CHECK_EQUAL(solcore["exporterFamily"].get<std::string>(), "solcore-solidity-0.8");
+	BOOST_REQUIRE(solcore["type_decls"].is_array());
+	BOOST_REQUIRE(solcore["functions"].is_array());
+	BOOST_REQUIRE(solcore["functions"].size() == 2);
+
+	Json const& storageDecl = solcore["type_decls"][0];
+	BOOST_CHECK_EQUAL(storageDecl["name"].get<std::string>(), "Storage");
+	BOOST_REQUIRE(storageDecl["fields"].is_array());
+	BOOST_REQUIRE(storageDecl["fields"].size() == 2);
+	BOOST_CHECK_EQUAL(storageDecl["fields"][0]["name"].get<std::string>(), "balances");
+	BOOST_CHECK_EQUAL(storageDecl["fields"][1]["name"].get<std::string>(), "total");
+
+	Json const& credit = solcore["functions"][0];
+	BOOST_CHECK_EQUAL(credit["name"].get<std::string>(), "credit");
+	BOOST_CHECK_EQUAL(credit["return"].get<std::string>(), "unit");
+	BOOST_REQUIRE(credit["body"]["kind"] == "block");
+	BOOST_REQUIRE(credit["body"]["statements"].is_array());
+	BOOST_REQUIRE(credit["body"]["statements"].size() == 3);
+	BOOST_CHECK_EQUAL(credit["body"]["statements"][0]["kind"].get<std::string>(), "storage_map_set");
+	BOOST_CHECK_EQUAL(credit["body"]["statements"][1]["kind"].get<std::string>(), "storage_set");
+	BOOST_CHECK_EQUAL(credit["body"]["statements"][2]["kind"].get<std::string>(), "return");
+
+	Json const& sameBalance = solcore["functions"][1];
+	BOOST_CHECK_EQUAL(sameBalance["name"].get<std::string>(), "sameBalance");
+	BOOST_CHECK_EQUAL(sameBalance["return"].get<std::string>(), "bool");
+	BOOST_CHECK_EQUAL(sameBalance["body"]["statements"][0]["kind"].get<std::string>(), "return");
+	BOOST_CHECK_EQUAL(
+		sameBalance["body"]["statements"][0]["value"]["kind"].get<std::string>(),
+		"u256_eq"
+	);
+
+	Json const& origins = contractResult["solcoreOrigins"];
+	BOOST_CHECK_EQUAL(origins["schemaVersion"].get<std::string>(), "0.1.0");
+	BOOST_REQUIRE(origins["entries"].is_array());
+	BOOST_REQUIRE(origins["entries"].size() == 4);
+	BOOST_CHECK_EQUAL(origins["entries"][0]["originId"].get<std::string>(), "state:balances");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_is_version_tagged_when_unsupported)
+{
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.0;
+				contract C {
+					function unsupported(bool cond) external pure returns (bool) {
+						return cond && cond;
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "C");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	BOOST_CHECK(contractResult["solcore"]["unsupported"].get<bool>());
+	BOOST_CHECK_EQUAL(contractResult["solcore"]["compilerVersion"].get<std::string>(), VersionString);
+	BOOST_CHECK_EQUAL(contractResult["solcore"]["exporterFamily"].get<std::string>(), "solcore-solidity-0.8");
+}
+
 BOOST_AUTO_TEST_CASE(source_location_of_bare_block)
 {
 	char const* input = R"(
