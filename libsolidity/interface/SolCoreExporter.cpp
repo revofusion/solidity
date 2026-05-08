@@ -44,6 +44,169 @@ struct UnsupportedSolCore: std::runtime_error
 	using std::runtime_error::runtime_error;
 };
 
+// --- Namespaced storage (ERC-7201) support ---
+//
+// A namespaced storage getter is a function like:
+//   function _getTokenStorage() private pure returns (TokenStorage storage $) {
+//       assembly { $.slot := TOKEN_STORAGE_LOCATION }
+//   }
+//
+// We detect these, flatten the struct fields into the main Storage type,
+// and rewrite accesses through the storage pointer ($) into direct
+// storage_get / storage_set / storage_map_get / storage_map_set operations.
+
+/// Information about a detected namespaced storage getter.
+struct NamespacedStorageGetter
+{
+	FunctionDefinition const* function;        ///< The getter function AST node
+	StructDefinition const* structDef;         ///< The struct type it returns
+	std::string prefix;                        ///< Field name prefix (e.g. "token_")
+	std::string fieldName;                     ///< Synthetic Storage field (e.g. "token")
+};
+
+/// Thread-local map: local variable name → field prefix for namespaced storage aliases.
+/// Populated when we encounter `TokenStorage storage $ = _getTokenStorage();`
+/// and consulted when we encounter `$.field` or `$.mapping[key]`.
+static thread_local std::map<std::string, std::string> namespacedStorageAliases;
+
+/// Thread-local map from namespaced getter definitions to their field prefix,
+/// so we can resolve overloaded getters precisely during export.
+static thread_local std::map<FunctionDefinition const*, std::string> namespacedGetterPrefixes;
+
+/// Thread-local set of struct member names that are mappings, keyed by
+/// prefixed field name → true if the field is a mapping type.
+static thread_local std::set<std::string> namespacedMappingFields;
+static thread_local std::map<FunctionDefinition const*, std::string> exportedFunctionNames;
+static thread_local CompilerStack const* activeCompilerStack = nullptr;
+
+/// Derive a field prefix from a struct name.
+/// "TokenStorage" → "token_", "MyDataStorage" → "myData_"
+std::string derivePrefix(std::string const& _structName)
+{
+	std::string base = _structName;
+	// Strip "Storage" suffix if present
+	if (base.size() > 7 && base.substr(base.size() - 7) == "Storage")
+		base = base.substr(0, base.size() - 7);
+	// Lowercase the first character
+	if (!base.empty())
+		base[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(base[0])));
+	return base + "_";
+}
+
+std::string deriveSubStorageFieldName(std::string const& _structName)
+{
+	std::string base = _structName;
+	if (base.size() > 7 && base.substr(base.size() - 7) == "Storage")
+		base = base.substr(0, base.size() - 7);
+	for (char& ch: base)
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	return base;
+}
+
+std::string const* namespacedGetterPrefix(Identifier const& _callee)
+{
+	auto const* funcDef =
+		dynamic_cast<FunctionDefinition const*>(_callee.annotation().referencedDeclaration);
+	if (!funcDef)
+		return nullptr;
+	auto it = namespacedGetterPrefixes.find(funcDef);
+	if (it == namespacedGetterPrefixes.end())
+		return nullptr;
+	return &it->second;
+}
+
+/// Check if a function is a namespaced storage getter.
+/// Criteria:
+///   1. Returns exactly one parameter with Location::Storage
+///   2. Return type references a struct
+///   3. Body is a single inline assembly block or storage-slot local plus inline assembly
+bool isNamespacedStorageGetter(
+	FunctionDefinition const& _function,
+	StructDefinition const** _outStructDef)
+{
+	// Must be an ordinary function (not constructor, receive, or fallback).
+	// Checking this first avoids calling visibility() on a constructor,
+	// which triggers solAssert(!isConstructor()) inside defaultVisibility().
+	if (!_function.isOrdinary())
+		return false;
+
+	// Must be private or internal
+	if (_function.visibility() == Visibility::Public || _function.visibility() == Visibility::External)
+		return false;
+
+	// Must return exactly one parameter with storage location
+	if (_function.returnParameters().size() != 1)
+		return false;
+	auto const& retParam = *_function.returnParameters().front();
+	if (retParam.referenceLocation() != VariableDeclaration::Location::Storage)
+		return false;
+
+	// Return type must reference a struct
+	if (auto const* userDefined = dynamic_cast<UserDefinedTypeName const*>(&retParam.typeName()))
+	{
+		Declaration const* referencedDecl = userDefined->pathNode().annotation().referencedDeclaration;
+		if (auto const* structDef = dynamic_cast<StructDefinition const*>(referencedDecl))
+		{
+			*_outStructDef = structDef;
+		}
+		else
+			return false;
+	}
+	else
+		return false;
+
+	// Body should contain an inline assembly block that sets $.slot.
+	// Pattern 1 (direct): { assembly { $.slot := CONSTANT } }
+	// Pattern 2 (indirect): { bytes32 slot = fn(); assembly { $.slot := slot } }
+	if (!_function.isImplemented())
+		return false;
+
+	Block const& body = _function.body();
+	size_t stmtCount = body.statements().size();
+
+	if (stmtCount == 1)
+	{
+		// Pattern 1: single inline assembly block
+		if (!dynamic_cast<InlineAssembly const*>(body.statements().front().get()))
+			return false;
+	}
+	else if (stmtCount == 2)
+	{
+		// Pattern 2: variable declaration followed by inline assembly
+		if (!dynamic_cast<VariableDeclarationStatement const*>(body.statements()[0].get()))
+			return false;
+		if (!dynamic_cast<InlineAssembly const*>(body.statements()[1].get()))
+			return false;
+	}
+	else
+		return false;
+
+	return true;
+}
+
+/// RAII helper to set up and tear down namespaced storage aliases for a function scope.
+struct NamespacedStorageScope
+{
+	std::map<std::string, std::string> savedAliases;
+	std::map<FunctionDefinition const*, std::string> savedPrefixes;
+	std::set<std::string> savedMappingFields;
+
+	NamespacedStorageScope()
+	{
+		savedAliases = namespacedStorageAliases;
+		savedPrefixes = namespacedGetterPrefixes;
+		savedMappingFields = namespacedMappingFields;
+	}
+	~NamespacedStorageScope()
+	{
+		namespacedStorageAliases = savedAliases;
+		namespacedGetterPrefixes = savedPrefixes;
+		namespacedMappingFields = savedMappingFields;
+	}
+};
+
+// --- End namespaced storage infrastructure ---
+
 Json exporterMetadata(std::string const& _contractName)
 {
 	Json metadata = Json::object();
@@ -65,13 +228,13 @@ Json featureFlags()
 	Json flags = Json::object();
 	flags["arrays"] = true;
 	flags["events"] = true;
-	flags["constructors"] = false;
+	flags["constructors"] = true;
 	flags["externalCalls"] = true;
 	flags["multipleReturns"] = false;
 	flags["structs"] = false;
 	flags["enums"] = false;
 	flags["inheritance"] = false;
-	flags["modifiers"] = false;
+	flags["modifiers"] = true;
 	flags["inlineAssembly"] = true;
 	flags["fixedBytes"] = true;
 	flags["smallUints"] = true;
@@ -106,6 +269,476 @@ Json jsonStringArray(std::vector<std::string> const& _values)
 	for (auto const& value: _values)
 		result.emplace_back(value);
 	return result;
+}
+
+std::string exportedContractId(ContractDefinition const& _contract)
+{
+	return _contract.fullyQualifiedName();
+}
+
+std::optional<Json> exportSimpleType(Type const& _type)
+{
+	switch (_type.category())
+	{
+	case Type::Category::Address:
+	case Type::Category::Contract:
+		return Json("address");
+	case Type::Category::Bool:
+		return Json("bool");
+	case Type::Category::Integer:
+	case Type::Category::FixedBytes:
+		return Json("u256");
+	default:
+		return std::nullopt;
+	}
+}
+
+std::optional<Json> exportStorageLayoutLeafType(Json const& _types, std::string const& _typeId)
+{
+	if (!_types.contains(_typeId))
+		return std::nullopt;
+	Json const& typeInfo = _types.at(_typeId);
+	std::string const label = typeInfo.value("label", "");
+	if (label == "address")
+		return Json("address");
+	if (label == "bool")
+		return Json("bool");
+	if (
+		label == "uint256" ||
+		label == "int256" ||
+		(label.size() > 4 && (label.substr(0, 4) == "uint" || label.substr(0, 3) == "int")) ||
+		(label.size() > 5 && label.substr(0, 5) == "bytes")
+	)
+		return Json("u256");
+	return std::nullopt;
+}
+
+bool exportStorageLayoutType(
+	Json const& _types,
+	std::string const& _typeId,
+	Json& _valueType,
+	Json& _keys
+)
+{
+	if (!_types.contains(_typeId))
+		return false;
+	Json const& typeInfo = _types.at(_typeId);
+	if (typeInfo.value("encoding", "") == "mapping")
+	{
+		std::string const keyId = typeInfo.value("key", "");
+		std::string const valueId = typeInfo.value("value", "");
+		auto keyType = exportStorageLayoutLeafType(_types, keyId);
+		if (!keyType.has_value())
+			return false;
+		_keys.emplace_back(*keyType);
+		return exportStorageLayoutType(_types, valueId, _valueType, _keys);
+	}
+	auto valueType = exportStorageLayoutLeafType(_types, _typeId);
+	if (!valueType.has_value())
+		return false;
+	_valueType = *valueType;
+	return true;
+}
+
+std::string externalMutabilityString(StateMutability _mutability)
+{
+	return _mutability <= StateMutability::View ? "view" : "stateful";
+}
+
+std::optional<std::string> lookupStorageSlot(
+	CompilerStack const& _compilerStack,
+	ContractDefinition const& _contract,
+	std::string const& _fieldName
+)
+{
+	try
+	{
+		Json const& layout = _compilerStack.storageLayout(_contract.fullyQualifiedName());
+		for (auto const& entry: layout.at("storage"))
+			if (entry.value("label", "") == _fieldName)
+				return entry.value("slot", "0");
+	}
+	catch (...)
+	{
+	}
+	return std::nullopt;
+}
+
+std::optional<int> functionParameterIndex(
+	FunctionDefinition const& _function,
+	Declaration const* _declaration
+)
+{
+	if (!_declaration)
+		return std::nullopt;
+	for (size_t i = 0; i < _function.parameters().size(); ++i)
+		if (_function.parameters()[i].get() == _declaration)
+			return static_cast<int>(i);
+	return std::nullopt;
+}
+
+bool collectStorageGetterAccess(
+	Expression const& _expr,
+	FunctionDefinition const& _function,
+	VariableDeclaration const*& _stateVar,
+	std::vector<int>& _keyArgOrder
+)
+{
+	if (auto const* identifier = dynamic_cast<Identifier const*>(&_expr))
+	{
+		auto const* variable =
+			dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
+		if (variable && variable->isStateVariable())
+		{
+			_stateVar = variable;
+			return true;
+		}
+		return false;
+	}
+	if (auto const* indexAccess = dynamic_cast<IndexAccess const*>(&_expr))
+	{
+		if (!indexAccess->indexExpression())
+			return false;
+		if (!collectStorageGetterAccess(
+				indexAccess->baseExpression(),
+				_function,
+				_stateVar,
+				_keyArgOrder
+			))
+			return false;
+		auto const* keyIdentifier =
+			dynamic_cast<Identifier const*>(indexAccess->indexExpression());
+		if (!keyIdentifier)
+			return false;
+		auto paramIndex = functionParameterIndex(
+			_function,
+			keyIdentifier->annotation().referencedDeclaration
+		);
+		if (!paramIndex.has_value())
+			return false;
+		_keyArgOrder.emplace_back(*paramIndex);
+		return true;
+	}
+	return false;
+}
+
+std::optional<Json> exportStorageGetterResolution(
+	CompilerStack const& _compilerStack,
+	ContractDefinition const& _contract,
+	VariableDeclaration const& _stateVariable,
+	std::vector<int> const& _keyArgOrder
+)
+{
+	if (!_stateVariable.isStateVariable())
+		return std::nullopt;
+	auto slot = lookupStorageSlot(_compilerStack, _contract, _stateVariable.name());
+	if (!slot.has_value())
+		return std::nullopt;
+	Type const* currentType = _stateVariable.annotation().type;
+	if (!currentType)
+		currentType = _stateVariable.type();
+	if (!currentType)
+		return std::nullopt;
+	for (size_t i = 0; i < _keyArgOrder.size(); ++i)
+	{
+		auto const* mappingType = dynamic_cast<MappingType const*>(currentType);
+		if (!mappingType)
+			return std::nullopt;
+		currentType = mappingType->valueType();
+	}
+	if (currentType->category() == Type::Category::Mapping)
+		return std::nullopt;
+	auto returnType = exportSimpleType(*currentType);
+	if (!returnType.has_value())
+		return std::nullopt;
+
+	Json resolution = Json::object();
+	resolution["kind"] = "storage_getter";
+	resolution["field"] = _stateVariable.name();
+	resolution["slot"] = *slot;
+	Json keyArgOrder = Json::array();
+	for (int index: _keyArgOrder)
+		keyArgOrder.emplace_back(index);
+	resolution["keyArgOrder"] = std::move(keyArgOrder);
+	resolution["returnType"] = *returnType;
+	return resolution;
+}
+
+std::optional<Json> exportStorageGetterResolution(
+	CompilerStack const& _compilerStack,
+	ContractDefinition const& _contract,
+	FunctionDefinition const& _function
+)
+{
+	if (!_function.isImplemented())
+		return std::nullopt;
+	if (_function.body().statements().size() != 1)
+		return std::nullopt;
+	auto const* returnStmt =
+		dynamic_cast<Return const*>(_function.body().statements().front().get());
+	if (!returnStmt || !returnStmt->expression())
+		return std::nullopt;
+	VariableDeclaration const* stateVar = nullptr;
+	std::vector<int> keyArgOrder;
+	if (!collectStorageGetterAccess(
+			*returnStmt->expression(),
+			_function,
+			stateVar,
+			keyArgOrder
+		))
+		return std::nullopt;
+	if (!stateVar)
+		return std::nullopt;
+	return exportStorageGetterResolution(
+		_compilerStack,
+		_contract,
+		*stateVar,
+		keyArgOrder
+	);
+}
+
+Json exportForeignMethodSummary(FunctionTypePointer const& _funType)
+{
+	Json method = Json::object();
+	method["name"] = _funType->declaration().name();
+	method["signature"] = _funType->externalSignature();
+	method["selector"] = _funType->externalIdentifierHex();
+	method["mutability"] = externalMutabilityString(_funType->stateMutability());
+	TypePointers const& returns = _funType->returnParameterTypes();
+	if (returns.size() == 1)
+	{
+		if (auto returnType = exportSimpleType(*returns.front()))
+			method["return"] = *returnType;
+	}
+	else if (returns.size() > 1)
+	{
+		// Multi-return: export as a tuple type
+		Json elements = Json::array();
+		bool allResolved = true;
+		for (auto const& ret : returns)
+		{
+			if (auto retType = exportSimpleType(*ret))
+				elements.emplace_back(*retType);
+			else
+			{
+				// Fall back to u256 for unsupported types
+				elements.emplace_back(Json("u256"));
+			}
+		}
+		if (allResolved)
+		{
+			Json tupleType = Json::object();
+			tupleType["kind"] = "tuple";
+			tupleType["elements"] = elements;
+			method["return"] = tupleType;
+		}
+	}
+	return method;
+}
+
+Json exportRevertPayload(FunctionCall const& _call);
+
+Json exportDispatchEntry(FunctionTypePointer const& _funType, FunctionDefinition const* _functionDef = nullptr)
+{
+	Json entry = Json::object();
+	entry["function"] = _funType->declaration().name();
+	entry["signature"] = _funType->externalSignature();
+	entry["selector"] = _funType->externalIdentifierHex();
+	if (_functionDef && _functionDef->isImplemented())
+	{
+		struct RevertPayloadCollector: ASTConstVisitor
+		{
+			std::vector<Json> payloads;
+			std::set<std::string> seen;
+
+			void pushPayload(Json _payload)
+			{
+				std::string key = _payload.dump();
+				if (seen.insert(key).second)
+					payloads.emplace_back(std::move(_payload));
+			}
+
+			bool visit(FunctionCall const& _call) override
+			{
+				Declaration const* calleeDecl = nullptr;
+				if (auto const* callee = dynamic_cast<Identifier const*>(&_call.expression()))
+					calleeDecl = callee->annotation().referencedDeclaration;
+				else if (auto const* callee = dynamic_cast<MemberAccess const*>(&_call.expression()))
+					calleeDecl = callee->annotation().referencedDeclaration;
+				if (auto const* callee = dynamic_cast<Identifier const*>(&_call.expression()))
+				{
+					if (callee->name() == "require" || callee->name() == "revert")
+						pushPayload(exportRevertPayload(_call));
+					else if (callee->name() == "assert")
+						pushPayload(Json::object());
+				}
+				if (dynamic_cast<ErrorDefinition const*>(calleeDecl))
+					pushPayload(exportRevertPayload(_call));
+				return true;
+			}
+
+			bool visit(RevertStatement const& _stmt) override
+			{
+				pushPayload(exportRevertPayload(_stmt.errorCall()));
+				return true;
+			}
+		};
+
+		RevertPayloadCollector collector;
+		_functionDef->body().accept(collector);
+		if (!collector.payloads.empty())
+		{
+			entry["revertPayloads"] = Json::array();
+			for (auto& payload: collector.payloads)
+				entry["revertPayloads"].emplace_back(std::move(payload));
+		}
+	}
+	return entry;
+}
+
+Json exportForeignContractSummary(CompilerStack const& _compilerStack, std::string const& _contractName)
+{
+	ContractDefinition const& contract = _compilerStack.contractDefinition(_contractName);
+	Json summary = Json::object();
+	summary["id"] = exportedContractId(contract);
+	summary["name"] = contract.name();
+	try
+	{
+		summary["deployedCodeSize"] =
+			std::to_string(_compilerStack.runtimeObject(_contractName).bytecode.size());
+	}
+	catch (...)
+	{
+	}
+
+	Json storage = Json::array();
+	try
+	{
+		Json const& layout = _compilerStack.storageLayout(_contractName);
+		Json const& types = layout.at("types");
+		for (auto const& entry: layout.at("storage"))
+		{
+			Json field = Json::object();
+			field["name"] = entry.value("label", "");
+			field["slot"] = entry.value("slot", "0");
+			Json valueType = Json();
+			Json keys = Json::array();
+			if (exportStorageLayoutType(types, entry.value("type", ""), valueType, keys))
+			{
+				field["valueType"] = valueType;
+				field["keys"] = keys;
+				storage.emplace_back(std::move(field));
+			}
+		}
+	}
+	catch (...)
+	{
+	}
+	summary["storage_layout"] = storage;
+	summary["storage"] = storage;
+
+	Json methods = Json::array();
+	Json dispatchEntries = Json::array();
+	try
+	{
+		for (auto const& [selector, functionType]: contract.interfaceFunctions())
+		{
+			(void)selector;
+			if (!functionType)
+				continue;
+			methods.emplace_back(exportForeignMethodSummary(functionType));
+			dispatchEntries.emplace_back(
+				exportDispatchEntry(
+					functionType,
+					dynamic_cast<FunctionDefinition const*>(&functionType->declaration())
+				)
+			);
+		}
+	}
+	catch (...)
+	{
+	}
+	summary["methods"] = methods;
+	summary["dispatch_entries"] = dispatchEntries;
+	return summary;
+}
+
+std::optional<Json> exportKnownExternalTarget(
+	CompilerStack const& _compilerStack,
+	MemberAccess const& _memberAccess
+)
+{
+	Type const* baseType = _memberAccess.expression().annotation().type;
+	if (!baseType || baseType->category() != Type::Category::Contract)
+		return std::nullopt;
+	auto const* contractType = dynamic_cast<ContractType const*>(baseType);
+	if (!contractType)
+		return std::nullopt;
+
+	Json target = Json::object();
+	ContractDefinition const& contract = contractType->contractDefinition();
+	target["contractId"] = exportedContractId(contract);
+	target["function"] = _memberAccess.memberName();
+	target["resolutionKind"] = "cross_contract";
+
+	if (auto const* functionType = dynamic_cast<FunctionType const*>(_memberAccess.annotation().type))
+	{
+		target["signature"] = functionType->externalSignature();
+		target["selector"] = functionType->externalIdentifierHex();
+		target["mutability"] = externalMutabilityString(functionType->stateMutability());
+	}
+	if (auto const* variableDef =
+			dynamic_cast<VariableDeclaration const*>(_memberAccess.annotation().referencedDeclaration))
+	{
+		target["selector"] = variableDef->externalIdentifierHex();
+		if (auto resolution =
+				exportStorageGetterResolution(_compilerStack, contract, *variableDef, {}))
+		{
+			target["resolutionKind"] = "storage_getter";
+			target["resolution"] = *resolution;
+		}
+	}
+	else if (auto const* functionDef =
+				dynamic_cast<FunctionDefinition const*>(_memberAccess.annotation().referencedDeclaration))
+	{
+		FunctionType functionType(*functionDef);
+		if (FunctionType const* iface = functionType.interfaceFunctionType())
+		{
+			if (!target.contains("signature"))
+				target["signature"] = iface->externalSignature();
+			if (!target.contains("selector"))
+				target["selector"] = iface->externalIdentifierHex();
+			if (!target.contains("mutability"))
+				target["mutability"] = externalMutabilityString(iface->stateMutability());
+		}
+		else if (!target.contains("mutability"))
+			target["mutability"] = externalMutabilityString(functionDef->stateMutability());
+		if (!target.contains("selector"))
+			target["selector"] = functionDef->externalIdentifierHex();
+		if (auto resolution =
+				exportStorageGetterResolution(_compilerStack, contract, *functionDef))
+		{
+			target["resolutionKind"] = "storage_getter";
+			target["resolution"] = *resolution;
+		}
+		if (auto const* funType = functionDef->functionType(false))
+		{
+			Json dispatchEntry = exportDispatchEntry(
+				funType,
+				functionDef
+			);
+			if (dispatchEntry.contains("revertPayloads"))
+				target["revertPayloads"] = dispatchEntry["revertPayloads"];
+		}
+	}
+	else if (!target.contains("mutability"))
+		target["mutability"] = "stateful";
+	return target;
+}
+
+char const* lowLevelCallKindString(std::string const& _memberName)
+{
+	return _memberName == "delegatecall" ? "delegatecall" : "call";
 }
 
 Json exportTypeName(TypeName const& _typeName);
@@ -342,6 +975,17 @@ Json exportField(VariableDeclaration const& _decl)
 	return result;
 }
 
+Json exportStorageField(
+	CompilerStack const& _compilerStack,
+	ContractDefinition const& _contract,
+	VariableDeclaration const& _decl)
+{
+	Json result = exportField(_decl);
+	if (auto slot = lookupStorageSlot(_compilerStack, _contract, _decl.name()))
+		result["storageSlot"] = *slot;
+	return result;
+}
+
 Json exportEventParam(VariableDeclaration const& _decl)
 {
 	Json result = Json::object();
@@ -370,6 +1014,8 @@ std::string runtimeFieldForMagicMember(std::string const& _base, std::string con
 			return "msgSender";
 		if (_member == "value")
 			return "msgValue";
+		if (_member == "data")
+			return "calldata";
 	}
 	if (_base == "block")
 	{
@@ -377,11 +1023,233 @@ std::string runtimeFieldForMagicMember(std::string const& _base, std::string con
 			return "blockTimestamp";
 		if (_member == "number")
 			return "blockNumber";
+		if (_member == "chainid")
+			return "chainId";
 	}
 	throw UnsupportedSolCore("Unsupported magic member access: " + _base + "." + _member);
 }
 
 Json exportExpr(Expression const& _expr);
+
+Json u256Literal(std::string const& _value)
+{
+	Json result = Json::object();
+	result["kind"] = "u256";
+	result["value"] = _value;
+	return result;
+}
+
+Json localExpr(std::string const& _name)
+{
+	Json result = Json::object();
+	result["kind"] = "local";
+	result["name"] = _name;
+	return result;
+}
+
+std::optional<Json> exportExternalContractCall(
+	FunctionCall const& _call,
+	MemberAccess const& _memberAccess,
+	bool _asStatement
+)
+{
+	Type const* baseType = _memberAccess.expression().annotation().type;
+	if (!baseType || baseType->category() != Type::Category::Contract)
+		return std::nullopt;
+
+	Json callExpr = Json::object();
+	callExpr["target"] = exportExpr(_memberAccess.expression());
+	callExpr["method"] = _memberAccess.memberName();
+	callExpr["args"] = Json::array();
+	for (auto const& arg: _call.arguments())
+		callExpr["args"].emplace_back(exportExpr(*arg));
+
+	bool statefulCall = true;
+	if (activeCompilerStack)
+	{
+		if (auto knownTarget = exportKnownExternalTarget(*activeCompilerStack, _memberAccess))
+		{
+			callExpr["knownTarget"] = *knownTarget;
+			if (
+				knownTarget->contains("mutability") &&
+				(*knownTarget)["mutability"].is_string() &&
+				(*knownTarget)["mutability"].get<std::string>() == "view"
+			)
+				statefulCall = false;
+		}
+	}
+
+	if (_asStatement && statefulCall)
+	{
+		callExpr["kind"] = "external_call_stmt";
+		return callExpr;
+	}
+
+	callExpr["kind"] = statefulCall ? "external_call_effect" : "external_call";
+	if (!_asStatement)
+		return callExpr;
+
+	Json result = Json::object();
+	result["kind"] = "expr";
+	result["value"] = callExpr;
+	return result;
+}
+
+std::string sanitizeExportNameComponent(std::string const& _value)
+{
+	std::string sanitized;
+	sanitized.reserve(_value.size());
+	bool lastWasUnderscore = false;
+	for (char c: _value)
+	{
+		unsigned char uc = static_cast<unsigned char>(c);
+		if (std::isalnum(uc))
+		{
+			sanitized.push_back(c);
+			lastWasUnderscore = false;
+		}
+		else if (!lastWasUnderscore)
+		{
+			sanitized.push_back('_');
+			lastWasUnderscore = true;
+		}
+	}
+	while (!sanitized.empty() && sanitized.back() == '_')
+		sanitized.pop_back();
+	if (sanitized.empty())
+		return "arg";
+	return sanitized;
+}
+
+std::string overloadSignatureSuffix(FunctionDefinition const& _function)
+{
+	if (_function.parameters().empty())
+		return "unit";
+
+	std::string suffix;
+	for (auto const& parameter: _function.parameters())
+	{
+		if (!suffix.empty())
+			suffix += "_";
+		std::string typeName =
+			parameter->annotation().type ?
+				parameter->annotation().type->toString() :
+				("arg" + std::to_string(parameter->id()));
+		suffix += sanitizeExportNameComponent(typeName);
+	}
+	return suffix;
+}
+
+std::string exportedFunctionName(FunctionDefinition const& _function)
+{
+	auto it = exportedFunctionNames.find(&_function);
+	if (it != exportedFunctionNames.end())
+		return it->second;
+	return _function.name().empty() ? "_unnamed" : _function.name();
+}
+
+std::string contractScopedSuperAlias(FunctionDefinition const& _function)
+{
+	auto const* owner = dynamic_cast<ContractDefinition const*>(_function.scope());
+	std::string ownerName =
+		owner && !owner->name().empty() ? owner->name() : "Base";
+	return (_function.name().empty() ? "_unnamed" : _function.name()) +
+		"__super__" + sanitizeExportNameComponent(ownerName);
+}
+
+std::set<FunctionDefinition const*> collectSuperReferencedFunctions(
+	ContractDefinition const& _contract)
+{
+	struct SuperReferenceCollector: ASTConstVisitor
+	{
+		std::set<FunctionDefinition const*> functions;
+
+		bool visit(FunctionCall const& _call) override
+		{
+			auto const* memberAccess =
+				dynamic_cast<MemberAccess const*>(&_call.expression());
+			if (!memberAccess)
+				return true;
+			auto const* baseIdent =
+				dynamic_cast<Identifier const*>(&memberAccess->expression());
+			if (!baseIdent || baseIdent->name() != "super")
+				return true;
+			auto const* function =
+				dynamic_cast<FunctionDefinition const*>(
+					memberAccess->annotation().referencedDeclaration);
+			if (function && function->isImplemented())
+				functions.insert(function);
+			return true;
+		}
+	};
+
+	std::set<FunctionDefinition const*> referenced;
+	std::set<FunctionDefinition const*> visited;
+	std::vector<FunctionDefinition const*> worklist;
+	for (FunctionDefinition const* function: _contract.definedFunctions())
+		if (function && function->isOrdinary() && function->isImplemented())
+			worklist.push_back(function);
+
+	while (!worklist.empty())
+	{
+		FunctionDefinition const* function = worklist.back();
+		worklist.pop_back();
+		if (!function || visited.count(function))
+			continue;
+		visited.insert(function);
+
+		SuperReferenceCollector collector;
+		function->body().accept(collector);
+		for (FunctionDefinition const* referencedFunction: collector.functions)
+		{
+			if (!referencedFunction || !referencedFunction->isOrdinary() || !referencedFunction->isImplemented())
+				continue;
+			if (referenced.insert(referencedFunction).second)
+				worklist.push_back(referencedFunction);
+		}
+	}
+
+	return referenced;
+}
+
+void assignExportedFunctionNames(std::vector<FunctionDefinition const*> const& _functions)
+{
+	exportedFunctionNames.clear();
+
+	std::map<std::string, std::vector<FunctionDefinition const*>> byName;
+	for (FunctionDefinition const* function: _functions)
+	{
+		if (!function)
+			continue;
+		byName[function->name().empty() ? "_unnamed" : function->name()].push_back(function);
+	}
+
+	for (auto const& [rawName, group]: byName)
+	{
+		std::map<std::string, std::vector<FunctionDefinition const*>> bySignature;
+		for (FunctionDefinition const* function: group)
+			bySignature[overloadSignatureSuffix(*function)].push_back(function);
+
+		if (bySignature.size() <= 1)
+		{
+			for (FunctionDefinition const* function: group)
+				exportedFunctionNames[function] = rawName;
+			continue;
+		}
+
+		std::map<std::string, int> usedCandidates;
+		for (auto const& [signatureSuffix, functions]: bySignature)
+		{
+			std::string candidate = rawName + "_" + signatureSuffix;
+			int& count = usedCandidates[candidate];
+			if (count > 0)
+				candidate += "_" + std::to_string(count);
+			++count;
+			for (FunctionDefinition const* function: functions)
+				exportedFunctionNames[function] = candidate;
+		}
+	}
+}
 
 std::pair<std::vector<std::string>, Json> exportStorageMapLValue(Expression const& _expr)
 {
@@ -390,6 +1258,35 @@ std::pair<std::vector<std::string>, Json> exportStorageMapLValue(Expression cons
 		throw UnsupportedSolCore("Expected single-level mapping index access.");
 
 	Expression const& base = indexAccess->baseExpression();
+
+	// Check for namespaced storage: $.mappingField[key]
+	// base is MemberAccess on a namespaced alias
+	if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&base))
+	{
+		if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
+		{
+			std::string baseName = baseIdent->name();
+			auto it = namespacedStorageAliases.find(baseName);
+			if (it != namespacedStorageAliases.end())
+			{
+				std::string fieldName = it->second + memberAccess->memberName();
+				return {{fieldName}, exportExpr(*indexAccess->indexExpression())};
+			}
+		}
+		// Also check for _getTokenStorage().mappingField[key] pattern
+		if (auto const* call = dynamic_cast<FunctionCall const*>(&memberAccess->expression()))
+		{
+			if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
+			{
+				if (auto const* prefix = namespacedGetterPrefix(*callee))
+				{
+					std::string fieldName = *prefix + memberAccess->memberName();
+					return {{fieldName}, exportExpr(*indexAccess->indexExpression())};
+				}
+			}
+		}
+	}
+
 	if (auto const* identifier = dynamic_cast<Identifier const*>(&base))
 	{
 		auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
@@ -425,11 +1322,58 @@ Json exportExpr(Expression const& _expr)
 			result["value"] = literal->value();
 			return result;
 		}
-		if (literal->token() == Token::StringLiteral || literal->token() == Token::UnicodeStringLiteral || literal->token() == Token::HexStringLiteral)
+		// Address literals: 0x... with 40 hex digits
+		if (literal->annotation().type && literal->annotation().type->category() == Type::Category::Address)
+		{
+			Json result = Json::object();
+			result["kind"] = "u256";
+			result["value"] = literal->value();
+			return result;
+		}
+		// Hex string literals (e.g. hex"0f") are byte sequences.
+		// In our model, all bytesN types are U256, so convert to a big-endian integer.
+		if (literal->token() == Token::HexStringLiteral)
+		{
+			std::string const& raw = literal->value();
+			u256 val = 0;
+			for (size_t i = 0; i < raw.size(); ++i)
+				val = val * 256 + static_cast<unsigned char>(raw[i]);
+			Json result = Json::object();
+			result["kind"] = "u256";
+			result["value"] = val.str();
+			return result;
+		}
+		if (literal->token() == Token::StringLiteral || literal->token() == Token::UnicodeStringLiteral)
 		{
 			Json result = Json::object();
 			result["kind"] = "string";
-			result["value"] = literal->value();
+			// Hex-encode string values that contain non-ASCII/non-printable bytes
+			// to avoid breaking JSON serialization (nlohmann/json's dump() with
+			// ensure_ascii=true throws on invalid UTF-8 sequences).
+			std::string const& raw = literal->value();
+			bool needsHexEncoding = false;
+			for (char c : raw)
+				if (static_cast<unsigned char>(c) > 126 || static_cast<unsigned char>(c) < 32)
+				{
+					needsHexEncoding = true;
+					break;
+				}
+			if (needsHexEncoding)
+			{
+				static char const digits[] = "0123456789abcdef";
+				std::string hex;
+				hex.reserve(raw.size() * 2);
+				for (size_t i = 0; i < raw.size(); ++i)
+				{
+					auto c = static_cast<unsigned char>(raw[i]);
+					hex += digits[c >> 4];
+					hex += digits[c & 0xf];
+				}
+				result["value"] = hex;
+				result["encoding"] = "hex";
+			}
+			else
+				result["value"] = raw;
 			return result;
 		}
 		throw UnsupportedSolCore("Only boolean, u256, and string literals are currently supported.");
@@ -452,23 +1396,68 @@ Json exportExpr(Expression const& _expr)
 		}
 		if (auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration))
 		{
-			// For constant variables, try to inline the value
-			if (decl->isConstant() && decl->value())
-			{
-				return exportExpr(*decl->value());
-			}
-			// For immutable variables with a compile-time value, try to inline the value.
-			// If inlining fails (e.g., the value is a function pointer or unsupported expression),
-			// fall back to storage_get so the field must be in Storage.
-			if (decl->immutable() && decl->value())
+			// For constant/immutable variables, try to inline the value.
+			// Guard against infinite recursion from self-referential initializers
+			// like `uint immutable x = x + 1` by tracking inlining depth.
+			static thread_local int inlineDepth = 0;
+			if ((decl->isConstant() || decl->immutable()) && decl->value() && inlineDepth < 3)
 			{
 				try
 				{
-					return exportExpr(*decl->value());
+					++inlineDepth;
+					auto result = exportExpr(*decl->value());
+					--inlineDepth;
+					return result;
 				}
 				catch (...)
 				{
-					// Fall through to storage_get below
+					--inlineDepth;
+					// For file-level / non-state constants that couldn't be inlined
+					// directly (e.g. `IERC20 constant CRV = IERC20(0xD533...)`),
+					// try to extract the literal address from the type-conversion
+					// wrapper: the value is a FunctionCall whose argument is a literal.
+					if (decl->isConstant() && !decl->isStateVariable() && decl->value())
+					{
+						// Pattern: TypeConversion(Literal) e.g. IERC20(0xD533...)
+						if (auto const* call = dynamic_cast<FunctionCall const*>(decl->value().get()))
+						{
+							if (*call->annotation().kind == FunctionCallKind::TypeConversion
+								&& call->arguments().size() == 1)
+							{
+								try
+								{
+									++inlineDepth;
+									auto inner = exportExpr(*call->arguments().front());
+									--inlineDepth;
+									return inner;
+								}
+								catch (...)
+								{
+									--inlineDepth;
+								}
+							}
+						}
+						// Pattern: Literal address/number
+						if (auto const* literal = dynamic_cast<Literal const*>(decl->value().get()))
+						{
+							(void)literal;
+							// Already tried above via exportExpr, but try the annotation
+							Type const* annType = decl->value()->annotation().type;
+							if (annType)
+							{
+								if (annType->category() == Type::Category::Address
+									|| annType->category() == Type::Category::RationalNumber
+									|| annType->category() == Type::Category::Integer)
+								{
+									Json result = Json::object();
+									result["kind"] = "u256";
+									result["value"] = annType->toString(true);
+									return result;
+								}
+							}
+						}
+					}
+					// Fall through to storage_get / local below
 				}
 			}
 			Json result = Json::object();
@@ -544,6 +1533,39 @@ Json exportExpr(Expression const& _expr)
 
 	if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_expr))
 	{
+		// --- Namespaced storage: $.field → storage_get with prefixed field ---
+		if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
+		{
+			auto it = namespacedStorageAliases.find(baseIdent->name());
+			if (it != namespacedStorageAliases.end())
+			{
+				std::string prefixedField = it->second + memberAccess->memberName();
+				// Check if this field is a mapping — if so, don't emit storage_get here,
+				// let IndexAccess handle it. But if used standalone (e.g. as base for length),
+				// emit storage_get.
+				Json result = Json::object();
+				result["kind"] = "storage_get";
+				result["field"] = prefixedField;
+				return result;
+			}
+		}
+		// --- Namespaced storage: _getTokenStorage().field → storage_get ---
+		if (auto const* call = dynamic_cast<FunctionCall const*>(&memberAccess->expression()))
+		{
+			if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
+			{
+				if (auto const* prefix = namespacedGetterPrefix(*callee))
+				{
+					std::string prefixedField = *prefix + memberAccess->memberName();
+					Json result = Json::object();
+					result["kind"] = "storage_get";
+					result["field"] = prefixedField;
+					return result;
+				}
+			}
+		}
+		// --- End namespaced storage member access ---
+
 		// Check if this member access resolves to an enum value.
 		// This handles ALL forms: Direction.Right, I.Direction.Right, L.Direction.Right
 		// because the Solidity type checker resolves the member access to the actual EnumValue declaration.
@@ -624,6 +1646,17 @@ Json exportExpr(Expression const& _expr)
 		// Array .length access
 		if (memberAccess->memberName() == "length")
 		{
+			if (auto const* codeAccess = dynamic_cast<MemberAccess const*>(&memberAccess->expression()))
+			{
+				Type const* codeBaseType = codeAccess->expression().annotation().type;
+				if (codeAccess->memberName() == "code" && codeBaseType && codeBaseType->category() == Type::Category::Address)
+				{
+					Json result = Json::object();
+					result["kind"] = "extcodesize";
+					result["address"] = exportExpr(codeAccess->expression());
+					return result;
+				}
+			}
 			Type const* baseType = memberAccess->expression().annotation().type;
 			if (baseType && baseType->category() == Type::Category::Array)
 			{
@@ -690,9 +1723,23 @@ Json exportExpr(Expression const& _expr)
 					}
 					if (memberAccess->memberName() == "interfaceId")
 					{
-						// type(SomeInterface).interfaceId — return as bytes4
+						// type(SomeInterface).interfaceId — bytes4 selector XOR
+						// (REV-271/bug_013/ERC165 fix: replaces a hardcoded "0" placeholder.)
 						Json result = Json::object();
 						result["kind"] = "u256";
+						if (typeArg && typeArg->category() == Type::Category::Contract)
+						{
+							auto const* contractType = dynamic_cast<ContractType const*>(typeArg);
+							if (contractType)
+							{
+								// Match codegen: shifted into top 32 bits of bytes4 word; here
+								// we want the 4-byte numeric value, formatted as decimal so the
+								// downstream u256 parser accepts it.
+								uint32_t selector = contractType->contractDefinition().interfaceId();
+								result["value"] = std::to_string(static_cast<uint64_t>(selector));
+								return result;
+							}
+						}
 						result["value"] = "0";
 						return result;
 					}
@@ -1010,6 +2057,18 @@ Json exportExpr(Expression const& _expr)
 		// Handle new expressions: new bytes(n), new string(n), new uint256[](n)
 		if (auto const* newExpr = dynamic_cast<NewExpression const*>(&call->expression()))
 		{
+			// Check if this is an empty array allocation: new T[](0)
+			// In that case, emit unit which the code generator maps to default = []
+			if (call->arguments().size() == 1)
+			{
+				auto const* sizeArg = dynamic_cast<Literal const*>(call->arguments().front().get());
+				if (sizeArg && sizeArg->value() == "0")
+				{
+					Json result = Json::object();
+					result["kind"] = "unit";
+					return result;
+				}
+			}
 			Json result = Json::object();
 			result["kind"] = "internal_call";
 			result["function"] = "new_array";
@@ -1117,7 +2176,7 @@ Json exportExpr(Expression const& _expr)
 			{
 				Json result = Json::object();
 				result["kind"] = "internal_call";
-				result["function"] = callee->name();
+				result["function"] = exportedFunctionName(*funcDef);
 				result["args"] = Json::array();
 				for (auto const& arg: call->arguments())
 					result["args"].emplace_back(exportExpr(*arg));
@@ -1194,14 +2253,8 @@ Json exportExpr(Expression const& _expr)
 			Type const* baseType = memberAccess->expression().annotation().type;
 			if (baseType && baseType->category() == Type::Category::Contract)
 			{
-				Json result = Json::object();
-				result["kind"] = "external_call";
-				result["target"] = exportExpr(memberAccess->expression());
-				result["method"] = memberAccess->memberName();
-				result["args"] = Json::array();
-				for (auto const& arg: call->arguments())
-					result["args"].emplace_back(exportExpr(*arg));
-				return result;
+				if (auto externalCall = exportExternalContractCall(*call, *memberAccess, false))
+					return *externalCall;
 			}
 
 			// Library-qualified or type-qualified function call: L.f(args)
@@ -1211,7 +2264,7 @@ Json exportExpr(Expression const& _expr)
 				(void)funcDef;
 				Json result = Json::object();
 				result["kind"] = "internal_call";
-				result["function"] = memberAccess->memberName();
+				result["function"] = exportedFunctionName(*funcDef);
 				result["args"] = Json::array();
 				for (auto const& arg: call->arguments())
 					result["args"].emplace_back(exportExpr(*arg));
@@ -1225,10 +2278,14 @@ Json exportExpr(Expression const& _expr)
 		{
 			if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&options->expression()))
 			{
+				if (auto externalCall = exportExternalContractCall(*call, *memberAccess, false))
+					return *externalCall;
+
 				if (memberAccess->memberName() == "call" || memberAccess->memberName() == "delegatecall")
 				{
 					Json result = Json::object();
 					result["kind"] = "low_level_call";
+					result["callKind"] = lowLevelCallKindString(memberAccess->memberName());
 					result["target"] = exportExpr(memberAccess->expression());
 
 					// Extract value from options
@@ -1251,8 +2308,8 @@ Json exportExpr(Expression const& _expr)
 					else
 					{
 						Json emptyData = Json::object();
-						emptyData["kind"] = "u256";
-						emptyData["value"] = "0";
+						emptyData["kind"] = "string";
+						emptyData["value"] = "";
 						result["data"] = emptyData;
 					}
 					return result;
@@ -1270,6 +2327,7 @@ Json exportExpr(Expression const& _expr)
 				{
 					Json result = Json::object();
 					result["kind"] = "low_level_call";
+					result["callKind"] = lowLevelCallKindString(memberAccess->memberName());
 					result["target"] = exportExpr(memberAccess->expression());
 
 					Json valueExpr = Json::object();
@@ -1282,8 +2340,8 @@ Json exportExpr(Expression const& _expr)
 					else
 					{
 						Json emptyData = Json::object();
-						emptyData["kind"] = "u256";
-						emptyData["value"] = "0";
+						emptyData["kind"] = "string";
+						emptyData["value"] = "";
 						result["data"] = emptyData;
 					}
 					return result;
@@ -1301,7 +2359,12 @@ Json exportExpr(Expression const& _expr)
 		if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
 			result["function"] = callee->name();
 		else if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&call->expression()))
-			result["function"] = memberAccess->memberName();
+		{
+			if (auto const* funcDef = dynamic_cast<FunctionDefinition const*>(memberAccess->annotation().referencedDeclaration))
+				result["function"] = exportedFunctionName(*funcDef);
+			else
+				result["function"] = memberAccess->memberName();
+		}
 		else
 			result["function"] = "unknown_call";
 		result["args"] = Json::array();
@@ -1322,27 +2385,87 @@ Json exportExpr(Expression const& _expr)
 	if (auto const* options = dynamic_cast<FunctionCallOptions const*>(&_expr))
 		return exportExpr(options->expression());
 
-	// Ultimate fallback — emit a zero placeholder instead of throwing.
-	// This allows partial export of functions that use an unsupported expression
-	// pattern in a subexpression, rather than failing the entire function.
+	// Ultimate fallback — return a placeholder instead of crashing
 	{
 		Json result = Json::object();
 		result["kind"] = "u256";
 		result["value"] = "0";
-		result["_unsupported"] = true;
+		result["_unsupported_expr"] = true;
 		return result;
 	}
 }
 
 Json exportRevertPayload(FunctionCall const& _call)
 {
+	auto exportCustomError = [&](ErrorDefinition const& _error) {
+		Json result = Json::object();
+		result["error"] = Json::object();
+		result["error"]["name"] = _error.name();
+		try
+		{
+			FunctionType errorType(_error);
+			result["error"]["signature"] = errorType.externalSignature();
+		}
+		catch (...)
+		{
+		}
+		Json argTypes = Json::array();
+		bool argTypesOk = true;
+		for (auto const& parameter: _error.parameters())
+		{
+			try
+			{
+				argTypes.emplace_back(exportTypeName(parameter->typeName()));
+			}
+			catch (...)
+			{
+				argTypesOk = false;
+				break;
+			}
+		}
+		if (argTypesOk && !argTypes.empty())
+			result["error"]["argTypes"] = std::move(argTypes);
+		Json args = Json::array();
+		for (auto const& argument: _call.arguments())
+			args.emplace_back(exportExpr(*argument));
+		if (!args.empty())
+			result["error"]["args"] = std::move(args);
+		if (_call.arguments().size() == 1)
+		{
+			if (auto const* message = dynamic_cast<Literal const*>(_call.arguments().front().get()))
+				if (message->token() == Token::StringLiteral)
+					result["error"]["data"] = message->value();
+		}
+		return result;
+	};
+
 	Json result = Json::object();
+	Declaration const* calleeDecl = nullptr;
+	if (auto const* callee = dynamic_cast<Identifier const*>(&_call.expression()))
+		calleeDecl = callee->annotation().referencedDeclaration;
+	else if (auto const* callee = dynamic_cast<MemberAccess const*>(&_call.expression()))
+		calleeDecl = callee->annotation().referencedDeclaration;
+	if (auto const* errorDef = dynamic_cast<ErrorDefinition const*>(calleeDecl))
+		return exportCustomError(*errorDef);
+
 	if (auto const* callee = dynamic_cast<Identifier const*>(&_call.expression()))
 	{
 		if (callee->name() == "require" || callee->name() == "revert")
 		{
 			if (_call.arguments().size() >= 2)
 			{
+				if (auto const* errorCall =
+						dynamic_cast<FunctionCall const*>(_call.arguments().at(1).get()))
+				{
+					if (auto const* errorDef =
+							dynamic_cast<ErrorDefinition const*>(
+								dynamic_cast<Identifier const*>(&errorCall->expression()) ?
+									dynamic_cast<Identifier const*>(&errorCall->expression())->annotation().referencedDeclaration :
+								dynamic_cast<MemberAccess const*>(&errorCall->expression()) ?
+									dynamic_cast<MemberAccess const*>(&errorCall->expression())->annotation().referencedDeclaration :
+									nullptr))
+						return exportCustomError(*errorDef);
+				}
 				auto const* message = dynamic_cast<Literal const*>(_call.arguments().at(1).get());
 				if (message && message->token() == Token::StringLiteral)
 				{
@@ -1364,18 +2487,141 @@ Json exportRevertPayload(FunctionCall const& _call)
 		}
 	}
 
-	if (auto const* callee = dynamic_cast<Identifier const*>(&_call.expression()))
-	{
-		result["error"] = Json::object();
-		result["error"]["name"] = callee->name();
-		return result;
-	}
-
 	// Fallback: return empty payload rather than throwing
 	return result;
 }
 
 Json exportStmt(Statement const& _stmt);
+
+Json replaceModifierPlaceholders(Json const& _stmt, Json const& _replacementBody)
+{
+	if (!_stmt.is_object())
+		return _stmt;
+
+	std::string kind = _stmt.value("kind", ""s);
+	if (kind == "placeholder")
+		return _replacementBody;
+
+	Json result = _stmt;
+	if (kind == "block")
+	{
+		Json statements = Json::array();
+		for (auto const& stmt: _stmt["statements"])
+			statements.emplace_back(replaceModifierPlaceholders(stmt, _replacementBody));
+		result["statements"] = std::move(statements);
+	}
+	else if (kind == "if")
+	{
+		result["then"] = replaceModifierPlaceholders(_stmt["then"], _replacementBody);
+		if (_stmt.contains("else") && !_stmt["else"].is_null())
+			result["else"] = replaceModifierPlaceholders(_stmt["else"], _replacementBody);
+	}
+	else if (kind == "while" || kind == "do_while")
+		result["body"] = replaceModifierPlaceholders(_stmt["body"], _replacementBody);
+	else if (kind == "for")
+	{
+		if (_stmt.contains("init") && !_stmt["init"].is_null())
+			result["init"] = replaceModifierPlaceholders(_stmt["init"], _replacementBody);
+		if (_stmt.contains("post") && !_stmt["post"].is_null())
+			result["post"] = replaceModifierPlaceholders(_stmt["post"], _replacementBody);
+		result["body"] = replaceModifierPlaceholders(_stmt["body"], _replacementBody);
+	}
+	else if (kind == "try_catch")
+	{
+		Json clauses = Json::array();
+		for (auto const& clause: _stmt["clauses"])
+		{
+			Json newClause = clause;
+			newClause["body"] = replaceModifierPlaceholders(clause["body"], _replacementBody);
+			clauses.emplace_back(std::move(newClause));
+		}
+		result["clauses"] = std::move(clauses);
+	}
+
+	return result;
+}
+
+ModifierDefinition const* resolveModifierDefinition(
+	FunctionDefinition const& _function,
+	ModifierInvocation const& _modifierInvocation)
+{
+	auto modifierDefinition = dynamic_cast<ModifierDefinition const*>(
+		_modifierInvocation.name().annotation().referencedDeclaration
+	);
+	if (!modifierDefinition)
+		return nullptr;
+
+	if (_function.isFree())
+		return modifierDefinition;
+
+	ContractDefinition const* contract = _function.annotation().contract;
+	if (!contract)
+		return modifierDefinition;
+
+	if (
+		_modifierInvocation.name().annotation().requiredLookup.set() &&
+		*_modifierInvocation.name().annotation().requiredLookup == VirtualLookup::Virtual
+	)
+		return &modifierDefinition->resolveVirtual(*contract);
+
+	return modifierDefinition;
+}
+
+Json modifierParameterBindings(
+	ModifierDefinition const& _modifierDefinition,
+	std::vector<ASTPointer<Expression>> const* _arguments)
+{
+	Json bindings = Json::array();
+	auto const& params = _modifierDefinition.parameters();
+	size_t argCount = _arguments ? _arguments->size() : 0;
+	for (size_t i = 0; i < params.size(); ++i)
+	{
+		VariableDeclaration const& param = *params[i];
+		Json letStmt = Json::object();
+		letStmt["kind"] = "let";
+		letStmt["name"] = param.name().empty() ? ("modifier_arg" + std::to_string(i)) : param.name();
+		try
+		{
+			letStmt["type"] = exportTypeName(param.typeName());
+		}
+		catch (...)
+		{
+			letStmt["type"] = Json("u256");
+		}
+		if (_arguments && i < argCount)
+			letStmt["value"] = exportExpr(*(*_arguments)[i]);
+		else
+			letStmt["value"] = defaultValueForTypeName(param.typeName());
+		bindings.emplace_back(std::move(letStmt));
+	}
+	return bindings;
+}
+
+Json expandModifiers(FunctionDefinition const& _function, Json _body)
+{
+	for (auto it = _function.modifiers().rbegin(); it != _function.modifiers().rend(); ++it)
+	{
+		ModifierInvocation const& modifierInvocation = *it->get();
+		ModifierDefinition const* modifierDefinition = resolveModifierDefinition(_function, modifierInvocation);
+		if (!modifierDefinition || !modifierDefinition->isImplemented())
+			continue;
+
+		Json modifierBody = exportStmt(modifierDefinition->body());
+		if (!modifierBody.is_object() || modifierBody.value("kind", ""s) != "block")
+			continue;
+
+		Json expandedModifier = replaceModifierPlaceholders(modifierBody, _body);
+		Json statements = Json::array();
+		for (auto const& binding: modifierParameterBindings(*modifierDefinition, modifierInvocation.arguments()))
+			statements.emplace_back(binding);
+		for (auto const& stmt: expandedModifier["statements"])
+			statements.emplace_back(stmt);
+		expandedModifier["statements"] = std::move(statements);
+		_body = std::move(expandedModifier);
+	}
+
+	return _body;
+}
 
 Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 {
@@ -1563,72 +2809,121 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		}
 		catch (...)
 		{
-			// If mapping export fails, fall back to generic array_set_expr
-			Json result = Json::object();
-			result["kind"] = "expr";
-			Json callExpr = Json::object();
-			callExpr["kind"] = "internal_call";
-			callExpr["function"] = "array_set_expr";
-			callExpr["args"] = Json::array();
-			callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
-			if (indexAccess->indexExpression())
-				callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
-			callExpr["args"].emplace_back(rhsJson);
-			result["value"] = callExpr;
-			return result;
+			// Nested mapping assignment:
+			// outer[innerKey][leafKey] = value
+			// Export this as a storage_map_set on the outer mapping whose value is an
+			// inner mapping update expression. This preserves the storage effect so the
+			// downstream generator can thread state and compute accurate touched fields.
+			try
+			{
+				auto [outerPath, outerKey] = exportStorageMapLValue(indexAccess->baseExpression());
+				Json innerBase = exportExpr(indexAccess->baseExpression());
+				Json leafIndex = exportExpr(*indexAccess->indexExpression());
+				Json effectiveRhs = rhsJson;
+				if (_op != Token::Assign)
+				{
+					Json current = Json::object();
+					current["kind"] = "array_get";
+					current["base"] = innerBase;
+					current["index"] = leafIndex;
+					effectiveRhs = compoundValue(current, rhsJson);
+				}
+				Json nestedUpdate = Json::object();
+				nestedUpdate["kind"] = "internal_call";
+				nestedUpdate["function"] = "array_set_expr";
+				nestedUpdate["args"] = Json::array();
+				nestedUpdate["args"].emplace_back(innerBase);
+				nestedUpdate["args"].emplace_back(leafIndex);
+				nestedUpdate["args"].emplace_back(effectiveRhs);
+				return mkDirectMap(outerPath, outerKey, nestedUpdate);
+			}
+			catch (...)
+			{
+				// If nested mapping export also fails, fall back to generic array_set_expr
+				Json result = Json::object();
+				result["kind"] = "expr";
+				Json callExpr = Json::object();
+				callExpr["kind"] = "internal_call";
+				callExpr["function"] = "array_set_expr";
+				callExpr["args"] = Json::array();
+				callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
+				if (indexAccess->indexExpression())
+					callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
+				callExpr["args"].emplace_back(rhsJson);
+				result["value"] = callExpr;
+				return result;
+			}
 		}
 	}
 
 	// Member access LHS: structVar.field = value
 	if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_lhs))
 	{
-		// Check if the base is a state variable (storage field set on a nested struct)
+		// --- Namespaced storage: $.field = value → storage_set with prefixed field ---
+		if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
+		{
+			auto nsIt = namespacedStorageAliases.find(baseIdent->name());
+			if (nsIt != namespacedStorageAliases.end())
+			{
+				std::string prefixedField = nsIt->second + memberAccess->memberName();
+				Json current = Json::object();
+				current["kind"] = "storage_get";
+				current["field"] = prefixedField;
+				return mkDirectStorage(prefixedField, compoundValue(current, rhsJson));
+			}
+		}
+		// --- End namespaced storage member LHS ---
+
+		auto exportStructUpdate = [&](Expression const& baseExpr) {
+			// Compute the effective RHS (handling compound assignment)
+			Json effectiveRhs = rhsJson;
+			if (_op != Token::Assign)
+			{
+				Json current = Json::object();
+				current["kind"] = "field";
+				current["base"] = exportExpr(baseExpr);
+				current["field"] = memberAccess->memberName();
+				effectiveRhs = compoundValue(current, rhsJson);
+			}
+
+			// Export as: assign base = struct_update(base, field, value)
+			Json update = Json::object();
+			update["kind"] = "struct_update";
+			update["base"] = exportExpr(baseExpr);
+			update["field"] = memberAccess->memberName();
+			update["value"] = effectiveRhs;
+			return update;
+		};
+
+		// Check if the base is an identifier (local or state variable)
 		if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
 		{
 			auto const* decl = dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration);
+			if (decl && !decl->isStateVariable())
+			{
+				// Local struct member write: $.field = value
+				// Export as: assign $ = struct_update($, field, value)
+				Json result = Json::object();
+				result["kind"] = "assign";
+				result["name"] = decl->name().empty() ? baseIdent->name() : decl->name();
+				result["value"] = exportStructUpdate(memberAccess->expression());
+				return result;
+			}
 			if (decl && decl->isStateVariable())
 			{
-				// storage.structField.member = val → storage_set with field path
+				// State variable struct member write: stateVar.field = value
+				// Export as: storage_set stateVar = struct_update(stateVar, field, value)
 				Json result = Json::object();
-				result["kind"] = "expr";
-				Json callExpr = Json::object();
-				callExpr["kind"] = "internal_call";
-				callExpr["function"] = "field_set";
-				callExpr["args"] = Json::array();
-				callExpr["args"].emplace_back(exportExpr(memberAccess->expression()));
-				Json fieldName = Json::object();
-				fieldName["kind"] = "string";
-				fieldName["value"] = memberAccess->memberName();
-				callExpr["args"].emplace_back(fieldName);
-				callExpr["args"].emplace_back(rhsJson);
-				result["value"] = callExpr;
+				result["kind"] = "storage_set";
+				result["field"] = decl->name();
+				result["value"] = exportStructUpdate(memberAccess->expression());
 				return result;
 			}
 		}
-		// Generic member access assignment: export as expr
+		// Generic member access assignment: export as expr with struct_update
 		Json result = Json::object();
 		result["kind"] = "expr";
-		Json callExpr = Json::object();
-		callExpr["kind"] = "internal_call";
-		callExpr["function"] = "field_set";
-		callExpr["args"] = Json::array();
-		try
-		{
-			callExpr["args"].emplace_back(exportExpr(memberAccess->expression()));
-		}
-		catch (...)
-		{
-			Json zero = Json::object();
-			zero["kind"] = "u256";
-			zero["value"] = "0";
-			callExpr["args"].emplace_back(zero);
-		}
-		Json fieldName = Json::object();
-		fieldName["kind"] = "string";
-		fieldName["value"] = memberAccess->memberName();
-		callExpr["args"].emplace_back(fieldName);
-		callExpr["args"].emplace_back(rhsJson);
-		result["value"] = callExpr;
+		result["value"] = exportStructUpdate(memberAccess->expression());
 		return result;
 	}
 
@@ -1680,6 +2975,275 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		result["value"] = callExpr;
 		return result;
 	}
+}
+
+Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
+{
+	auto mkDirectStorage = [&](std::string const& _field, Json const& _storedValue) {
+		Json result = Json::object();
+		result["kind"] = "storage_set";
+		result["field"] = _field;
+		result["value"] = _storedValue;
+		return result;
+	};
+
+	auto mkDirectMap = [&](std::vector<std::string> const& _path, Json const& _key, Json const& _storedValue) {
+		Json result = Json::object();
+		result["kind"] = "storage_map_set";
+		if (_path.size() == 1)
+			result["field"] = _path.front();
+		else
+			result["path"] = jsonStringArray(_path);
+		result["key"] = _key;
+		result["value"] = _storedValue;
+		return result;
+	};
+
+	if (auto const* identifier = dynamic_cast<Identifier const*>(&_lhs))
+	{
+		auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
+		if (!decl)
+			throw UnsupportedSolCore("Assignment target without declaration.");
+		if (decl->isStateVariable())
+			return mkDirectStorage(decl->name(), _value);
+
+		Json result = Json::object();
+		result["kind"] = "assign";
+		result["name"] = decl->name().empty() ? identifier->name() : decl->name();
+		result["value"] = _value;
+		return result;
+	}
+
+	if (auto const* indexAccess = dynamic_cast<IndexAccess const*>(&_lhs))
+	{
+		Type const* baseType = indexAccess->baseExpression().annotation().type;
+		if (baseType && (baseType->category() == Type::Category::Array ||
+		                 baseType->category() == Type::Category::FixedBytes))
+		{
+			if (!indexAccess->indexExpression())
+				throw UnsupportedSolCore("Array index assignment without index.");
+			if (auto const* baseIdent = dynamic_cast<Identifier const*>(&indexAccess->baseExpression()))
+			{
+				auto const* decl = dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration);
+				if (decl && !decl->isStateVariable())
+				{
+					Json result = Json::object();
+					result["kind"] = "assign";
+					result["name"] = decl->name().empty() ? baseIdent->name() : decl->name();
+					Json callExpr = Json::object();
+					callExpr["kind"] = "internal_call";
+					callExpr["function"] = "array_set_local";
+					callExpr["args"] = Json::array();
+					callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
+					callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
+					callExpr["args"].emplace_back(_value);
+					result["value"] = callExpr;
+					return result;
+				}
+				Json basePath = Json::array();
+				if (decl)
+					basePath.emplace_back(decl->name());
+				else
+					basePath.emplace_back(baseIdent->name());
+				Json result = Json::object();
+				result["kind"] = "array_set";
+				result["base_path"] = basePath;
+				result["index"] = exportExpr(*indexAccess->indexExpression());
+				result["value"] = _value;
+				return result;
+			}
+			Json result = Json::object();
+			result["kind"] = "expr";
+			Json callExpr = Json::object();
+			callExpr["kind"] = "internal_call";
+			callExpr["function"] = "array_set_expr";
+			callExpr["args"] = Json::array();
+			callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
+			callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
+			callExpr["args"].emplace_back(_value);
+			result["value"] = callExpr;
+			return result;
+		}
+
+		try
+		{
+			auto [path, key] = exportStorageMapLValue(_lhs);
+			return mkDirectMap(path, key, _value);
+		}
+		catch (...)
+		{
+			try
+			{
+				auto [outerPath, outerKey] = exportStorageMapLValue(indexAccess->baseExpression());
+				Json nestedUpdate = Json::object();
+				nestedUpdate["kind"] = "internal_call";
+				nestedUpdate["function"] = "array_set_expr";
+				nestedUpdate["args"] = Json::array();
+				nestedUpdate["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
+				nestedUpdate["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
+				nestedUpdate["args"].emplace_back(_value);
+				return mkDirectMap(outerPath, outerKey, nestedUpdate);
+			}
+			catch (...)
+			{
+				Json result = Json::object();
+				result["kind"] = "expr";
+				Json callExpr = Json::object();
+				callExpr["kind"] = "internal_call";
+				callExpr["function"] = "array_set_expr";
+				callExpr["args"] = Json::array();
+				callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
+				if (indexAccess->indexExpression())
+					callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
+				callExpr["args"].emplace_back(_value);
+				result["value"] = callExpr;
+				return result;
+			}
+		}
+	}
+
+	if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_lhs))
+	{
+		if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
+		{
+			auto nsIt = namespacedStorageAliases.find(baseIdent->name());
+			if (nsIt != namespacedStorageAliases.end())
+			{
+				std::string prefixedField = nsIt->second + memberAccess->memberName();
+				return mkDirectStorage(prefixedField, _value);
+			}
+		}
+
+		auto exportStructUpdate = [&](Expression const& baseExpr) {
+			Json update = Json::object();
+			update["kind"] = "struct_update";
+			update["base"] = exportExpr(baseExpr);
+			update["field"] = memberAccess->memberName();
+			update["value"] = _value;
+			return update;
+		};
+
+		if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
+		{
+			auto const* decl = dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration);
+			if (decl && !decl->isStateVariable())
+			{
+				Json result = Json::object();
+				result["kind"] = "assign";
+				result["name"] = decl->name().empty() ? baseIdent->name() : decl->name();
+				result["value"] = exportStructUpdate(memberAccess->expression());
+				return result;
+			}
+			if (decl && decl->isStateVariable())
+			{
+				Json result = Json::object();
+				result["kind"] = "storage_set";
+				result["field"] = decl->name();
+				result["value"] = exportStructUpdate(memberAccess->expression());
+				return result;
+			}
+		}
+		Json result = Json::object();
+		result["kind"] = "expr";
+		result["value"] = exportStructUpdate(memberAccess->expression());
+		return result;
+	}
+
+	if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_lhs))
+	{
+		Json result = Json::object();
+		result["kind"] = "expr";
+		Json callExpr = Json::object();
+		callExpr["kind"] = "internal_call";
+		callExpr["function"] = "tuple_assign";
+		callExpr["args"] = Json::array();
+		for (auto const& component: tuple->components())
+		{
+			if (component)
+			{
+				try { callExpr["args"].emplace_back(exportExpr(*component)); }
+				catch (...) { callExpr["args"].emplace_back(u256Literal("0")); }
+			}
+			else
+				callExpr["args"].emplace_back(Json());
+		}
+		callExpr["args"].emplace_back(_value);
+		result["value"] = callExpr;
+		return result;
+	}
+
+	Json result = Json::object();
+	result["kind"] = "expr";
+	Json callExpr = Json::object();
+	callExpr["kind"] = "internal_call";
+	callExpr["function"] = "generic_assign";
+	callExpr["args"] = Json::array();
+	try { callExpr["args"].emplace_back(exportExpr(_lhs)); }
+	catch (...) { callExpr["args"].emplace_back(u256Literal("0")); }
+	callExpr["args"].emplace_back(_value);
+	result["value"] = callExpr;
+	return result;
+}
+
+Json mutationValue(Json const& _current, Token _op)
+{
+	Json result = Json::object();
+	switch (_op)
+	{
+	case Token::Inc:
+		result["kind"] = "u256_add";
+		break;
+	case Token::Dec:
+		result["kind"] = "u256_sub";
+		break;
+	default:
+		throw UnsupportedSolCore("Expected ++ or -- unary mutation.");
+	}
+	result["lhs"] = _current;
+	result["rhs"] = u256Literal("1");
+	return result;
+}
+
+Json exportUnaryMutation(Expression const& _target, Token _op)
+{
+	return exportDirectAssignment(_target, mutationValue(exportExpr(_target), _op));
+}
+
+Json exportUnaryMutationReturn(UnaryOperation const& _unary)
+{
+	Expression const& target = _unary.subExpression();
+	std::string tempName = "__solcore_tmp_" + std::to_string(_unary.id());
+
+	Json block = Json::object();
+	block["kind"] = "block";
+	block["statements"] = Json::array();
+
+	if (_unary.isPrefixOperation())
+	{
+		Json letStmt = Json::object();
+		letStmt["kind"] = "let";
+		letStmt["name"] = tempName;
+		letStmt["type"] = "u256";
+		letStmt["value"] = mutationValue(exportExpr(target), _unary.getOperator());
+		block["statements"].emplace_back(std::move(letStmt));
+		block["statements"].emplace_back(exportDirectAssignment(target, localExpr(tempName)));
+	}
+	else
+	{
+		Json letStmt = Json::object();
+		letStmt["kind"] = "let";
+		letStmt["name"] = tempName;
+		letStmt["type"] = "u256";
+		letStmt["value"] = exportExpr(target);
+		block["statements"].emplace_back(std::move(letStmt));
+		block["statements"].emplace_back(exportDirectAssignment(target, mutationValue(localExpr(tempName), _unary.getOperator())));
+	}
+
+	Json ret = Json::object();
+	ret["kind"] = "return";
+	ret["value"] = localExpr(tempName);
+	block["statements"].emplace_back(std::move(ret));
+	return block;
 }
 
 // --- Yul AST export functions ---
@@ -1866,6 +3430,11 @@ Json exportStmt(Statement const& _stmt)
 
 	if (auto const* returnStmt = dynamic_cast<Return const*>(&_stmt))
 	{
+		if (returnStmt->expression())
+			if (auto const* unary = dynamic_cast<UnaryOperation const*>(returnStmt->expression()))
+				if (unary->getOperator() == Token::Inc || unary->getOperator() == Token::Dec)
+					return exportUnaryMutationReturn(*unary);
+
 		Json result = Json::object();
 		result["kind"] = "return";
 		if (returnStmt->expression())
@@ -1881,6 +3450,34 @@ Json exportStmt(Statement const& _stmt)
 
 	if (auto const* varDecl = dynamic_cast<VariableDeclarationStatement const*>(&_stmt))
 	{
+		// --- Namespaced storage: detect `TokenStorage storage $ = _getTokenStorage();`
+		// and register `$` as a namespaced storage alias instead of emitting a let statement.
+		if (varDecl->declarations().size() == 1 && varDecl->declarations().front() && varDecl->initialValue())
+		{
+			auto const& decl = *varDecl->declarations().front();
+			if (decl.referenceLocation() == VariableDeclaration::Location::Storage)
+			{
+				// Check if the initializer is a call to a namespaced storage getter
+				if (auto const* call = dynamic_cast<FunctionCall const*>(varDecl->initialValue()))
+				{
+					if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
+					{
+						if (auto const* prefix = namespacedGetterPrefix(*callee))
+						{
+							// Register this local variable as a namespaced storage alias
+							namespacedStorageAliases[decl.name()] = *prefix;
+							// Emit a no-op block instead of a let statement
+							Json result = Json::object();
+							result["kind"] = "block";
+							result["statements"] = Json::array();
+							return result;
+						}
+					}
+				}
+			}
+		}
+		// --- End namespaced storage var decl ---
+
 		// Single variable declaration with initializer (common case)
 		if (varDecl->declarations().size() == 1 && varDecl->declarations().front() && varDecl->initialValue())
 		{
@@ -1987,6 +3584,10 @@ Json exportStmt(Statement const& _stmt)
 		if (auto const* assignment = dynamic_cast<Assignment const*>(&expr))
 			return exportAssignment(assignment->leftHandSide(), assignment->assignmentOperator(), assignment->rightHandSide());
 
+		if (auto const* unary = dynamic_cast<UnaryOperation const*>(&expr))
+			if (unary->getOperator() == Token::Inc || unary->getOperator() == Token::Dec)
+				return exportUnaryMutation(unary->subExpression(), unary->getOperator());
+
 		if (auto const* call = dynamic_cast<FunctionCall const*>(&expr))
 		{
 			if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
@@ -2045,7 +3646,7 @@ Json exportStmt(Statement const& _stmt)
 					result["kind"] = "expr";
 					Json callExpr = Json::object();
 					callExpr["kind"] = "internal_call";
-					callExpr["function"] = callee->name();
+					callExpr["function"] = exportedFunctionName(*funcDef);
 					callExpr["args"] = Json::array();
 					for (auto const& arg: call->arguments())
 						callExpr["args"].emplace_back(exportExpr(*arg));
@@ -2109,17 +3710,8 @@ Json exportStmt(Statement const& _stmt)
 				Type const* baseType = memberAccess->expression().annotation().type;
 				if (baseType && baseType->category() == Type::Category::Contract)
 				{
-					Json result = Json::object();
-					result["kind"] = "expr";
-					Json callExpr = Json::object();
-					callExpr["kind"] = "external_call";
-					callExpr["target"] = exportExpr(memberAccess->expression());
-					callExpr["method"] = memberAccess->memberName();
-					callExpr["args"] = Json::array();
-					for (auto const& arg: call->arguments())
-						callExpr["args"].emplace_back(exportExpr(*arg));
-					result["value"] = callExpr;
-					return result;
+					if (auto externalCall = exportExternalContractCall(*call, *memberAccess, true))
+						return *externalCall;
 				}
 
 				// Library-qualified or type-qualified function call as statement: L.f(args)
@@ -2144,12 +3736,16 @@ Json exportStmt(Statement const& _stmt)
 			{
 				if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&options->expression()))
 				{
+					if (auto externalCall = exportExternalContractCall(*call, *memberAccess, true))
+						return *externalCall;
+
 					if (memberAccess->memberName() == "call" || memberAccess->memberName() == "delegatecall")
 					{
 						Json result = Json::object();
 						result["kind"] = "expr";
 						Json callExpr = Json::object();
 						callExpr["kind"] = "low_level_call";
+						callExpr["callKind"] = lowLevelCallKindString(memberAccess->memberName());
 						callExpr["target"] = exportExpr(memberAccess->expression());
 
 						// Extract value from options
@@ -2172,8 +3768,8 @@ Json exportStmt(Statement const& _stmt)
 						else
 						{
 							Json emptyData = Json::object();
-							emptyData["kind"] = "u256";
-							emptyData["value"] = "0";
+							emptyData["kind"] = "string";
+							emptyData["value"] = "";
 							callExpr["data"] = emptyData;
 						}
 						result["value"] = callExpr;
@@ -2194,6 +3790,7 @@ Json exportStmt(Statement const& _stmt)
 						result["kind"] = "expr";
 						Json callExpr = Json::object();
 						callExpr["kind"] = "low_level_call";
+						callExpr["callKind"] = lowLevelCallKindString(memberAccess->memberName());
 						callExpr["target"] = exportExpr(memberAccess->expression());
 
 						Json valueExpr = Json::object();
@@ -2206,8 +3803,8 @@ Json exportStmt(Statement const& _stmt)
 						else
 						{
 							Json emptyData = Json::object();
-							emptyData["kind"] = "u256";
-							emptyData["value"] = "0";
+							emptyData["kind"] = "string";
+							emptyData["value"] = "";
 							callExpr["data"] = emptyData;
 						}
 						result["value"] = callExpr;
@@ -2262,6 +3859,13 @@ Json exportStmt(Statement const& _stmt)
 		Json result = Json::object();
 		result["kind"] = "inline_assembly";
 		result["body"] = exportYulBlock(asmStmt->operations().root(), asmStmt->dialect());
+		return result;
+	}
+
+	if (dynamic_cast<PlaceholderStatement const*>(&_stmt))
+	{
+		Json result = Json::object();
+		result["kind"] = "placeholder";
 		return result;
 	}
 
@@ -2354,9 +3958,37 @@ Json exportStmt(Statement const& _stmt)
 
 Json exportBody(FunctionDefinition const& _function)
 {
-	Json body = exportStmt(_function.body());
-	if (!body.is_object() || body.value("kind", ""s) != "block")
+	// Save and clear per-function namespaced storage aliases
+	// (the getter prefix map persists across functions)
+	auto savedAliases = namespacedStorageAliases;
+	namespacedStorageAliases.clear();
+
+	Json body;
+	try
+	{
+		body = exportStmt(_function.body());
+		body = expandModifiers(_function, std::move(body));
+	}
+	catch (...)
+	{
+		namespacedStorageAliases = savedAliases;
+		body = Json::object();
+		body["kind"] = "block";
+		body["statements"] = Json::array();
+		// Return empty body as fallback
+		Json ret = Json::object();
+		ret["kind"] = "return";
+		Json unit = Json::object();
+		unit["kind"] = "unit";
+		ret["value"] = unit;
+		body["statements"].emplace_back(ret);
 		return body;
+	}
+	if (!body.is_object() || body.value("kind", ""s) != "block")
+	{
+		namespacedStorageAliases = savedAliases;
+		return body;
+	}
 
 	// Prepend implicit local variable declarations for named return parameters.
 	// In Solidity, named return parameters like "returns (uint256 y)" create an
@@ -2370,8 +4002,19 @@ Json exportBody(FunctionDefinition const& _function)
 				Json letStmt = Json::object();
 				letStmt["kind"] = "let";
 				letStmt["name"] = retParam->name();
-				letStmt["type"] = exportTypeName(retParam->typeName());
-				letStmt["value"] = defaultValueForTypeName(retParam->typeName());
+				try
+				{
+					letStmt["type"] = exportTypeName(retParam->typeName());
+					letStmt["value"] = defaultValueForTypeName(retParam->typeName());
+				}
+				catch (...)
+				{
+					letStmt["type"] = Json("u256");
+					Json zero = Json::object();
+					zero["kind"] = "u256";
+					zero["value"] = "0";
+					letStmt["value"] = zero;
+				}
 				// Prepend at the beginning of the block
 				Json newStatements = Json::array();
 				newStatements.emplace_back(letStmt);
@@ -2422,6 +4065,7 @@ Json exportBody(FunctionDefinition const& _function)
 			body["statements"].emplace_back(ret);
 		}
 	}
+	namespacedStorageAliases = savedAliases;
 	return body;
 }
 
@@ -2431,12 +4075,12 @@ Json exportFunction(FunctionDefinition const& _function, bool _isInternal = fals
 		throw UnsupportedSolCore("Only ordinary implemented functions are supported.");
 	if (!_isInternal && !(_function.visibility() == Visibility::Public || _function.visibility() == Visibility::External))
 		throw UnsupportedSolCore("Only public/external functions are supported.");
-	// Note: we no longer reject functions with modifiers or multiple return values.
-	// Modifiers are ignored (only the function body is exported).
-	// Multiple return values are exported as a tuple return type.
+	// Note: multiple return values are exported as a tuple return type.
 
 	Json result = Json::object();
-	result["name"] = _function.name();
+	result["name"] = exportedFunctionName(_function);
+	if (result["name"] != (_function.name().empty() ? "_unnamed" : _function.name()))
+		result["originalName"] = _function.name().empty() ? "_unnamed" : _function.name();
 	if (_isInternal)
 		result["visibility"] = "internal";
 	if (!_function.modifiers().empty())
@@ -2489,6 +4133,33 @@ Json exportFunction(FunctionDefinition const& _function, bool _isInternal = fals
 		}
 		result["return"] = tupleType;
 	}
+	result["body"] = exportBody(_function);
+	return result;
+}
+
+Json exportConstructor(FunctionDefinition const& _function)
+{
+	if (_function.isOrdinary() || !_function.isImplemented())
+		throw UnsupportedSolCore("Only implemented constructors are supported.");
+
+	Json result = Json::object();
+	result["name"] = "constructor";
+	result["params"] = Json::array();
+	for (auto const& parameter: _function.parameters())
+	{
+		try
+		{
+			result["params"].emplace_back(exportParam(*parameter));
+		}
+		catch (...)
+		{
+			Json param = Json::object();
+			param["name"] = parameter->name().empty() ? ("arg" + std::to_string(parameter->id())) : parameter->name();
+			param["type"] = Json("u256");
+			result["params"].emplace_back(param);
+		}
+	}
+	result["return"] = Json("unit");
 	result["body"] = exportBody(_function);
 	return result;
 }
@@ -2623,7 +4294,78 @@ namespace v0_8
 
 solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std::string const& _contractName)
 {
+	struct ActiveCompilerStackScope
+	{
+		CompilerStack const* saved = activeCompilerStack;
+		explicit ActiveCompilerStackScope(CompilerStack const& _compilerStack)
+		{
+			activeCompilerStack = &_compilerStack;
+		}
+		~ActiveCompilerStackScope()
+		{
+			activeCompilerStack = saved;
+		}
+	} activeCompilerStackScope(_compilerStack);
+
 	ContractDefinition const& contract = _compilerStack.contractDefinition(_contractName);
+
+	// --- Detect namespaced storage getters (ERC-7201 pattern) ---
+	// Clear thread-local state from any previous export
+	namespacedStorageAliases.clear();
+	namespacedGetterPrefixes.clear();
+	namespacedMappingFields.clear();
+	exportedFunctionNames.clear();
+
+	std::vector<NamespacedStorageGetter> namespacedGetters;
+	// Scan all functions in the contract hierarchy for namespaced storage getters
+	for (FunctionDefinition const* function : contract.definedFunctions())
+	{
+		StructDefinition const* structDef = nullptr;
+		if (isNamespacedStorageGetter(*function, &structDef))
+		{
+			std::string prefix = derivePrefix(structDef->name());
+			std::string fieldName = deriveSubStorageFieldName(structDef->name());
+			namespacedGetters.push_back({function, structDef, prefix, fieldName});
+			namespacedGetterPrefixes[function] = prefix;
+			// Track which prefixed fields are mappings
+			for (auto const& member : structDef->members())
+			{
+				if (dynamic_cast<Mapping const*>(&member->typeName()))
+					namespacedMappingFields.insert(prefix + member->name());
+			}
+		}
+	}
+	// Also scan base contracts
+	for (auto const* baseContract : contract.annotation().linearizedBaseContracts)
+	{
+		if (baseContract == &contract)
+			continue;
+		for (FunctionDefinition const* function : baseContract->definedFunctions())
+		{
+			StructDefinition const* structDef = nullptr;
+			if (isNamespacedStorageGetter(*function, &structDef))
+			{
+				// Avoid duplicates
+				bool alreadyFound = false;
+				for (auto const& g : namespacedGetters)
+					if (g.function->name() == function->name())
+						alreadyFound = true;
+				if (!alreadyFound)
+				{
+					std::string prefix = derivePrefix(structDef->name());
+					std::string fieldName = deriveSubStorageFieldName(structDef->name());
+					namespacedGetters.push_back({function, structDef, prefix, fieldName});
+					namespacedGetterPrefixes[function] = prefix;
+					for (auto const& member : structDef->members())
+					{
+						if (dynamic_cast<Mapping const*>(&member->typeName()))
+							namespacedMappingFields.insert(prefix + member->name());
+					}
+				}
+			}
+		}
+	}
+	// --- End namespaced storage getter detection ---
 
 	Json solcore = Json::object();
 	solcore["solcoreVersion"] = "0.1.0";
@@ -2633,42 +4375,88 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	for (auto const& [key, value]: metadata.items())
 		solcore[key] = value;
 	solcore["crate_name"] = contract.name();
+	solcore["deployedCodeSize"] =
+		std::to_string(_compilerStack.runtimeObject(_contractName).bytecode.size());
 
 	Json typeDecls = Json::array();
+	Json subStorageGetters = Json::array();
 	Json storageFields = Json::array();
-	for (VariableDeclaration const* stateVar: contract.stateVariables())
+	std::set<std::string> exportedFieldNames;
+
+	// Helper lambda to export state variables from a contract definition
+	auto exportStateVars = [&](ContractDefinition const* source)
 	{
-		// Skip constant variables — they are inlined at usage sites
-		if (stateVar->isConstant())
-			continue;
-		// Skip immutable variables whose value can be successfully inlined.
-		// If inlining the value would fail (e.g., function pointer, unsupported expression),
-		// the identifier handler falls back to storage_get, so we must include the field.
-		if (stateVar->immutable() && stateVar->value())
+		for (VariableDeclaration const* stateVar: source->stateVariables())
 		{
+			// Skip constant variables — they are inlined at usage sites
+			if (stateVar->isConstant())
+				continue;
+			// Skip already-exported fields (can happen with diamond inheritance)
+			if (exportedFieldNames.count(stateVar->name()))
+				continue;
+			// Skip immutable variables whose value can be successfully inlined.
+			if (stateVar->immutable() && stateVar->value())
+			{
+				try
+				{
+					(void)exportExpr(*stateVar->value());
+					continue;
+				}
+				catch (...)
+				{
+				}
+			}
 			try
 			{
-				(void)exportExpr(*stateVar->value());
-				continue; // Inlining works — skip from Storage
+				storageFields.emplace_back(exportStorageField(_compilerStack, contract, *stateVar));
+				exportedFieldNames.insert(stateVar->name());
 			}
-			catch (...)
+			catch (UnsupportedSolCore const&)
 			{
-				// Inlining failed — include in Storage so storage_get can find it
+			}
+			catch (std::exception const&)
+			{
 			}
 		}
-		try
+	};
+
+	// Export state variables from the full inheritance hierarchy
+	// Iterate in linearization order (most-base first) so storage layout matches
+	{
+		auto const& bases = contract.annotation().linearizedBaseContracts;
+		for (auto it = bases.rbegin(); it != bases.rend(); ++it)
+			exportStateVars(*it);
+	}
+
+	// --- Flatten namespaced storage struct fields into Storage ---
+	for (auto const& getter : namespacedGetters)
+	{
+		for (auto const& member : getter.structDef->members())
 		{
-			storageFields.emplace_back(exportField(*stateVar));
-		}
-		catch (UnsupportedSolCore const&)
-		{
-			// Skip state variables with unsupported types
-		}
-		catch (std::exception const&)
-		{
-			// Skip state variables that cause unexpected errors during export
+			std::string flatName = getter.prefix + member->name();
+			// Skip if we already exported a field with this name
+			if (exportedFieldNames.count(flatName))
+				continue;
+			try
+			{
+				Json field = Json::object();
+				field["name"] = flatName;
+				field["type"] = exportTypeName(member->typeName());
+				storageFields.emplace_back(field);
+				exportedFieldNames.insert(flatName);
+			}
+			catch (UnsupportedSolCore const&)
+			{
+				// Skip fields with unsupported types
+			}
+			catch (std::exception const&)
+			{
+				// Skip fields that cause unexpected errors
+			}
 		}
 	}
+	// --- End flatten namespaced storage ---
+
 	typeDecls.emplace_back(runtimeTypeDecl("Storage", std::move(storageFields)));
 
 	Json callEnvFields = Json::array();
@@ -2676,10 +4464,31 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	callEnvFields.emplace_back(Json{{"name", "msgValue"}, {"type", "u256"}});
 	callEnvFields.emplace_back(Json{{"name", "blockTimestamp"}, {"type", "u256"}});
 	callEnvFields.emplace_back(Json{{"name", "blockNumber"}, {"type", "u256"}});
+	callEnvFields.emplace_back(Json{{"name", "chainId"}, {"type", "u256"}});
 	callEnvFields.emplace_back(Json{{"name", "thisAddress"}, {"type", "address"}});
+	{
+		Json calldataType = Json::object();
+		calldataType["kind"] = "array";
+		calldataType["element"] = "u8";
+		callEnvFields.emplace_back(Json{{"name", "calldata"}, {"type", calldataType}});
+	}
 	typeDecls.emplace_back(runtimeTypeDecl("CallEnv", std::move(callEnvFields)));
 	Json worldStateFields = Json::array();
 	worldStateFields.emplace_back(Json{{"name", "contractBalance"}, {"type", "u256"}});
+	worldStateFields.emplace_back(Json{{"name", "codeSize"}, {"type", Json{
+		{"kind", "mapping"},
+		{"key", "address"},
+		{"value", "u256"}
+	}}});
+	worldStateFields.emplace_back(Json{{"name", "contractStorage"}, {"type", Json{
+		{"kind", "mapping"},
+		{"key", "address"},
+		{"value", Json{
+			{"kind", "mapping"},
+			{"key", "u256"},
+			{"value", "u256"}
+		}}
+	}}});
 	typeDecls.emplace_back(runtimeTypeDecl("WorldState", std::move(worldStateFields)));
 	typeDecls.emplace_back(runtimeTypeDecl("Memory", Json::array()));
 	typeDecls.emplace_back(runtimeTypeDecl("ByteArray", Json::array()));
@@ -2742,7 +4551,78 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 		}
 	}
 
+	// Also export struct types from all reachable source units — including
+	// base contracts, imported libraries, and transitively imported files.
+	{
+		std::set<std::string> addedTypeNames;
+		for (auto const& existing : typeDecls)
+			addedTypeNames.insert(existing.value("name", ""));
+
+		auto tryAddStruct = [&](StructDefinition const* structDef)
+		{
+			if (addedTypeNames.count(structDef->name()))
+				return;
+			Json structFields = Json::array();
+			for (auto const& member : structDef->members())
+			{
+				try
+				{
+					structFields.emplace_back(exportField(*member));
+				}
+				catch (...)
+				{
+				}
+			}
+			typeDecls.emplace_back(runtimeTypeDecl(structDef->name(), std::move(structFields)));
+			addedTypeNames.insert(structDef->name());
+		};
+
+		// Collect all reachable source units by walking the import graph
+		std::set<SourceUnit const*> visitedUnits;
+		std::vector<SourceUnit const*> unitQueue;
+		unitQueue.push_back(&contract.sourceUnit());
+		for (auto const* baseContract : contract.annotation().linearizedBaseContracts)
+			unitQueue.push_back(&baseContract->sourceUnit());
+
+		while (!unitQueue.empty())
+		{
+			SourceUnit const* unit = unitQueue.back();
+			unitQueue.pop_back();
+			if (!visitedUnits.insert(unit).second)
+				continue;
+
+			// Scan this source unit for struct definitions
+			for (auto const& node : unit->nodes())
+			{
+				if (auto const* structDef = dynamic_cast<StructDefinition const*>(node.get()))
+					tryAddStruct(structDef);
+				if (auto const* contractNode = dynamic_cast<ContractDefinition const*>(node.get()))
+					for (auto const* structDef : contractNode->definedStructs())
+						tryAddStruct(structDef);
+				// Follow imports to reach transitively imported source units
+				if (auto const* importDir = dynamic_cast<ImportDirective const*>(node.get()))
+					if (importDir->annotation().sourceUnit)
+						unitQueue.push_back(importDir->annotation().sourceUnit);
+			}
+		}
+	}
+
 	solcore["type_decls"] = std::move(typeDecls);
+	solcore["sub_storage_getters"] = std::move(subStorageGetters);
+	Json foreignContracts = Json::array();
+	for (std::string const& candidate: _compilerStack.contractNames())
+	{
+		try
+		{
+			foreignContracts.emplace_back(
+				exportForeignContractSummary(_compilerStack, candidate)
+			);
+		}
+		catch (...)
+		{
+		}
+	}
+	solcore["foreign_contracts"] = std::move(foreignContracts);
 
 	Json state = Json::object();
 	state["name"] = "ExecState";
@@ -2755,12 +4635,102 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	stateFields.emplace_back(Json{{"name", "env"}, {"type", Json{{"kind", "named"}, {"name", "CallEnv"}}}});
 	state["fields"] = std::move(stateFields);
 	solcore["state"] = std::move(state);
+	if (auto const* ctor = contract.constructor())
+	{
+		if (ctor->isImplemented())
+		{
+			try
+			{
+				solcore["constructor"] = exportConstructor(*ctor);
+			}
+			catch (UnsupportedSolCore const&)
+			{
+				// Skip unsupported constructors
+			}
+			catch (std::exception const&)
+			{
+				// Skip constructors that cause unexpected export errors
+			}
+		}
+	}
+
+	Json dispatchEntries = Json::array();
+	try
+	{
+		for (auto const& [selector, functionType]: contract.interfaceFunctions())
+		{
+			(void)selector;
+			if (!functionType)
+				continue;
+			dispatchEntries.emplace_back(
+				exportDispatchEntry(
+					functionType,
+					dynamic_cast<FunctionDefinition const*>(&functionType->declaration())
+				)
+			);
+		}
+	}
+	catch (...)
+	{
+	}
+	solcore["dispatch_entries"] = std::move(dispatchEntries);
 
 	Json functions = Json::array();
 	Json internalFunctions = Json::array();
+
+	// Collect exported internal function names to avoid duplicates
+	std::set<std::string> exportedInternalNames;
+
+	// Build a set of namespaced getter definitions to skip during export
+	std::set<FunctionDefinition const*> namespacedGetterDefinitions;
+	for (auto const& getter : namespacedGetters)
+		namespacedGetterDefinitions.insert(getter.function);
+
+	std::vector<FunctionDefinition const*> overloadCandidates;
+	for (FunctionDefinition const* function : contract.definedFunctions())
+	{
+		if (!function->isOrdinary() || !function->isImplemented())
+			continue;
+		if (namespacedGetterDefinitions.count(function))
+			continue;
+		overloadCandidates.push_back(function);
+	}
+	for (auto const* baseContract : contract.annotation().linearizedBaseContracts)
+	{
+		if (baseContract == &contract)
+			continue;
+		for (FunctionDefinition const* function : baseContract->definedFunctions())
+		{
+			if (!function->isOrdinary() || !function->isImplemented())
+				continue;
+			if (namespacedGetterDefinitions.count(function))
+				continue;
+			overloadCandidates.push_back(function);
+		}
+	}
+	assignExportedFunctionNames(overloadCandidates);
+	std::set<FunctionDefinition const*> superReferencedFunctions =
+		collectSuperReferencedFunctions(contract);
+	for (FunctionDefinition const* function: superReferencedFunctions)
+		exportedFunctionNames[function] = contractScopedSuperAlias(*function);
+
+	subStorageGetters = Json::array();
+	for (auto const& getter : namespacedGetters)
+	{
+		Json entry = Json::object();
+		entry["function"] = exportedFunctionName(*getter.function);
+		entry["field"] = getter.fieldName;
+		entry["type"] = getter.structDef->name();
+		subStorageGetters.emplace_back(std::move(entry));
+	}
+
+	// First pass: export functions defined directly in this contract
 	for (FunctionDefinition const* function: contract.definedFunctions())
 	{
 		if (!function->isOrdinary() || !function->isImplemented())
+			continue;
+		// Skip namespaced storage getter functions — they are not real functions
+		if (namespacedGetterDefinitions.count(function))
 			continue;
 		if (function->visibility() == Visibility::Public || function->visibility() == Visibility::External)
 		{
@@ -2794,6 +4764,82 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 			}
 		}
 	}
+
+	// Track which internal function names we already exported
+	for (auto const& f : internalFunctions)
+		if (f.contains("name") && f["name"].is_string())
+			exportedInternalNames.insert(f["name"].get<std::string>());
+
+	// Track which public function names we already exported
+	std::set<std::string> exportedPublicNames;
+	for (auto const& f : functions)
+		if (f.contains("name") && f["name"].is_string())
+			exportedPublicNames.insert(f["name"].get<std::string>());
+
+	// Second pass: export inherited public functions from base contracts,
+	// iterating in reverse linearization order (most-base first) so that
+	// actual implementations are preferred over super-delegating overrides.
+	{
+		auto const& bases = contract.annotation().linearizedBaseContracts;
+		for (auto it = bases.rbegin(); it != bases.rend(); ++it)
+		{
+			auto const* baseContract = *it;
+			if (baseContract == &contract)
+				continue;
+			for (FunctionDefinition const* function : baseContract->definedFunctions())
+			{
+				if (!function->isOrdinary() || !function->isImplemented())
+					continue;
+				if (namespacedGetterDefinitions.count(function))
+					continue;
+				if (function->visibility() != Visibility::Public && function->visibility() != Visibility::External)
+					continue;
+				if (superReferencedFunctions.count(function))
+					continue;
+				if (exportedPublicNames.count(exportedFunctionName(*function)))
+					continue;
+				try
+				{
+					functions.emplace_back(exportFunction(*function));
+					exportedPublicNames.insert(exportedFunctionName(*function));
+				}
+				catch (UnsupportedSolCore const&) {}
+				catch (std::exception const&) {}
+			}
+		}
+	}
+
+	// Third pass: export inherited internal functions from base contracts
+	// (most-derived first so overrides win)
+	for (auto const* baseContract : contract.annotation().linearizedBaseContracts)
+	{
+		if (baseContract == &contract)
+			continue; // Skip self
+		for (FunctionDefinition const* function : baseContract->definedFunctions())
+		{
+			if (!function->isOrdinary() || !function->isImplemented())
+				continue;
+			// Skip namespaced storage getter functions
+			if (namespacedGetterDefinitions.count(function))
+				continue;
+			bool needsSuperAlias = superReferencedFunctions.count(function);
+			if (
+				(function->visibility() == Visibility::Public || function->visibility() == Visibility::External) &&
+				!needsSuperAlias
+			)
+				continue; // Already handled in public pass above
+			if (exportedInternalNames.count(exportedFunctionName(*function)))
+				continue; // Already exported (overridden in derived contract)
+			try
+			{
+				internalFunctions.emplace_back(exportFunction(*function, /*_isInternal=*/true));
+				exportedInternalNames.insert(exportedFunctionName(*function));
+			}
+			catch (UnsupportedSolCore const&) {}
+			catch (std::exception const&) {}
+		}
+	}
+
 	// Export receive() function if present
 	if (auto const* recv = contract.receiveFunction())
 	{
@@ -2804,7 +4850,27 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 				Json f = Json::object();
 				f["name"] = "receive";
 				f["params"] = Json::array();
-				f["return"] = Json("unit");
+				// Export actual parameters if the receive function has them
+				for (auto const& parameter : recv->parameters())
+				{
+					try { f["params"].emplace_back(exportParam(*parameter)); }
+					catch (...) {
+						Json placeholder = Json::object();
+						placeholder["name"] = parameter->name().empty() ? ("arg" + std::to_string(parameter->id())) : parameter->name();
+						placeholder["type"] = Json("u256");
+						f["params"].emplace_back(placeholder);
+					}
+				}
+				// Export actual return type
+				if (recv->returnParameters().empty())
+					f["return"] = Json("unit");
+				else if (recv->returnParameters().size() == 1)
+				{
+					try { f["return"] = exportTypeName(recv->returnParameters().front()->typeName()); }
+					catch (...) { f["return"] = Json("u256"); }
+				}
+				else
+					f["return"] = Json("unit");
 				f["body"] = exportBody(*recv);
 				functions.emplace_back(f);
 			}
@@ -2828,7 +4894,27 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 				Json f = Json::object();
 				f["name"] = "fallback";
 				f["params"] = Json::array();
-				f["return"] = Json("unit");
+				// Export actual parameters if the fallback has them
+				for (auto const& parameter : fb->parameters())
+				{
+					try { f["params"].emplace_back(exportParam(*parameter)); }
+					catch (...) {
+						Json placeholder = Json::object();
+						placeholder["name"] = parameter->name().empty() ? ("arg" + std::to_string(parameter->id())) : parameter->name();
+						placeholder["type"] = Json("u256");
+						f["params"].emplace_back(placeholder);
+					}
+				}
+				// Export actual return type
+				if (fb->returnParameters().empty())
+					f["return"] = Json("unit");
+				else if (fb->returnParameters().size() == 1)
+				{
+					try { f["return"] = exportTypeName(fb->returnParameters().front()->typeName()); }
+					catch (...) { f["return"] = Json("u256"); }
+				}
+				else
+					f["return"] = Json("unit");
 				f["body"] = exportBody(*fb);
 				functions.emplace_back(f);
 			}
@@ -2843,9 +4929,69 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 		}
 	}
 
+	// Disambiguate overloaded function names.
+	// Lean doesn't support overloading, so functions with the same name
+	// get a suffix based on parameter count or parameter types.
+	auto disambiguate = [](Json& funcs) {
+		// Count occurrences of each name
+		std::map<std::string, int> nameCounts;
+		for (auto const& f : funcs)
+			if (f.contains("name") && f["name"].is_string())
+				nameCounts[f["name"].get<std::string>()]++;
+
+		// For names that appear more than once, disambiguate
+		std::map<std::string, int> nameIndex;
+		for (auto& f : funcs)
+		{
+			if (!f.contains("name") || !f["name"].is_string())
+				continue;
+			std::string name = f["name"].get<std::string>();
+			if (nameCounts[name] <= 1)
+				continue;
+
+			// Build suffix from parameter count
+			int paramCount = 0;
+			if (f.contains("params") && f["params"].is_array())
+				paramCount = static_cast<int>(f["params"].size());
+
+			// Build suffix from param count; if that still clashes, add type abbreviations
+			std::string candidate = name + "_" + std::to_string(paramCount);
+			nameIndex[candidate]++;
+			if (nameIndex[candidate] > 1)
+			{
+				// Same name AND same param count — disambiguate with type abbreviations
+				std::string typeSuffix;
+				if (f.contains("params") && f["params"].is_array())
+					for (auto const& p : f["params"])
+					{
+						if (!typeSuffix.empty()) typeSuffix += "_";
+						std::string ty = "u256";
+						if (p.contains("type"))
+						{
+							if (p["type"].is_string())
+								ty = p["type"].get<std::string>();
+							else if (p["type"].is_object() && p["type"].contains("kind"))
+								ty = p["type"]["kind"].get<std::string>();
+						}
+						// Abbreviate common types
+						if (ty == "address") ty = "addr";
+						else if (ty == "mapping") ty = "map";
+						else if (ty.length() > 4) ty = ty.substr(0, 4);
+						typeSuffix += ty;
+					}
+				candidate = name + "_" + typeSuffix;
+			}
+
+			f["name"] = candidate;
+			f["originalName"] = name;
+		}
+	};
+
+	disambiguate(functions);
+	disambiguate(internalFunctions);
+
 	solcore["functions"] = std::move(functions);
-	if (!internalFunctions.empty())
-		solcore["internal_functions"] = std::move(internalFunctions);
+	solcore["internal_functions"] = std::move(internalFunctions);
 
 	Json events = Json::array();
 	for (EventDefinition const* event: contract.events())
@@ -2861,44 +5007,53 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	}
 	solcore["events"] = std::move(events);
 
-	// Export enum declarations (including inherited ones)
+	// Export enum declarations from every source unit reachable through the
+	// active compiler stack — not just the contract's own SourceUnit. Enums
+	// defined in imported library files (e.g. RoundingMode in Fixed.sol) must
+	// be available so downstream consumers can resolve `EnumName.VARIANT`
+	// constants to their integer values. (REV-271/bug_013 fix.)
 	Json enumDecls = Json::array();
-	for (auto const& node : contract.sourceUnit().nodes())
-	{
-		if (auto const* enumDef = dynamic_cast<EnumDefinition const*>(node.get()))
+	auto recordEnum = [&](EnumDefinition const& _enumDef) {
+		// Avoid duplicates by name (matches downstream lookup).
+		for (auto const& existing : enumDecls)
+			if (existing.value("name", "") == _enumDef.name())
+				return;
+		Json decl = Json::object();
+		decl["name"] = _enumDef.name();
+		decl["variants"] = Json::array();
+		for (auto const& member : _enumDef.members())
+			decl["variants"].emplace_back(member->name());
+		enumDecls.emplace_back(std::move(decl));
+	};
+	auto walkSourceUnit = [&](SourceUnit const& _unit) {
+		for (auto const& node : _unit.nodes())
 		{
-			Json decl = Json::object();
-			decl["name"] = enumDef->name();
-			decl["variants"] = Json::array();
-			for (auto const& member : enumDef->members())
-				decl["variants"].emplace_back(member->name());
-			enumDecls.emplace_back(decl);
+			if (auto const* enumDef = dynamic_cast<EnumDefinition const*>(node.get()))
+				recordEnum(*enumDef);
+			else if (auto const* contractNode = dynamic_cast<ContractDefinition const*>(node.get()))
+				for (auto const& subNode : contractNode->subNodes())
+					if (auto const* enumDef = dynamic_cast<EnumDefinition const*>(subNode.get()))
+						recordEnum(*enumDef);
 		}
-	}
-	// Also check enums defined inside contracts and interfaces in the same source unit
-	for (auto const& node : contract.sourceUnit().nodes())
+	};
+	if (activeCompilerStack)
 	{
-		if (auto const* contractNode = dynamic_cast<ContractDefinition const*>(node.get()))
+		for (auto const& sourceName : activeCompilerStack->sourceNames())
 		{
-			for (auto const& subNode : contractNode->subNodes())
+			try
 			{
-				if (auto const* enumDef = dynamic_cast<EnumDefinition const*>(subNode.get()))
-				{
-					Json decl = Json::object();
-					decl["name"] = enumDef->name();
-					decl["variants"] = Json::array();
-					for (auto const& member : enumDef->members())
-						decl["variants"].emplace_back(member->name());
-					// Avoid duplicates
-					bool exists = false;
-					for (auto const& existing : enumDecls)
-						if (existing.value("name", "") == enumDef->name())
-							exists = true;
-					if (!exists)
-						enumDecls.emplace_back(decl);
-				}
+				walkSourceUnit(activeCompilerStack->ast(sourceName));
+			}
+			catch (...)
+			{
+				// Best-effort: skip unparsable / missing units.
 			}
 		}
+	}
+	else
+	{
+		// Fallback for callers without a compiler stack context (legacy path).
+		walkSourceUnit(contract.sourceUnit());
 	}
 	if (!enumDecls.empty())
 		solcore["enum_decls"] = std::move(enumDecls);
