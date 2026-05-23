@@ -29,7 +29,10 @@
 
 #include <libsolutil/Visitor.h>
 
+#include <algorithm>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 using namespace solidity;
 using namespace solidity::frontend;
@@ -78,6 +81,62 @@ static thread_local std::map<FunctionDefinition const*, std::string> namespacedG
 static thread_local std::set<std::string> namespacedMappingFields;
 static thread_local std::map<FunctionDefinition const*, std::string> exportedFunctionNames;
 static thread_local CompilerStack const* activeCompilerStack = nullptr;
+static thread_local ContractDefinition const* activeExportContract = nullptr;
+
+std::string exportedFunctionName(FunctionDefinition const& _function);
+
+template <class F>
+void forEachEnumDefinition(SourceUnit const& _unit, F&& _f)
+{
+	for (auto const& node : _unit.nodes())
+	{
+		if (auto const* enumDef = dynamic_cast<EnumDefinition const*>(node.get()))
+			_f(*enumDef);
+		else if (auto const* contractNode = dynamic_cast<ContractDefinition const*>(node.get()))
+			for (auto const& subNode : contractNode->subNodes())
+				if (auto const* enumDef = dynamic_cast<EnumDefinition const*>(subNode.get()))
+					_f(*enumDef);
+	}
+}
+
+std::string enumDefinitionIdentity(EnumDefinition const& _enumDef)
+{
+	return _enumDef.sourceUnitName() + ":" + _enumDef.name() + "#" + std::to_string(_enumDef.id());
+}
+
+bool enumNameNeedsQualification(EnumDefinition const& _enumDef)
+{
+	if (!activeCompilerStack)
+		return false;
+	bool seenDifferentDefinition = false;
+	auto const ownIdentity = enumDefinitionIdentity(_enumDef);
+	for (auto const& sourceName: activeCompilerStack->sourceNames())
+	{
+		try
+		{
+			forEachEnumDefinition(
+				activeCompilerStack->ast(sourceName),
+				[&](EnumDefinition const& candidate) {
+					if (
+						candidate.name() == _enumDef.name() &&
+						enumDefinitionIdentity(candidate) != ownIdentity
+					)
+						seenDifferentDefinition = true;
+				});
+		}
+		catch (...)
+		{
+		}
+	}
+	return seenDifferentDefinition;
+}
+
+std::string exportedEnumName(EnumDefinition const& _enumDef)
+{
+	if (enumNameNeedsQualification(_enumDef))
+		return enumDefinitionIdentity(_enumDef);
+	return _enumDef.name();
+}
 
 /// Derive a field prefix from a struct name.
 /// "TokenStorage" → "token_", "MyDataStorage" → "myData_"
@@ -274,6 +333,78 @@ Json jsonStringArray(std::vector<std::string> const& _values)
 std::string exportedContractId(ContractDefinition const& _contract)
 {
 	return _contract.fullyQualifiedName();
+}
+
+std::string solcoreDeployedCodeSize(ContractDefinition const& _contract)
+{
+	// SolCore export is intentionally available after semantic analysis and
+	// must not force bytecode generation. Constructor semantics only need the
+	// source-backed fact that deployable contracts have non-empty runtime code
+	// after construction; exact byte size belongs to the EVM bytecode artifact.
+	if (_contract.isInterface() || _contract.abstract())
+		return "0";
+	return "1";
+}
+
+std::optional<ContractDefinition const*> uniqueInterfaceImplementation(
+	CompilerStack const& _compilerStack,
+	ContractDefinition const& _interfaceContract
+)
+{
+	if (!_interfaceContract.isInterface())
+		return std::nullopt;
+
+	auto const requiredFunctions = _interfaceContract.interfaceFunctions();
+	if (requiredFunctions.empty())
+		return std::nullopt;
+
+	std::vector<ContractDefinition const*> candidates;
+	for (std::string const& candidateName: _compilerStack.contractNames())
+	{
+		ContractDefinition const& candidate = _compilerStack.contractDefinition(candidateName);
+		if (candidate.fullyQualifiedName() == _interfaceContract.fullyQualifiedName())
+			continue;
+		if (candidate.isInterface() || candidate.isLibrary() || candidate.abstract())
+			continue;
+
+		auto const candidateFunctions = candidate.interfaceFunctions();
+		bool coversInterface = true;
+		for (auto const& [selector, functionType]: requiredFunctions)
+		{
+			(void)functionType;
+			if (!candidateFunctions.count(selector))
+			{
+				coversInterface = false;
+				break;
+			}
+		}
+		if (coversInterface)
+			candidates.emplace_back(&candidate);
+	}
+
+	std::sort(
+		candidates.begin(),
+		candidates.end(),
+		[](ContractDefinition const* lhs, ContractDefinition const* rhs)
+		{
+			return lhs->fullyQualifiedName() < rhs->fullyQualifiedName();
+		}
+	);
+	candidates.erase(
+		std::unique(
+			candidates.begin(),
+			candidates.end(),
+			[](ContractDefinition const* lhs, ContractDefinition const* rhs)
+			{
+				return lhs->fullyQualifiedName() == rhs->fullyQualifiedName();
+			}
+		),
+		candidates.end()
+	);
+
+	if (candidates.size() != 1)
+		return std::nullopt;
+	return candidates.front();
 }
 
 std::optional<Json> exportSimpleType(Type const& _type)
@@ -541,7 +672,8 @@ Json exportRevertPayload(FunctionCall const& _call);
 Json exportDispatchEntry(FunctionTypePointer const& _funType, FunctionDefinition const* _functionDef = nullptr)
 {
 	Json entry = Json::object();
-	entry["function"] = _funType->declaration().name();
+	entry["abiFunction"] = _funType->declaration().name();
+	entry["function"] = _functionDef ? exportedFunctionName(*_functionDef) : _funType->declaration().name();
 	entry["signature"] = _funType->externalSignature();
 	entry["selector"] = _funType->externalIdentifierHex();
 	if (_functionDef && _functionDef->isImplemented())
@@ -602,14 +734,6 @@ Json exportForeignContractSummary(CompilerStack const& _compilerStack, std::stri
 	Json summary = Json::object();
 	summary["id"] = exportedContractId(contract);
 	summary["name"] = contract.name();
-	try
-	{
-		summary["deployedCodeSize"] =
-			std::to_string(_compilerStack.runtimeObject(_contractName).bytecode.size());
-	}
-	catch (...)
-	{
-	}
 
 	Json storage = Json::array();
 	try
@@ -676,8 +800,18 @@ std::optional<Json> exportKnownExternalTarget(
 		return std::nullopt;
 
 	Json target = Json::object();
-	ContractDefinition const& contract = contractType->contractDefinition();
-	target["contractId"] = exportedContractId(contract);
+	ContractDefinition const* targetContract = &contractType->contractDefinition();
+	if (auto const* baseIdentifier = dynamic_cast<Identifier const*>(&_memberAccess.expression()))
+		if (baseIdentifier->name() == "this" && activeExportContract)
+			targetContract = activeExportContract;
+	target["contractId"] = exportedContractId(*targetContract);
+	if (targetContract == &contractType->contractDefinition())
+		if (auto implementation = uniqueInterfaceImplementation(_compilerStack, *targetContract))
+	{
+		target["declaredContractId"] = exportedContractId(*targetContract);
+		target["contractId"] = exportedContractId(**implementation);
+		target["producerResolution"] = "unique_interface_implementation";
+	}
 	target["function"] = _memberAccess.memberName();
 	target["resolutionKind"] = "cross_contract";
 
@@ -692,7 +826,7 @@ std::optional<Json> exportKnownExternalTarget(
 	{
 		target["selector"] = variableDef->externalIdentifierHex();
 		if (auto resolution =
-				exportStorageGetterResolution(_compilerStack, contract, *variableDef, {}))
+				exportStorageGetterResolution(_compilerStack, *targetContract, *variableDef, {}))
 		{
 			target["resolutionKind"] = "storage_getter";
 			target["resolution"] = *resolution;
@@ -716,7 +850,7 @@ std::optional<Json> exportKnownExternalTarget(
 		if (!target.contains("selector"))
 			target["selector"] = functionDef->externalIdentifierHex();
 		if (auto resolution =
-				exportStorageGetterResolution(_compilerStack, contract, *functionDef))
+				exportStorageGetterResolution(_compilerStack, *targetContract, *functionDef))
 		{
 			target["resolutionKind"] = "storage_getter";
 			target["resolution"] = *resolution;
@@ -903,9 +1037,10 @@ Json exportTypeName(TypeName const& _typeName)
 		// Check if this user-defined type is an enum
 		if (referencedDecl && dynamic_cast<EnumDefinition const*>(referencedDecl))
 		{
+			auto const* enumDef = dynamic_cast<EnumDefinition const*>(referencedDecl);
 			Json result = Json::object();
 			result["kind"] = "enum";
-			result["name"] = std::string(path.back());
+			result["name"] = exportedEnumName(*enumDef);
 			return result;
 		}
 		Json result = Json::object();
@@ -1145,7 +1280,24 @@ std::string exportedFunctionName(FunctionDefinition const& _function)
 	auto it = exportedFunctionNames.find(&_function);
 	if (it != exportedFunctionNames.end())
 		return it->second;
-	return _function.name().empty() ? "_unnamed" : _function.name();
+	std::string rawName = _function.name().empty() ? "_unnamed" : _function.name();
+	ContractDefinition const* contract = _function.annotation().contract;
+	if (!contract)
+		return rawName;
+	std::set<std::string> matchingSignatures;
+	for (FunctionDefinition const* candidate: contract->definedFunctions())
+	{
+		if (
+			candidate &&
+			candidate->isOrdinary() &&
+			candidate->isImplemented() &&
+			(candidate->name().empty() ? "_unnamed" : candidate->name()) == rawName
+		)
+			matchingSignatures.insert(overloadSignatureSuffix(*candidate));
+	}
+	if (matchingSignatures.size() > 1)
+		return rawName + "_" + overloadSignatureSuffix(_function);
+	return rawName;
 }
 
 std::string contractScopedSuperAlias(FunctionDefinition const& _function)
@@ -1389,7 +1541,7 @@ Json exportExpr(Expression const& _expr)
 			{
 				Json result = Json::object();
 				result["kind"] = "enum_variant";
-				result["enum"] = enumDef->name();
+				result["enum"] = exportedEnumName(*enumDef);
 				result["variant"] = enumValue->name();
 				return result;
 			}
@@ -1579,7 +1731,7 @@ Json exportExpr(Expression const& _expr)
 				{
 					Json result = Json::object();
 					result["kind"] = "enum_variant";
-					result["enum"] = enumDef->name();
+					result["enum"] = exportedEnumName(*enumDef);
 					result["variant"] = enumValue->name();
 					return result;
 				}
@@ -2249,6 +2401,31 @@ Json exportExpr(Expression const& _expr)
 				}
 			}
 
+			// using-for library extension call: receiver.method(args) resolves
+			// to an internal library function whose receiver is the first
+			// parameter. Type/module-qualified L.f(args) calls are handled
+			// below and do not get a receiver argument.
+			if (auto const* funcDef = dynamic_cast<FunctionDefinition const*>(memberAccess->annotation().referencedDeclaration))
+			{
+				Type const* baseType = memberAccess->expression().annotation().type;
+				if (
+					baseType &&
+					baseType->category() != Type::Category::TypeType &&
+					baseType->category() != Type::Category::Module &&
+					funcDef->visibility() <= Visibility::Internal
+				)
+				{
+					Json result = Json::object();
+					result["kind"] = "internal_call";
+					result["function"] = exportedFunctionName(*funcDef);
+					result["args"] = Json::array();
+					result["args"].emplace_back(exportExpr(memberAccess->expression()));
+					for (auto const& arg: call->arguments())
+						result["args"].emplace_back(exportExpr(*arg));
+					return result;
+				}
+			}
+
 			// External contract call: contract.method(args)
 			Type const* baseType = memberAccess->expression().annotation().type;
 			if (baseType && baseType->category() == Type::Category::Contract)
@@ -2261,7 +2438,6 @@ Json exportExpr(Expression const& _expr)
 			// The member access resolves to a FunctionDefinition when calling through a library/type namespace
 			if (auto const* funcDef = dynamic_cast<FunctionDefinition const*>(memberAccess->annotation().referencedDeclaration))
 			{
-				(void)funcDef;
 				Json result = Json::object();
 				result["kind"] = "internal_call";
 				result["function"] = exportedFunctionName(*funcDef);
@@ -3706,6 +3882,31 @@ Json exportStmt(Statement const& _stmt)
 					}
 				}
 
+				// using-for library extension call as statement.
+				if (auto const* funcDef = dynamic_cast<FunctionDefinition const*>(memberAccess->annotation().referencedDeclaration))
+				{
+					Type const* baseType = memberAccess->expression().annotation().type;
+					if (
+						baseType &&
+						baseType->category() != Type::Category::TypeType &&
+						baseType->category() != Type::Category::Module &&
+						funcDef->visibility() <= Visibility::Internal
+					)
+					{
+						Json result = Json::object();
+						result["kind"] = "expr";
+						Json callExpr = Json::object();
+						callExpr["kind"] = "internal_call";
+						callExpr["function"] = exportedFunctionName(*funcDef);
+						callExpr["args"] = Json::array();
+						callExpr["args"].emplace_back(exportExpr(memberAccess->expression()));
+						for (auto const& arg: call->arguments())
+							callExpr["args"].emplace_back(exportExpr(*arg));
+						result["value"] = callExpr;
+						return result;
+					}
+				}
+
 				// External contract call as statement: contract.method(args)
 				Type const* baseType = memberAccess->expression().annotation().type;
 				if (baseType && baseType->category() == Type::Category::Contract)
@@ -3717,12 +3918,11 @@ Json exportStmt(Statement const& _stmt)
 				// Library-qualified or type-qualified function call as statement: L.f(args)
 				if (auto const* funcDef = dynamic_cast<FunctionDefinition const*>(memberAccess->annotation().referencedDeclaration))
 				{
-					(void)funcDef;
 					Json result = Json::object();
 					result["kind"] = "expr";
 					Json callExpr = Json::object();
 					callExpr["kind"] = "internal_call";
-					callExpr["function"] = memberAccess->memberName();
+					callExpr["function"] = exportedFunctionName(*funcDef);
 					callExpr["args"] = Json::array();
 					for (auto const& arg: call->arguments())
 						callExpr["args"].emplace_back(exportExpr(*arg));
@@ -4289,6 +4489,28 @@ Json runtimeTypeDecl(std::string const& _name, Json _fields)
 	return decl;
 }
 
+Json exportSourceImports(SourceUnit const& _sourceUnit)
+{
+	Json imports = Json::array();
+	std::set<std::string> seen;
+	for (auto const& node: _sourceUnit.nodes())
+	{
+		auto const* importDirective = dynamic_cast<ImportDirective const*>(node.get());
+		if (!importDirective)
+			continue;
+		std::string sourcePath =
+			importDirective->annotation().absolutePath.set() ?
+			*importDirective->annotation().absolutePath :
+			std::string{};
+		if (sourcePath.empty())
+			sourcePath = importDirective->path();
+		if (sourcePath.empty() || !seen.insert(sourcePath).second)
+			continue;
+		imports.emplace_back(sourcePath);
+	}
+	return imports;
+}
+
 namespace v0_8
 {
 
@@ -4297,6 +4519,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	struct ActiveCompilerStackScope
 	{
 		CompilerStack const* saved = activeCompilerStack;
+		ContractDefinition const* savedContract = activeExportContract;
 		explicit ActiveCompilerStackScope(CompilerStack const& _compilerStack)
 		{
 			activeCompilerStack = &_compilerStack;
@@ -4304,10 +4527,12 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 		~ActiveCompilerStackScope()
 		{
 			activeCompilerStack = saved;
+			activeExportContract = savedContract;
 		}
 	} activeCompilerStackScope(_compilerStack);
 
 	ContractDefinition const& contract = _compilerStack.contractDefinition(_contractName);
+	activeExportContract = &contract;
 
 	// --- Detect namespaced storage getters (ERC-7201 pattern) ---
 	// Clear thread-local state from any previous export
@@ -4375,8 +4600,9 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	for (auto const& [key, value]: metadata.items())
 		solcore[key] = value;
 	solcore["crate_name"] = contract.name();
-	solcore["deployedCodeSize"] =
-		std::to_string(_compilerStack.runtimeObject(_contractName).bytecode.size());
+	solcore["deployedCodeSize"] = solcoreDeployedCodeSize(contract);
+	solcore["deployedCodeSizeMode"] = "semantic-nonzero";
+	solcore["source_imports"] = exportSourceImports(contract.sourceUnit());
 
 	Json typeDecls = Json::array();
 	Json subStorageGetters = Json::array();
@@ -5014,27 +5240,21 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	// constants to their integer values. (REV-271/bug_013 fix.)
 	Json enumDecls = Json::array();
 	auto recordEnum = [&](EnumDefinition const& _enumDef) {
-		// Avoid duplicates by name (matches downstream lookup).
+		auto const enumName = exportedEnumName(_enumDef);
+		// Avoid exact duplicates while preserving distinct same-named enums
+		// from different source units under qualified names.
 		for (auto const& existing : enumDecls)
-			if (existing.value("name", "") == _enumDef.name())
+			if (existing.value("name", "") == enumName)
 				return;
 		Json decl = Json::object();
-		decl["name"] = _enumDef.name();
+		decl["name"] = enumName;
 		decl["variants"] = Json::array();
 		for (auto const& member : _enumDef.members())
 			decl["variants"].emplace_back(member->name());
 		enumDecls.emplace_back(std::move(decl));
 	};
 	auto walkSourceUnit = [&](SourceUnit const& _unit) {
-		for (auto const& node : _unit.nodes())
-		{
-			if (auto const* enumDef = dynamic_cast<EnumDefinition const*>(node.get()))
-				recordEnum(*enumDef);
-			else if (auto const* contractNode = dynamic_cast<ContractDefinition const*>(node.get()))
-				for (auto const& subNode : contractNode->subNodes())
-					if (auto const* enumDef = dynamic_cast<EnumDefinition const*>(subNode.get()))
-						recordEnum(*enumDef);
-		}
+		forEachEnumDefinition(_unit, recordEnum);
 	};
 	if (activeCompilerStack)
 	{

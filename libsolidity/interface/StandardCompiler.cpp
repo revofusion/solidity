@@ -1448,7 +1448,8 @@ Json StandardCompiler::compileSolidity(StandardCompiler::InputsAndSettings _inpu
 
 	Json errors = std::move(_inputsAndSettings.errors);
 
-	bool const binariesRequested = isBinaryRequested(_inputsAndSettings.outputSelection);
+	bool const binariesRequested =
+		isBinaryRequested(_inputsAndSettings.outputSelection);
 
 	try
 	{
