@@ -1956,16 +1956,23 @@ BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
 
 BOOST_AUTO_TEST_CASE(solcore_export_is_version_tagged_when_unsupported)
 {
+	// A `transient`-location state variable is deliberately fail-closed at
+	// contract level (exporting it as ordinary persistent storage would be a
+	// false model), so it exercises the whole-contract unsupportedExport
+	// path.  (The original fixture used `cond && cond`, but boolean
+	// conjunction has long since gained faithful `bool_and` lowering.)
 	Json input = generateStandardJson(
 		false,
 		Json(),
 		Json::array({"solcore"}),
 		SolidityCode({
 			{"fileA", R"(
-				pragma solidity >=0.0;
+				pragma solidity >=0.8.28;
 				contract C {
-					function unsupported(bool cond) external pure returns (bool) {
-						return cond && cond;
+					uint256 transient temp;
+					function bump() external returns (uint256) {
+						temp += 1;
+						return temp;
 					}
 				}
 			)"}
@@ -1978,8 +1985,107 @@ BOOST_AUTO_TEST_CASE(solcore_export_is_version_tagged_when_unsupported)
 	Json contractResult = getContractResult(result, "fileA", "C");
 	BOOST_REQUIRE(contractResult["solcore"].is_object());
 	BOOST_CHECK(contractResult["solcore"]["unsupported"].get<bool>());
+	// The structured rejection must say precisely why, not just flag failure.
+	BOOST_CHECK(
+		contractResult["solcore"]["reason"].get<std::string>().find("transient") != std::string::npos);
 	BOOST_CHECK_EQUAL(contractResult["solcore"]["compilerVersion"].get<std::string>(), VersionString);
 	BOOST_CHECK_EQUAL(contractResult["solcore"]["exporterFamily"].get<std::string>(), "solcore-solidity-0.8");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_abi_decode_type_list_and_method_selector)
+{
+	// Regression pin for the Reserve-protocol corpus generation failures
+	// (PermitLib / SignatureCheckerUpgradeable / SafeERC20 /
+	// SafeERC20Upgradeable, plus OZ ERC4626's _tryGetAssetDecimals):
+	//
+	// 1. abi.decode(data, (T1, ...)) — the parenthesized second argument is a
+	//    syntactic *type list* (ElementaryTypeNameExpression components inside
+	//    a TupleExpression), not a value expression. exportExpr used to fall
+	//    through every recognized Expression subtype on it and substitute a
+	//    {"kind":"u256","value":"0","_unsupported_expr":true} placeholder,
+	//    corrupting the call's semantics and failing the whole contract
+	//    downstream (the OCaml frontend fail-louds on the sentinel). It must
+	//    now be exported out-of-band as canonical type-name strings in a
+	//    sibling `decode_types` field, with only the data argument in `args`.
+	//
+	// 2. Interface.method.selector — the base of the member access is a
+	//    function, not a value; value-lowering it used to throw and end in the
+	//    same placeholder. It must now be exported as a `method_selector` node
+	//    with authoritative selector_hex/method_signature read from the type
+	//    annotations.
+	//
+	// The probe bodies below mirror the exact corpus expression shapes
+	// (SafeERC20._callOptionalReturn's `abi.decode(returndata, (bool))` and
+	// SignatureCheckerUpgradeable.isValidERC1271SignatureNow's
+	// `abi.decode(result, (bytes32)) == bytes32(IERC1271.isValidSignature.selector)`).
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.0;
+				interface IERC1271Like {
+					function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4);
+				}
+				library ProbeLib {
+					function probeBool(bytes memory returndata) internal pure returns (bool) {
+						return returndata.length == 0 || abi.decode(returndata, (bool));
+					}
+					function probeSelectorWord(bytes memory result) internal pure returns (bool) {
+						return abi.decode(result, (bytes32)) == bytes32(IERC1271Like.isValidSignature.selector);
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "ProbeLib");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+
+	// Fail-closed: nothing in this artifact may be a silent 0-placeholder or
+	// an unexported body — both probes must lower faithfully.
+	std::string serialized = solcore.dump();
+	BOOST_CHECK(serialized.find("_unsupported_expr") == std::string::npos);
+	BOOST_CHECK(serialized.find("unsupported_body") == std::string::npos);
+
+	BOOST_REQUIRE(solcore["internal_functions"].is_array());
+	BOOST_REQUIRE(solcore["internal_functions"].size() == 2);
+
+	Json const& probeBool = solcore["internal_functions"][0];
+	BOOST_CHECK_EQUAL(probeBool["name"].get<std::string>(), "probeBool");
+	// return returndata.length == 0 || abi.decode(returndata, (bool));
+	Json const& decodeBool = probeBool["body"]["statements"][0]["value"]["rhs"];
+	BOOST_CHECK_EQUAL(decodeBool["kind"].get<std::string>(), "internal_call");
+	BOOST_CHECK_EQUAL(decodeBool["function"].get<std::string>(), "abi_decode");
+	BOOST_REQUIRE(decodeBool["args"].is_array());
+	// Only the data argument — the type list must NOT appear as a value arg.
+	BOOST_REQUIRE(decodeBool["args"].size() == 1);
+	BOOST_CHECK_EQUAL(decodeBool["args"][0]["kind"].get<std::string>(), "local");
+	BOOST_REQUIRE(decodeBool["decode_types"].is_array());
+	BOOST_REQUIRE(decodeBool["decode_types"].size() == 1);
+	BOOST_CHECK_EQUAL(decodeBool["decode_types"][0].get<std::string>(), "bool");
+
+	Json const& probeSelector = solcore["internal_functions"][1];
+	BOOST_CHECK_EQUAL(probeSelector["name"].get<std::string>(), "probeSelectorWord");
+	// return abi.decode(result, (bytes32)) == bytes32(IERC1271Like.isValidSignature.selector);
+	Json const& comparison = probeSelector["body"]["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(comparison["kind"].get<std::string>(), "u256_eq");
+	Json const& decodeWord = comparison["lhs"];
+	BOOST_CHECK_EQUAL(decodeWord["function"].get<std::string>(), "abi_decode");
+	BOOST_REQUIRE(decodeWord["decode_types"].is_array());
+	BOOST_REQUIRE(decodeWord["decode_types"].size() == 1);
+	BOOST_CHECK_EQUAL(decodeWord["decode_types"][0].get<std::string>(), "bytes32");
+	Json const& selector = comparison["rhs"];
+	BOOST_CHECK_EQUAL(selector["kind"].get<std::string>(), "method_selector");
+	BOOST_CHECK_EQUAL(selector["method_name"].get<std::string>(), "isValidSignature");
+	BOOST_CHECK_EQUAL(selector["method_signature"].get<std::string>(), "isValidSignature(bytes32,bytes)");
+	BOOST_CHECK_EQUAL(selector["selector_hex"].get<std::string>(), "1626ba7e");
+	BOOST_CHECK_EQUAL(selector["contractId"].get<std::string>(), "IERC1271Like");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_namespaced_storage)
@@ -2639,26 +2745,34 @@ BOOST_AUTO_TEST_CASE(solcore_export_known_external_target_metadata_and_foreign_r
 	BOOST_CHECK_MESSAGE(
 		solcoreDump.find("\"name\":\"contractStorage\"") != std::string::npos,
 		"WorldState should expose contractStorage for known foreign contract lowering");
+	// The registry used to also carry a heuristic `kind` classification
+	// ("ownable"/"erc20"); that field was removed — consumers now use the
+	// per-contract dispatch_entries/methods metadata instead, so only
+	// registry inclusion is pinned here.
 	BOOST_CHECK_MESSAGE(
 		solcoreDump.find("\"id\":\"fileA:Ownable\"") != std::string::npos,
 		"foreign contract registry should include Ownable");
 	BOOST_CHECK_MESSAGE(
-		solcoreDump.find("\"kind\":\"ownable\"") != std::string::npos,
-		"foreign contract registry should classify Ownable");
-	BOOST_CHECK_MESSAGE(
 		solcoreDump.find("\"id\":\"fileA:Token\"") != std::string::npos,
 		"foreign contract registry should include Token");
+	// knownTarget gained function/resolution/resolutionKind/selector fields
+	// since these pins were first written; the expectations below are the
+	// full current serializations (nlohmann dumps keys alphabetically).
 	BOOST_CHECK_MESSAGE(
-		solcoreDump.find("\"kind\":\"erc20\"") != std::string::npos,
-		"foreign contract registry should classify Token");
-	BOOST_CHECK_MESSAGE(
-		solcoreDump.find("\"knownTarget\":{\"contractId\":\"fileA:Ownable\",\"mutability\":\"view\",\"signature\":\"owner()\"}") != std::string::npos,
+		solcoreDump.find(
+			"\"knownTarget\":{\"contractId\":\"fileA:Ownable\",\"function\":\"owner\",\"mutability\":\"view\","
+			"\"resolution\":{\"field\":\"_owner\",\"keyArgOrder\":[],\"kind\":\"storage_getter\",\"returnType\":\"address\",\"slot\":\"0\"},"
+			"\"resolutionKind\":\"storage_getter\",\"selector\":\"8da5cb5b\",\"signature\":\"owner()\"}") != std::string::npos,
 		"known view calls should carry knownTarget metadata");
 	BOOST_CHECK_MESSAGE(
-		solcoreDump.find("\"knownTarget\":{\"contractId\":\"fileA:Token\",\"mutability\":\"stateful\",\"signature\":\"transfer(address,uint256)\"}") != std::string::npos,
+		solcoreDump.find(
+			"\"knownTarget\":{\"contractId\":\"fileA:Token\",\"function\":\"transfer\",\"mutability\":\"stateful\","
+			"\"resolutionKind\":\"cross_contract\",\"selector\":\"a9059cbb\",\"signature\":\"transfer(address,uint256)\"}") != std::string::npos,
 		"known ERC20 transfer calls should carry knownTarget metadata");
 	BOOST_CHECK_MESSAGE(
-		solcoreDump.find("\"knownTarget\":{\"contractId\":\"fileA:Token\",\"mutability\":\"stateful\",\"signature\":\"transferFrom(address,address,uint256)\"}") != std::string::npos,
+		solcoreDump.find(
+			"\"knownTarget\":{\"contractId\":\"fileA:Token\",\"function\":\"transferFrom\",\"mutability\":\"stateful\","
+			"\"resolutionKind\":\"cross_contract\",\"selector\":\"23b872dd\",\"signature\":\"transferFrom(address,address,uint256)\"}") != std::string::npos,
 		"known ERC20 transferFrom calls should carry knownTarget metadata");
 }
 
@@ -2713,7 +2827,9 @@ BOOST_AUTO_TEST_CASE(solcore_export_try_catch_optioned_contract_call_keeps_known
 		solcoreDump.find("\"method\":\"quantity\"") != std::string::npos,
 		"try/catch call should preserve the contract method name");
 	BOOST_CHECK_MESSAGE(
-		solcoreDump.find("\"knownTarget\":{\"contractId\":\"fileA:IBasket\",\"mutability\":\"view\",\"signature\":\"quantity(address)\"") != std::string::npos,
+		solcoreDump.find(
+			"\"knownTarget\":{\"contractId\":\"fileA:IBasket\",\"function\":\"quantity\",\"mutability\":\"view\","
+			"\"resolutionKind\":\"cross_contract\",\"selector\":\"a5a5828c\",\"signature\":\"quantity(address)\"}") != std::string::npos,
 		"optioned try/catch contract calls should carry knownTarget metadata");
 	BOOST_CHECK_MESSAGE(
 		solcoreDump.find("\"method\":\"disableBasket\"") != std::string::npos,
