@@ -83,6 +83,52 @@ static thread_local std::map<FunctionDefinition const*, std::string> exportedFun
 static thread_local CompilerStack const* activeCompilerStack = nullptr;
 static thread_local ContractDefinition const* activeExportContract = nullptr;
 
+// --- `unchecked { }` block signal (SOLCORE_MATH_BUG_CLASSES_PLAN.md §3.5/Task 11) ---
+//
+// Before this, `unchecked { ... }` carried zero signal through the exporter:
+// every arithmetic op lowered to the same JSON regardless of source-level
+// `unchecked`, so the OCaml frontend had no way to distinguish a checked add
+// from a wrapping one. This is a plain ambient (thread-local) flag rather
+// than a threaded parameter because `exportExpr`/`exportStmt` are mutually
+// recursive free functions called from dozens of sites; threading a new
+// parameter through all of them would be a much larger, higher-blast-radius
+// change than this file's existing `thread_local` ambient-context idiom
+// (`namespacedStorageAliases` et al., above) for exactly this kind of
+// "ambient fact about where we are in the AST" state.
+static thread_local bool inUncheckedBlock = false;
+
+/// RAII guard: sets `inUncheckedBlock` for the duration of walking one
+/// `Block`'s statements, restoring the previous value on scope exit (so
+/// nested checked blocks inside an unchecked one, and vice versa, are
+/// handled correctly — Solidity's `unchecked` does not nest by inheriting
+/// the enclosing block's mode, each `Block` carries its own flag).
+struct UncheckedBlockGuard
+{
+	explicit UncheckedBlockGuard(bool _unchecked):
+		m_previous(inUncheckedBlock)
+	{
+		inUncheckedBlock = _unchecked;
+	}
+	~UncheckedBlockGuard() { inUncheckedBlock = m_previous; }
+	UncheckedBlockGuard(UncheckedBlockGuard const&) = delete;
+	UncheckedBlockGuard& operator=(UncheckedBlockGuard const&) = delete;
+private:
+	bool m_previous;
+};
+
+/// Tag a just-built arithmetic-op JSON node with `"unchecked": true` when it
+/// was produced while walking an `unchecked { }` block, so the OCaml
+/// frontend can choose the wrapping (`yul_*`) model instead of the checked
+/// (`u256_*_checked`) one at that site. Additive-only: absent (the default
+/// for every pre-existing corpus JSON file, and every checked-context site)
+/// means exactly what it always meant — checked arithmetic — so this cannot
+/// change behavior for any already-exported JSON.
+void markUncheckedContext(Json& _result)
+{
+	if (inUncheckedBlock)
+		_result["unchecked"] = true;
+}
+
 std::string exportedFunctionName(FunctionDefinition const& _function);
 
 template <class F>
@@ -333,6 +379,13 @@ Json jsonStringArray(std::vector<std::string> const& _values)
 std::string exportedContractId(ContractDefinition const& _contract)
 {
 	return _contract.fullyQualifiedName();
+}
+
+void addInternalLibraryCallContractId(Json& _result, FunctionDefinition const& _function)
+{
+	auto const* library = dynamic_cast<ContractDefinition const*>(_function.scope());
+	if (library && library->isLibrary())
+		_result["contractId"] = exportedContractId(*library);
 }
 
 std::string solcoreDeployedCodeSize(ContractDefinition const& _contract)
@@ -1309,12 +1362,170 @@ std::string contractScopedSuperAlias(FunctionDefinition const& _function)
 		"__super__" + sanitizeExportNameComponent(ownerName);
 }
 
+/// A statically-bound base-contract call resolved against the most-derived
+/// (exporting) contract's C3 linearization. `needsAlias == false` means the
+/// resolved target IS the most-derived implementation of its virtual slot, so
+/// the plain exported slot name already denotes exactly this body and no
+/// flattened `f__super__Owner` sibling is required.
+struct StaticBaseCallTarget
+{
+	FunctionDefinition const* target;
+	bool needsAlias;
+};
+
+/// Classifies a member-access function call as a statically-bound internal
+/// call through a contract qualifier — `super.f(...)` or `Base.f(...)` — and
+/// resolves the EXACT implementation it must dispatch to, following solc's
+/// own dispatch rules (mirrors ASTNode::resolveFunctionCall):
+///   - `super.f(...)`: virtual lookup in _mostDerived's linearization
+///     starting strictly after the contract that lexically contains the call
+///     (NOT the raw referencedDeclaration annotation, which was resolved
+///     against the DEFINING contract's own linearization and is wrong
+///     whenever the most-derived contract interposes another override — the
+///     inherited-override case, e.g. StRSRP1Votes.beginEra emitted inside
+///     StRSRP1VotesV2's artifact).
+///   - `Base.f(...)` (VirtualLookup::Static): bound exactly to the referenced
+///     declaration. Previously this shape fell through to the generic
+///     "library/type-qualified" lowering, whose exportedFunctionName collapses
+///     every same-name/same-signature function in the hierarchy onto the
+///     virtual-slot name — so `GovernorTimelockControl.state(id)` inside
+///     Governance.state lowered to a bare self-named `internal_call state`,
+///     silently dropping GovernorTimelockControl.state's refinements.
+///
+/// Returns std::nullopt when the call is NOT this shape (library-qualified
+/// calls, using-for receivers, external contract calls, magic builtins,
+/// struct constructors, type conversions — all handled by pre-existing
+/// paths). Once the shape matches, this function either resolves the target
+/// or throws UnsupportedSolCore (fail-closed): it never lets the call fall
+/// through to a lowering that would emit a silent self-forward.
+std::optional<StaticBaseCallTarget> resolveStaticBaseCallTarget(
+	FunctionCall const& _call,
+	MemberAccess const& _memberAccess,
+	ContractDefinition const* _mostDerived)
+{
+	auto const* typeType =
+		dynamic_cast<TypeType const*>(_memberAccess.expression().annotation().type);
+	if (!typeType)
+		return std::nullopt;
+	auto const* qualifierType = dynamic_cast<ContractType const*>(typeType->actualType());
+	if (!qualifierType)
+		return std::nullopt;
+	if (qualifierType->contractDefinition().isLibrary())
+		return std::nullopt;
+	// Struct constructors (`Base.S(...)`) and type conversions are not
+	// function dispatch; leave them to their dedicated handlers.
+	if (_call.annotation().kind.set() && *_call.annotation().kind != FunctionCallKind::FunctionCall)
+		return std::nullopt;
+
+	// From here on this IS a statically-bound super/base-qualified internal
+	// call: resolve it exactly or fail closed.
+	auto const* funcDef =
+		dynamic_cast<FunctionDefinition const*>(_memberAccess.annotation().referencedDeclaration);
+	if (!funcDef)
+		throw UnsupportedSolCore(
+			"Base-qualified call '" + _memberAccess.memberName() +
+			"' does not reference a function definition.");
+	if (!_mostDerived)
+		throw UnsupportedSolCore(
+			"Base-qualified call to '" + funcDef->name() +
+			"' outside of a contract export context.");
+
+	FunctionDefinition const* target = nullptr;
+	if (qualifierType->isSuper())
+	{
+		// The contract of a super type is the contract lexically containing
+		// the call (annotations are assigned once, when that contract was
+		// type-checked). Solidity semantics: search _mostDerived's MRO
+		// strictly after it.
+		ContractDefinition const& definingContract = qualifierType->contractDefinition();
+		auto const& hierarchy = _mostDerived->annotation().linearizedBaseContracts;
+		if (std::find(hierarchy.begin(), hierarchy.end(), &definingContract) == hierarchy.end())
+			throw UnsupportedSolCore(
+				"super call in '" + definingContract.name() + "' but '" +
+				definingContract.name() + "' is not a base of '" + _mostDerived->name() + "'.");
+		ContractDefinition const* searchStart = definingContract.superContract(*_mostDerived);
+		if (!searchStart)
+			throw UnsupportedSolCore(
+				"super call in '" + definingContract.name() +
+				"' with no remaining base contracts in '" + _mostDerived->name() + "'.");
+		target = &funcDef->resolveVirtual(*_mostDerived, searchStart);
+	}
+	else
+		// Explicit `Base.f(...)` is statically bound to the referenced
+		// declaration (VirtualLookup::Static) — no virtual lookup.
+		target = funcDef;
+
+	if (!target->isOrdinary() || !target->isImplemented())
+		throw UnsupportedSolCore(
+			"Statically-bound base call to '" + target->name() +
+			"' has no implemented ordinary target.");
+
+	// If the statically-bound target is ALSO the most-derived implementation
+	// of its virtual slot, the plain exported slot name denotes exactly this
+	// body: emit a plain call instead of aliasing (aliasing would rename the
+	// slot's only implementation and orphan every plain-name caller).
+	bool needsAlias = &target->resolveVirtual(*_mostDerived) != target;
+	return StaticBaseCallTarget{target, needsAlias};
+}
+
+/// The exported callee name for a resolved statically-bound base call.
+/// For aliased targets, verifies the flattening pass actually registered the
+/// `f__super__Owner` sibling (exportContract registers every function
+/// collected by collectSuperReferencedFunctions, which uses the same resolver
+/// — a mismatch means exporter drift and must fail closed, not emit a bare
+/// slot name that self-forwards).
+std::string flattenedStaticBaseCallName(StaticBaseCallTarget const& _resolved)
+{
+	if (!_resolved.needsAlias)
+		return exportedFunctionName(*_resolved.target);
+	std::string alias = contractScopedSuperAlias(*_resolved.target);
+	auto it = exportedFunctionNames.find(_resolved.target);
+	if (it == exportedFunctionNames.end() || it->second != alias)
+		throw UnsupportedSolCore(
+			"Statically-bound base call target '" + alias +
+			"' was not registered for flattened export.");
+	return alias;
+}
+
+/// The exported callee name for a PLAIN (unqualified-identifier) internal
+/// call — Solidity VIRTUAL dispatch (mirrors ASTNode::resolveFunctionCall's
+/// Identifier arm): the call must reach the most-derived override in the
+/// exporting contract's linearization, i.e. the exported virtual-slot name.
+/// Using exportedFunctionName(referencedDeclaration) directly is wrong here:
+/// the lexically referenced declaration (e.g. Governor.state inside
+/// Governor.execute's body) may be registered under a flattened
+/// `f__super__Owner` alias because some OTHER call site super/base-qualifies
+/// it — a plain call would then silently bind to the base implementation and
+/// skip every more-derived override (e.g. execute() skipping
+/// GovernorTimelockControl.state's timelock refinement).
+std::string virtualCallTargetName(FunctionDefinition const& _funcDef)
+{
+	FunctionDefinition const* target = &_funcDef;
+	if (
+		activeExportContract &&
+		_funcDef.isOrdinary() &&
+		!_funcDef.name().empty() &&
+		_funcDef.virtualSemantics()
+	)
+		// The resolved slot winner is by construction never alias-registered
+		// (resolveStaticBaseCallTarget only flattens targets that are NOT
+		// their slot's most-derived implementation), so this lookup yields
+		// the plain exported slot name.
+		target = &_funcDef.resolveVirtual(*activeExportContract);
+	return exportedFunctionName(*target);
+}
+
 std::set<FunctionDefinition const*> collectSuperReferencedFunctions(
 	ContractDefinition const& _contract)
 {
 	struct SuperReferenceCollector: ASTConstVisitor
 	{
+		ContractDefinition const& mostDerived;
 		std::set<FunctionDefinition const*> functions;
+
+		explicit SuperReferenceCollector(ContractDefinition const& _mostDerived):
+			mostDerived(_mostDerived)
+		{}
 
 		bool visit(FunctionCall const& _call) override
 		{
@@ -1322,15 +1533,24 @@ std::set<FunctionDefinition const*> collectSuperReferencedFunctions(
 				dynamic_cast<MemberAccess const*>(&_call.expression());
 			if (!memberAccess)
 				return true;
-			auto const* baseIdent =
-				dynamic_cast<Identifier const*>(&memberAccess->expression());
-			if (!baseIdent || baseIdent->name() != "super")
-				return true;
-			auto const* function =
-				dynamic_cast<FunctionDefinition const*>(
-					memberAccess->annotation().referencedDeclaration);
-			if (function && function->isImplemented())
-				functions.insert(function);
+			try
+			{
+				// Same resolver the call-site lowering uses (exportExpr /
+				// exportStmt), so the alias a call site emits and the sibling
+				// this collection causes to be flattened can never diverge.
+				// Covers both `super.f(...)` AND explicitly-qualified
+				// `Base.f(...)` calls.
+				if (auto resolved = resolveStaticBaseCallTarget(_call, *memberAccess, &mostDerived))
+					if (resolved->needsAlias)
+						functions.insert(resolved->target);
+			}
+			catch (...)
+			{
+				// Unresolvable statically-bound call: the matching throw in
+				// the call-site lowering will independently fail the
+				// containing body CLOSED (kind:"unsupported_body") when it is
+				// exported, so there is no sibling to register here.
+			}
 			return true;
 		}
 	};
@@ -1338,9 +1558,24 @@ std::set<FunctionDefinition const*> collectSuperReferencedFunctions(
 	std::set<FunctionDefinition const*> referenced;
 	std::set<FunctionDefinition const*> visited;
 	std::vector<FunctionDefinition const*> worklist;
-	for (FunctionDefinition const* function: _contract.definedFunctions())
-		if (function && function->isOrdinary() && function->isImplemented())
-			worklist.push_back(function);
+	// Seed over the full linearized base hierarchy (MRO), not just functions
+	// defined directly in this contract: a super.X() call can live inside the
+	// body of an INHERITED function, which definedFunctions() does not return.
+	// The visited set below de-duplicates across bases.
+	for (ContractDefinition const* base: _contract.annotation().linearizedBaseContracts)
+	{
+		for (FunctionDefinition const* function: base->definedFunctions())
+			if (function && function->isOrdinary() && function->isImplemented())
+				worklist.push_back(function);
+		// Constructors are walked as SEEDS only (they are not ordinary, are
+		// never flattened as siblings themselves, and the targets the
+		// resolver returns are guaranteed ordinary) — a constructor body may
+		// contain `Base.f(...)`/`super.f(...)` calls whose flattened siblings
+		// the artifact must include.
+		if (FunctionDefinition const* ctor = base->constructor())
+			if (ctor->isImplemented())
+				worklist.push_back(ctor);
+	}
 
 	while (!worklist.empty())
 	{
@@ -1350,7 +1585,7 @@ std::set<FunctionDefinition const*> collectSuperReferencedFunctions(
 			continue;
 		visited.insert(function);
 
-		SuperReferenceCollector collector;
+		SuperReferenceCollector collector{_contract};
 		function->body().accept(collector);
 		for (FunctionDefinition const* referencedFunction: collector.functions)
 		{
@@ -1447,6 +1682,70 @@ std::pair<std::vector<std::string>, Json> exportStorageMapLValue(Expression cons
 	}
 
 	throw UnsupportedSolCore("Only direct state-mapping index access is supported.");
+}
+
+// A bounded, well-known set of OpenZeppelin `SafeCast`/`SafeCastUpgradeable`
+// narrowing-downcast helpers (`toUint8`..`toUint248`, `toInt8`..`toInt248`,
+// including the commonly-used `toUint128`/`toUint240`/etc.) whose return
+// value can be soundly attributed to the call site's own argument TRUNCATED
+// to the target width, using the exact same `"truncate"` JSON node the
+// inline narrowing-downcast case (`uint128(x)`, below) already emits
+// (SOLCORE_MATH_BUG_CLASSES_PLAN.md §3.5/§6.3, Task 11) — instead of
+// exporting the call as an opaque `internal_call` to a function this
+// exporter never walks into: `SafeCast` is a library, never a base contract,
+// so its body is never part of `contract.definedFunctions()`/
+// `linearizedBaseContracts` (the main per-contract export loop, far below,
+// only walks those two sets), and prior to this the OCaml frontend's only
+// handling of an unresolved `toUintN`/`toIntN`-named internal_call was a
+// name-prefix match used purely for TYPE inference (`Analysis.ml`'s
+// `infer_builtin_internal_return_ty`) — the call itself still lowered to a
+// fully opaque, unconstrained-return-value runtime helper.
+//
+// `SafeCast.toUintN`/`toIntN` also has a `require`/custom-error revert when
+// the value is out of range, which this (like the inline downcast case)
+// does not model — the same pre-existing, explicitly out-of-scope gap noted
+// in `Arith/Truncation.lean`'s "Explicit downcasts" comment. On every path
+// that does NOT revert, though, its return value is bit-for-bit identical
+// to `uint128(x)`'s: a `mod 2^n` truncation of the input. Attributing
+// exactly that (and only that) is sound and a strict precision improvement
+// over the fully-opaque model it replaces.
+bool isKnownOzSafeCastNarrowingDowncast(FunctionDefinition const& _funcDef, int& _targetBits)
+{
+	auto const* library = dynamic_cast<ContractDefinition const*>(_funcDef.scope());
+	if (!library || !library->isLibrary())
+		return false;
+	std::string const& libName = library->name();
+	if (libName != "SafeCast" && libName != "SafeCastUpgradeable")
+		return false;
+	std::string const& fnName = _funcDef.name();
+	if (fnName.rfind("toUint", 0) != 0 && fnName.rfind("toInt", 0) != 0)
+		return false;
+	// Defensive shape check: a genuine narrowing downcast takes exactly one
+	// integer-typed argument and returns a STRICTLY NARROWER integer type.
+	// This is also what excludes SafeCast's OTHER same-width
+	// sign-reinterpretation helpers that happen to share the
+	// `to(Uint|Int)NNN` naming shape — `toUint256(int256)` and
+	// `toInt256(uint256)` — which are not truncations at all (both operands
+	// are 256 bits; the check those two perform is a sign/range check, not
+	// a bit-width narrowing), so falling through to the generic
+	// (fail-closed, opaque) path for them is correct, not a gap this
+	// function needs to close.
+	if (_funcDef.parameters().size() != 1 || _funcDef.returnParameters().size() != 1)
+		return false;
+	Type const* sourceType = _funcDef.parameters().front()->type();
+	Type const* targetType = _funcDef.returnParameters().front()->type();
+	if (
+		!sourceType || !targetType ||
+		sourceType->category() != Type::Category::Integer ||
+		targetType->category() != Type::Category::Integer
+	)
+		return false;
+	auto const* sourceInt = dynamic_cast<IntegerType const*>(sourceType);
+	auto const* targetInt = dynamic_cast<IntegerType const*>(targetType);
+	if (!sourceInt || !targetInt || targetInt->numBits() >= sourceInt->numBits())
+		return false;
+	_targetBits = static_cast<int>(targetInt->numBits());
+	return true;
 }
 
 Json exportExpr(Expression const& _expr)
@@ -2008,12 +2307,15 @@ Json exportExpr(Expression const& _expr)
 		{
 		case Token::Add:
 			result["kind"] = "u256_add";
+			markUncheckedContext(result);
 			break;
 		case Token::Sub:
 			result["kind"] = "u256_sub";
+			markUncheckedContext(result);
 			break;
 		case Token::Mul:
 			result["kind"] = "u256_mul";
+			markUncheckedContext(result);
 			break;
 		case Token::Div:
 			result["kind"] = "u256_div";
@@ -2087,6 +2389,7 @@ Json exportExpr(Expression const& _expr)
 		case Token::Inc:
 		{
 			result["kind"] = "u256_add";
+			markUncheckedContext(result);
 			result["lhs"] = exportExpr(unary->subExpression());
 			Json one = Json::object();
 			one["kind"] = "u256";
@@ -2097,6 +2400,7 @@ Json exportExpr(Expression const& _expr)
 		case Token::Dec:
 		{
 			result["kind"] = "u256_sub";
+			markUncheckedContext(result);
 			result["lhs"] = exportExpr(unary->subExpression());
 			Json one = Json::object();
 			one["kind"] = "u256";
@@ -2107,6 +2411,7 @@ Json exportExpr(Expression const& _expr)
 		case Token::Sub:
 		{
 			result["kind"] = "u256_sub";
+			markUncheckedContext(result);
 			Json zero = Json::object();
 			zero["kind"] = "u256";
 			zero["value"] = "0";
@@ -2172,12 +2477,44 @@ Json exportExpr(Expression const& _expr)
 
 	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
 	{
-		// Type conversions (e.g. uint256(x), address(x)) are no-ops at EVM level
+		// Type conversions (e.g. uint256(x), address(x)) are no-ops at EVM
+		// level for every case EXCEPT a genuine narrowing integer downcast
+		// (e.g. `uint128(x)` from a `uint256` — the SafeCast/explicit-downcast
+		// idiom SOLCORE_MATH_BUG_CLASSES_PLAN.md §3.5/§6.3 (Task 11) flags:
+		// before this, the target bit-width carried nowhere through this
+		// exporter, so `SolCoreOfJson.ml` had no way to model the truncation
+		// and silently lowered the downcast to an untruncated copy — making
+		// `require(downcasted == value)`-style validation checks
+		// tautological under the old model). Widening/same-width/non-integer
+		// conversions keep the exact old pass-through behavior (this patch
+		// changes nothing for them), so only the previously-mismodeled case
+		// changes.
 		if (*call->annotation().kind == FunctionCallKind::TypeConversion)
 		{
-			if (!call->arguments().empty())
-				return exportExpr(*call->arguments().front());
-			throw UnsupportedSolCore("Empty type conversion in SolCore exporter.");
+			if (call->arguments().empty())
+				throw UnsupportedSolCore("Empty type conversion in SolCore exporter.");
+			Expression const& argExpr = *call->arguments().front();
+			Json innerJson = exportExpr(argExpr);
+			Type const* targetType = call->annotation().type;
+			Type const* sourceType = argExpr.annotation().type;
+			if (
+				targetType && sourceType &&
+				targetType->category() == Type::Category::Integer &&
+				sourceType->category() == Type::Category::Integer
+			)
+			{
+				auto const* targetInt = dynamic_cast<IntegerType const*>(targetType);
+				auto const* sourceInt = dynamic_cast<IntegerType const*>(sourceType);
+				if (targetInt && sourceInt && targetInt->numBits() < sourceInt->numBits())
+				{
+					Json result = Json::object();
+					result["kind"] = "truncate";
+					result["target_bits"] = static_cast<int>(targetInt->numBits());
+					result["value"] = innerJson;
+					return result;
+				}
+			}
+			return innerJson;
 		}
 
 		// Struct constructor calls: S(field1, field2, ...)
@@ -2322,13 +2659,16 @@ Json exportExpr(Expression const& _expr)
 				}
 			}
 
-			// Internal function call: callee references a FunctionDefinition
+			// Internal function call: callee references a FunctionDefinition.
+			// Plain-identifier calls are VIRTUAL dispatch — name the slot
+			// winner, not the lexically referenced declaration (see
+			// virtualCallTargetName).
 			auto const* funcDef = dynamic_cast<FunctionDefinition const*>(callee->annotation().referencedDeclaration);
 			if (funcDef)
 			{
 				Json result = Json::object();
 				result["kind"] = "internal_call";
-				result["function"] = exportedFunctionName(*funcDef);
+				result["function"] = virtualCallTargetName(*funcDef);
 				result["args"] = Json::array();
 				for (auto const& arg: call->arguments())
 					result["args"].emplace_back(exportExpr(*arg));
@@ -2339,6 +2679,62 @@ Json exportExpr(Expression const& _expr)
 		// Check for member calls on arrays and contracts
 		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&call->expression()))
 		{
+			// Statically-bound super/base-qualified internal calls:
+			// `super.f(...)` and `Base.f(...)`. Both must lower to the
+			// flattened `f__super__<DefiningContract>` sibling (emitted by the
+			// super-referenced-functions pass in exportContract) — NEVER to
+			// the bare virtual-slot name, which for `Base.f()` inside an
+			// override of `f` produced a self-forwarding body that silently
+			// skipped `Base.f`'s refinements (e.g. Governance.state →
+			// GovernorTimelockControl.state's timelock-queue logic).
+			if (auto resolved = resolveStaticBaseCallTarget(*call, *memberAccess, activeExportContract))
+			{
+				Json result = Json::object();
+				result["kind"] = "internal_call";
+				result["function"] = flattenedStaticBaseCallName(*resolved);
+				result["args"] = Json::array();
+				for (auto const& arg: call->arguments())
+					result["args"].emplace_back(exportExpr(*arg));
+				return result;
+			}
+
+			// OpenZeppelin SafeCast narrowing downcasts (`x.toUint128()` via
+			// `using SafeCast for uint256`, or the qualified
+			// `SafeCast.toUint128(x)` form) — see
+			// isKnownOzSafeCastNarrowingDowncast's docstring above. Must run
+			// before the using-for/qualified-call `internal_call` branches
+			// further below, which would otherwise catch this same call
+			// shape first and export it as an opaque call.
+			if (auto const* safeCastFuncDef = dynamic_cast<FunctionDefinition const*>(memberAccess->annotation().referencedDeclaration))
+			{
+				int targetBits = 0;
+				if (isKnownOzSafeCastNarrowingDowncast(*safeCastFuncDef, targetBits))
+				{
+					Type const* receiverType = memberAccess->expression().annotation().type;
+					bool isUsingForCall =
+						receiverType &&
+						receiverType->category() != Type::Category::TypeType &&
+						receiverType->category() != Type::Category::Module;
+					Expression const* argExpr = nullptr;
+					if (isUsingForCall)
+						argExpr = &memberAccess->expression();
+					else if (!call->arguments().empty())
+						argExpr = call->arguments().front().get();
+					if (argExpr)
+					{
+						Json result = Json::object();
+						result["kind"] = "truncate";
+						result["target_bits"] = targetBits;
+						result["value"] = exportExpr(*argExpr);
+						return result;
+					}
+					// Couldn't resolve the argument (shouldn't happen for any
+					// real SafeCast call site) — fail closed and fall through
+					// to the generic internal_call path below rather than
+					// guessing.
+				}
+			}
+
 			// abi.encode, abi.encodePacked, abi.decode, abi.encodeWithSelector, abi.encodeWithSignature
 			{
 				Type const* baseType = memberAccess->expression().annotation().type;
@@ -2347,20 +2743,74 @@ Json exportExpr(Expression const& _expr)
 					auto const* magicType = dynamic_cast<MagicType const*>(baseType);
 					if (magicType && magicType->kind() == MagicType::Kind::ABI)
 					{
+						// abi.decode(data, (T1, T2, ...)): the second argument is a
+						// syntactic *type list*, not a value expression. The parser
+						// always wraps a parenthesized argument list in a
+						// TupleExpression (even a single-element one — see
+						// Parser::parsePrimaryExpression's "(x) is not a real tuple"
+						// comment, which only affects later *type* checking, not the
+						// AST shape), whose components are ElementaryTypeNameExpression
+						// nodes referring to a type, not a value. Recursing into it via
+						// the generic exportExpr args-loop below would fall through every
+						// dynamic_cast in exportExpr (ElementaryTypeNameExpression isn't
+						// one of the handled Expression subtypes) and hit the ultimate
+						// fallback — which used to silently substitute a `0`
+						// u256/`_unsupported_expr` sentinel in place of the type list, and
+						// now throws instead (see that fallback's comment below). Either
+						// way, routing the type list through exportExpr both mis-describes
+						// a type as a value and — more importantly — throws away
+						// information the OCaml side needs to synthesize a genuinely
+						// opaque runtime value of the correct decoded type(s). So export
+						// the type list out-of-band as canonical Solidity type-name
+						// strings (the same `Type::toString()` used for signature-suffix
+						// disambiguation above) via a sibling `decode_types` field
+						// instead of routing it through exportExpr.
+						if (memberAccess->memberName() == "decode" && call->arguments().size() == 2)
+						{
+							auto const* typesTuple = dynamic_cast<TupleExpression const*>(call->arguments()[1].get());
+							if (!typesTuple)
+								throw UnsupportedSolCore("abi.decode: expected a parenthesized type list as the second argument.");
+
+							Json result = Json::object();
+							result["kind"] = "internal_call";
+							result["function"] = "abi_decode";
+							result["args"] = Json::array();
+							result["args"].emplace_back(exportExpr(*call->arguments()[0]));
+
+							Json decodeTypes = Json::array();
+							for (auto const& component: typesTuple->components())
+							{
+								if (!component)
+									throw UnsupportedSolCore("abi.decode: omitted entry in type list is unsupported.");
+								Type const* componentType = component->annotation().type;
+								auto const* typeType = dynamic_cast<TypeType const*>(componentType);
+								if (!typeType || !typeType->actualType())
+									throw UnsupportedSolCore("abi.decode: type-list entry is not a resolvable type name.");
+								// _withoutDataLocation=true: the type-list entries are bare
+								// type names (no explicit storage/memory/calldata location
+								// was written), so Type::toString(false)'s default location
+								// suffix (e.g. "bytes storage pointer") would produce a
+								// string the OCaml-side sc_ty_of_external_signature_type
+								// parser doesn't recognize. Canonical form (e.g. "bytes",
+								// "address", "uint256[]") is what that parser expects.
+								decodeTypes.emplace_back(typeType->actualType()->toString(true));
+							}
+							result["decode_types"] = decodeTypes;
+							return result;
+						}
+
 						Json result = Json::object();
 						result["kind"] = "internal_call";
 						result["function"] = "abi_" + memberAccess->memberName();
 						result["args"] = Json::array();
 						for (auto const& arg: call->arguments())
-						{
-							try { result["args"].emplace_back(exportExpr(*arg)); }
-							catch (...) {
-								Json zero = Json::object();
-								zero["kind"] = "u256";
-								zero["value"] = "0";
-								result["args"].emplace_back(zero);
-							}
-						}
+							// No catch here: an argument this pipeline can't lower must
+							// propagate (to exportBody's catch-all, which turns it into a
+							// diagnosable "unsupported_body" marker), not silently become
+							// a bare `0` with no trace at all. abi.decode itself never
+							// reaches this loop (handled above, out-of-band); this is only
+							// abi.encode/abi.encodePacked/abi.encodeWithSignature now.
+							result["args"].emplace_back(exportExpr(*arg));
 						return result;
 					}
 				}
@@ -2418,6 +2868,7 @@ Json exportExpr(Expression const& _expr)
 					Json result = Json::object();
 					result["kind"] = "internal_call";
 					result["function"] = exportedFunctionName(*funcDef);
+					addInternalLibraryCallContractId(result, *funcDef);
 					result["args"] = Json::array();
 					result["args"].emplace_back(exportExpr(memberAccess->expression()));
 					for (auto const& arg: call->arguments())
@@ -2441,6 +2892,7 @@ Json exportExpr(Expression const& _expr)
 				Json result = Json::object();
 				result["kind"] = "internal_call";
 				result["function"] = exportedFunctionName(*funcDef);
+				addInternalLibraryCallContractId(result, *funcDef);
 				result["args"] = Json::array();
 				for (auto const& arg: call->arguments())
 					result["args"].emplace_back(exportExpr(*arg));
@@ -2545,15 +2997,10 @@ Json exportExpr(Expression const& _expr)
 			result["function"] = "unknown_call";
 		result["args"] = Json::array();
 		for (auto const& arg: call->arguments())
-		{
-			try { result["args"].emplace_back(exportExpr(*arg)); }
-			catch (...) {
-				Json zero = Json::object();
-				zero["kind"] = "u256";
-				zero["value"] = "0";
-				result["args"].emplace_back(zero);
-			}
-		}
+			// No catch here — see the abi_encode* loop above for the rationale:
+			// an unlowerable argument must propagate to exportBody's catch-all
+			// rather than silently becoming an untraceable `0`.
+			result["args"].emplace_back(exportExpr(*arg));
 		return result;
 	}
 
@@ -2561,14 +3008,20 @@ Json exportExpr(Expression const& _expr)
 	if (auto const* options = dynamic_cast<FunctionCallOptions const*>(&_expr))
 		return exportExpr(options->expression());
 
-	// Ultimate fallback — return a placeholder instead of crashing
-	{
-		Json result = Json::object();
-		result["kind"] = "u256";
-		result["value"] = "0";
-		result["_unsupported_expr"] = true;
-		return result;
-	}
+	// Ultimate fallback: every expression form this exporter knows how to
+	// recognize is handled above (Identifier, IndexAccess, Literal,
+	// MemberAccess, IndexRangeAccess, BinaryOperation, UnaryOperation,
+	// Conditional, TupleExpression, Assignment, FunctionCall,
+	// FunctionCallOptions). Reaching here means `_expr` is a genuinely
+	// unrecognized Expression subtype (e.g. ElementaryTypeNameExpression used
+	// outside abi.decode's dedicated handling above). Throwing — instead of
+	// the old `{"kind":"u256","value":"0","_unsupported_expr":true}`
+	// placeholder — lets exportBody's catch-all turn this into a diagnosable
+	// "unsupported_body" marker with a real reason string, rather than
+	// manufacturing a fake value that some downstream consumer has to
+	// remember to specifically check for.
+	throw UnsupportedSolCore(
+		"exportExpr: unrecognized expression node (no matching Expression subtype)");
 }
 
 Json exportRevertPayload(FunctionCall const& _call)
@@ -2829,12 +3282,15 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 			return _rhsJson;
 		case Token::AssignAdd:
 			value["kind"] = "u256_add";
+			markUncheckedContext(value);
 			break;
 		case Token::AssignSub:
 			value["kind"] = "u256_sub";
+			markUncheckedContext(value);
 			break;
 		case Token::AssignMul:
 			value["kind"] = "u256_mul";
+			markUncheckedContext(value);
 			break;
 		case Token::AssignDiv:
 			value["kind"] = "u256_div";
@@ -3368,9 +3824,11 @@ Json mutationValue(Json const& _current, Token _op)
 	{
 	case Token::Inc:
 		result["kind"] = "u256_add";
+		markUncheckedContext(result);
 		break;
 	case Token::Dec:
 		result["kind"] = "u256_sub";
+		markUncheckedContext(result);
 		break;
 	default:
 		throw UnsupportedSolCore("Expected ++ or -- unary mutation.");
@@ -3578,8 +4036,11 @@ Json exportStmt(Statement const& _stmt)
 {
 	if (auto const* block = dynamic_cast<Block const*>(&_stmt))
 	{
+		UncheckedBlockGuard uncheckedGuard(block->unchecked());
 		Json result = Json::object();
 		result["kind"] = "block";
+		if (block->unchecked())
+			result["unchecked"] = true;
 		result["statements"] = Json::array();
 		for (auto const& statement: block->statements())
 			result["statements"].emplace_back(exportStmt(*statement));
@@ -3814,7 +4275,9 @@ Json exportStmt(Statement const& _stmt)
 					return result;
 				}
 
-				// Internal function call as statement
+				// Internal function call as statement. Plain-identifier calls
+				// are VIRTUAL dispatch — name the slot winner, not the
+				// lexically referenced declaration (see virtualCallTargetName).
 				auto const* funcDef = dynamic_cast<FunctionDefinition const*>(callee->annotation().referencedDeclaration);
 				if (funcDef)
 				{
@@ -3822,7 +4285,7 @@ Json exportStmt(Statement const& _stmt)
 					result["kind"] = "expr";
 					Json callExpr = Json::object();
 					callExpr["kind"] = "internal_call";
-					callExpr["function"] = exportedFunctionName(*funcDef);
+					callExpr["function"] = virtualCallTargetName(*funcDef);
 					callExpr["args"] = Json::array();
 					for (auto const& arg: call->arguments())
 						callExpr["args"].emplace_back(exportExpr(*arg));
@@ -3834,6 +4297,25 @@ Json exportStmt(Statement const& _stmt)
 			// Array push: arr.push(value), Array pop: arr.pop()
 			if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&call->expression()))
 			{
+				// Statically-bound super/base-qualified internal call as a
+				// statement — same handling as the expression path above (and
+				// it MUST run before the library/type-qualified branch below,
+				// which would otherwise collapse it onto the virtual-slot
+				// name and emit a self-forward).
+				if (auto resolved = resolveStaticBaseCallTarget(*call, *memberAccess, activeExportContract))
+				{
+					Json result = Json::object();
+					result["kind"] = "expr";
+					Json callExpr = Json::object();
+					callExpr["kind"] = "internal_call";
+					callExpr["function"] = flattenedStaticBaseCallName(*resolved);
+					callExpr["args"] = Json::array();
+					for (auto const& arg: call->arguments())
+						callExpr["args"].emplace_back(exportExpr(*arg));
+					result["value"] = callExpr;
+					return result;
+				}
+
 				if (memberAccess->memberName() == "push" || memberAccess->memberName() == "pop")
 				{
 					Type const* baseType = memberAccess->expression().annotation().type;
@@ -4156,6 +4638,525 @@ Json exportStmt(Statement const& _stmt)
 	}
 }
 
+// ===========================================================================
+// AST write-set oracle (Layer 2 of the SOL-PLAN-FIDELITY cross-check).
+//
+// This is a SECOND, INDEPENDENT pass over the Solidity AST that estimates
+// which state variables a function's execution can write, computed WITHOUT
+// using exportStmt/exportExpr/exportBody at all. The entire point is that it
+// must not be able to inherit exportStmt/exportExpr's bugs (in particular
+// the catch-all body-export failure exportBody() now guards against above):
+// if the JSON body export silently produced a wrong (too-weak) model, this
+// walk gives the OCaml frontend an independent second opinion to diff
+// against. It is deliberately conservative: anything it cannot resolve
+// statically sets `unknown`, it never guesses, and it must never throw.
+// ===========================================================================
+
+struct WriteOracleResult
+{
+	std::set<std::string> writes;
+	bool unknown = false;
+};
+
+// Resolve a function-call callee expression (Identifier or MemberAccess) to
+// the FunctionDefinition that will actually execute, applying virtual
+// dispatch against `_mostDerivedContract` when the call site requires
+// virtual lookup. This generalizes the resolution idiom already used by
+// resolveModifierDefinition() above (ModifierDefinition::resolveVirtual)
+// to FunctionDefinition::resolveVirtual.
+FunctionDefinition const* resolveWriteOracleCallTarget(
+	Expression const& _callee,
+	ContractDefinition const* _mostDerivedContract)
+{
+	Declaration const* referenced = nullptr;
+	bool requiresVirtual = false;
+	if (auto const* ident = dynamic_cast<Identifier const*>(&_callee))
+	{
+		referenced = ident->annotation().referencedDeclaration;
+		requiresVirtual =
+			ident->annotation().requiredLookup.set() &&
+			*ident->annotation().requiredLookup == VirtualLookup::Virtual;
+	}
+	else if (auto const* member = dynamic_cast<MemberAccess const*>(&_callee))
+	{
+		referenced = member->annotation().referencedDeclaration;
+		requiresVirtual =
+			member->annotation().requiredLookup.set() &&
+			*member->annotation().requiredLookup == VirtualLookup::Virtual;
+	}
+	else
+		return nullptr;
+
+	auto const* funcDef = dynamic_cast<FunctionDefinition const*>(referenced);
+	if (!funcDef)
+		return nullptr;
+	if (requiresVirtual && _mostDerivedContract)
+		return &funcDef->resolveVirtual(*_mostDerivedContract);
+	return funcDef;
+}
+
+// Scan a Yul AST for sstore, independently of exportYulExpr/exportYulStmt
+// above (same std::visit idiom, but this one only answers "does this touch
+// PERSISTENT storage", it does not build any JSON). We do not try to
+// resolve which slot(s) are touched — any occurrence is treated as a fully
+// opaque write, matching the existing OCaml havoc-modeling policy for
+// assembly blocks (SolCore.ml's `inline_asm_writes_persistent_storage`
+// marks any `assembly { ... }` block containing `sstore` as a
+// StorageHavocUpdate on the OCaml side; this oracle independently confirms
+// the same conclusion from the raw AST rather than trusting that pass).
+//
+// `tstore` (EIP-1153 transient storage) is deliberately NOT matched here:
+// transient storage is a sibling of the named-field `Storage` model this
+// oracle protects (`ast_write_oracle` feeds ProofPlan's
+// `model_fidelity_diag`, which only ever compares against
+// `transitive_touched_fields`, itself a set of NAMED PERSISTENT fields — see
+// SOLCORE_TLOAD_TSTORE_ARCHITECTURE_SPEC.md §4.5). A tstore-only assembly
+// block genuinely cannot perturb persistent storage, so flagging it
+// `unknown` here would falsely demote every function reachable from it
+// (e.g. OpenZeppelin's `ReentrancyGuardTransient._nonReentrantBefore`) to
+// `Unsupported.SOL-PLAN-FIDELITY-002` even though the OCaml/Lean side now
+// proves persistent-storage preservation through it correctly. Keeping
+// this oracle's `sstore`-only judgment in sync with the OCaml split is
+// exactly why this comment (and the one on `WriteOracleCollector::visit
+// (InlineAssembly const&)` below) call out the pairing explicitly.
+bool yulExprMayStoreToStorage(yul::Expression const& _expr, yul::Dialect const& _dialect);
+bool yulStmtMayStoreToStorage(yul::Statement const& _stmt, yul::Dialect const& _dialect);
+
+bool yulBlockMayStoreToStorage(yul::Block const& _block, yul::Dialect const& _dialect)
+{
+	for (auto const& stmt: _block.statements)
+		if (yulStmtMayStoreToStorage(stmt, _dialect))
+			return true;
+	return false;
+}
+
+bool yulExprMayStoreToStorage(yul::Expression const& _expr, yul::Dialect const& _dialect)
+{
+	return std::visit(util::GenericVisitor{
+		[&](yul::Literal const&) -> bool { return false; },
+		[&](yul::Identifier const&) -> bool { return false; },
+		[&](yul::FunctionCall const& _call) -> bool {
+			std::string name = std::string(yul::resolveFunctionName(_call.functionName, _dialect));
+			// `tstore` writes EIP-1153 transient storage, not the named
+			// PERSISTENT `Storage` fields this oracle exists to protect — see
+			// the comment above `yulExprMayStoreToStorage`'s declaration for
+			// why it is deliberately excluded here.
+			if (name == "sstore")
+				return true;
+			for (auto const& arg: _call.arguments)
+				if (yulExprMayStoreToStorage(arg, _dialect))
+					return true;
+			return false;
+		}
+	}, _expr);
+}
+
+bool yulStmtMayStoreToStorage(yul::Statement const& _stmt, yul::Dialect const& _dialect)
+{
+	return std::visit(util::GenericVisitor{
+		[&](yul::ExpressionStatement const& _exprStmt) -> bool {
+			return yulExprMayStoreToStorage(_exprStmt.expression, _dialect);
+		},
+		[&](yul::Assignment const& _assignment) -> bool {
+			return _assignment.value && yulExprMayStoreToStorage(*_assignment.value, _dialect);
+		},
+		[&](yul::VariableDeclaration const& _varDecl) -> bool {
+			return _varDecl.value && yulExprMayStoreToStorage(*_varDecl.value, _dialect);
+		},
+		[&](yul::FunctionDefinition const& _funDef) -> bool {
+			return yulBlockMayStoreToStorage(_funDef.body, _dialect);
+		},
+		[&](yul::If const& _if) -> bool {
+			return
+				(_if.condition && yulExprMayStoreToStorage(*_if.condition, _dialect)) ||
+				yulBlockMayStoreToStorage(_if.body, _dialect);
+		},
+		[&](yul::Switch const& _switch) -> bool {
+			if (_switch.expression && yulExprMayStoreToStorage(*_switch.expression, _dialect))
+				return true;
+			for (auto const& c: _switch.cases)
+				if (yulBlockMayStoreToStorage(c.body, _dialect))
+					return true;
+			return false;
+		},
+		[&](yul::ForLoop const& _for) -> bool {
+			return
+				yulBlockMayStoreToStorage(_for.pre, _dialect) ||
+				(_for.condition && yulExprMayStoreToStorage(*_for.condition, _dialect)) ||
+				yulBlockMayStoreToStorage(_for.post, _dialect) ||
+				yulBlockMayStoreToStorage(_for.body, _dialect);
+		},
+		[&](yul::Break const&) -> bool { return false; },
+		[&](yul::Continue const&) -> bool { return false; },
+		[&](yul::Leave const&) -> bool { return false; },
+		[&](yul::Block const& _block) -> bool {
+			return yulBlockMayStoreToStorage(_block, _dialect);
+		}
+	}, _stmt);
+}
+
+// Peel an lvalue/mutated-subexpression down to a base Identifier through
+// IndexAccess (a[i]) and MemberAccess (s.field) layers. Returns nullptr when
+// the base is not a plain Identifier (e.g. the base is itself a function
+// call result, `this`, or some other shape this independent walk does not
+// specifically model) — callers must then fail closed (set `unknown`)
+// rather than silently dropping the write.
+Identifier const* peelToBaseIdentifierForWriteOracle(Expression const& _expr)
+{
+	Expression const* current = &_expr;
+	while (true)
+	{
+		if (auto const* ident = dynamic_cast<Identifier const*>(current))
+			return ident;
+		if (auto const* indexAccess = dynamic_cast<IndexAccess const*>(current))
+		{
+			current = &indexAccess->baseExpression();
+			continue;
+		}
+		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(current))
+		{
+			current = &memberAccess->expression();
+			continue;
+		}
+		return nullptr;
+	}
+}
+
+// A bounded, well-known set of storage-ref OpenZeppelin library helpers
+// (EnumerableSet.add/remove, EnumerableMap.set/remove, Checkpoints.push --
+// and their "Upgradeable" twins) whose write target can be soundly
+// attributed to the CALL SITE's "self"/"set"/"map" argument, instead of
+// giving up with `unknown=true` the way an arbitrary storage-pointer
+// parameter must (recordWriteToBase's local-storage-pointer case, just
+// below, is and remains the correct fail-closed default for every OTHER
+// call -- this function recognizes ONLY this fixed list of (library,
+// function) pairs; it is a targeted extension, not a general relaxation
+// of that rule). Matched functions are never recursed into: their own
+// bodies mutate the "self" struct's fields, which is exactly the
+// information their storage-pointer PARAMETER cannot see, so recursing
+// would just rediscover the same unresolvable parameter one level down.
+bool isKnownOzStorageRefLibraryMutator(FunctionDefinition const& _funcDef)
+{
+	auto const* library = dynamic_cast<ContractDefinition const*>(_funcDef.scope());
+	if (!library || !library->isLibrary())
+		return false;
+	std::string const& libName = library->name();
+	std::string const& fnName = _funcDef.name();
+	bool matches =
+		((libName == "EnumerableSet" || libName == "EnumerableSetUpgradeable") &&
+			(fnName == "add" || fnName == "remove")) ||
+		((libName == "EnumerableMap" || libName == "EnumerableMapUpgradeable") &&
+			(fnName == "set" || fnName == "remove")) ||
+		((libName == "Checkpoints" || libName == "CheckpointsUpgradeable") &&
+			fnName == "push");
+	if (!matches)
+		return false;
+	// Defensive shape check: every known signature for these entry points
+	// takes the self/set/map argument as a storage-located first
+	// parameter. If some unexpected overload doesn't match that shape,
+	// fall through to the generic (fail-closed) path instead of guessing.
+	auto const& params = _funcDef.parameters();
+	if (params.empty())
+		return false;
+	return params.front()->referenceLocation() == VariableDeclaration::Location::Storage;
+}
+
+// Resolve the "self"/"set"/"map" argument of a call already confirmed (via
+// isKnownOzStorageRefLibraryMutator) to be one of the bounded OZ helpers,
+// covering both calling conventions Solidity allows: using-for member-call
+// syntax (`set.add(value)`, where the receiver IS the argument) and
+// explicit qualified calls (`EnumerableSet.add(set, value)`, where the
+// receiver names the library itself and the argument is the first
+// parameter).
+Expression const* ozStorageRefSelfArgument(FunctionCall const& _call)
+{
+	if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_call.expression()))
+	{
+		Type const* receiverType = memberAccess->expression().annotation().type;
+		bool isUsingForCall =
+			receiverType &&
+			receiverType->category() != Type::Category::TypeType &&
+			receiverType->category() != Type::Category::Module;
+		if (isUsingForCall)
+			return &memberAccess->expression();
+	}
+	if (!_call.arguments().empty())
+		return _call.arguments().front().get();
+	return nullptr;
+}
+
+struct WriteOracleCollector: ASTConstVisitor
+{
+	std::set<std::string> writes;
+	bool unknown = false;
+	std::set<FunctionDefinition const*> calleesToVisit;
+	ContractDefinition const* mostDerivedContract = nullptr;
+
+	void recordWriteToBase(Expression const& _target)
+	{
+		if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_target))
+		{
+			for (auto const& component: tuple->components())
+				if (component)
+					recordWriteToBase(*component);
+			return;
+		}
+
+		Identifier const* base = peelToBaseIdentifierForWriteOracle(_target);
+		if (!base)
+		{
+			// Written through something other than a plain (possibly
+			// indexed/projected) local/state variable name — e.g. the
+			// result of a function call. Fail closed.
+			unknown = true;
+			return;
+		}
+		auto const* varDecl = dynamic_cast<VariableDeclaration const*>(base->annotation().referencedDeclaration);
+		if (!varDecl)
+		{
+			// Not a variable reference at all — shouldn't normally happen
+			// for a write target, but fail closed rather than dropping it.
+			unknown = true;
+			return;
+		}
+		if (varDecl->isStateVariable())
+		{
+			writes.insert(varDecl->name());
+			return;
+		}
+		if (varDecl->isLocalVariable() && varDecl->referenceLocation() == VariableDeclaration::Location::Storage)
+		{
+			// A local storage-pointer variable: without alias analysis we
+			// cannot statically tell which state variable it points at.
+			// Fail closed rather than guessing.
+			unknown = true;
+			return;
+		}
+		// Otherwise a plain memory/calldata/stack local: not a storage
+		// write at all, nothing to record.
+	}
+
+	bool visit(Assignment const& _assignment) override
+	{
+		recordWriteToBase(_assignment.leftHandSide());
+		return true;
+	}
+
+	bool visit(UnaryOperation const& _unary) override
+	{
+		Token op = _unary.getOperator();
+		if (op == Token::Delete || op == Token::Inc || op == Token::Dec)
+			recordWriteToBase(_unary.subExpression());
+		return true;
+	}
+
+	bool visit(InlineAssembly const& _asm) override
+	{
+		if (yulBlockMayStoreToStorage(_asm.operations().root(), _asm.dialect()))
+			unknown = true;
+		return true;
+	}
+
+	bool visit(FunctionCall const& _call) override
+	{
+		Expression const& calleeExpr = _call.expression();
+
+		// Type conversions and struct-constructor calls are not calls into
+		// other code at all — nothing to do.
+		if (
+			_call.annotation().kind.set() &&
+			*_call.annotation().kind != FunctionCallKind::FunctionCall
+		)
+			return true;
+
+		// Classify by the callee's own FunctionType::Kind rather than by
+		// hand-matching identifier/member names: this is the SAME
+		// information solc's type checker already computed for every
+		// compiler builtin (require/assert/revert/selfdestruct/addmod/
+		// keccak256/gasleft/...), low-level call form (call/staticcall/
+		// delegatecall/callcode), and push/pop, so it is both more
+		// complete and more precise than a name-based allowlist (which
+		// would either miss builtins — turning nearly every function with
+		// a plain `require(...)` into a false "unknown" — or risk matching
+		// a user-defined function that happens to share a builtin's name).
+		Type const* calleeType = calleeExpr.annotation().type;
+		if (auto const* functionType = dynamic_cast<FunctionType const*>(calleeType))
+		{
+			using Kind = FunctionType::Kind;
+			switch (functionType->kind())
+			{
+			case Kind::ArrayPush:
+			case Kind::ArrayPop:
+				// arr.push(...)/arr.pop(): a write to the array's own base
+				// state variable (or `unknown` if the base isn't
+				// resolvable).
+				if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&calleeExpr))
+					recordWriteToBase(memberAccess->expression());
+				else
+					unknown = true;
+				return true;
+			case Kind::DelegateCall:
+			case Kind::BareDelegateCall:
+			case Kind::BareCallCode:
+				// Executes in OUR storage context under callee-chosen
+				// code — cannot be modeled, ever.
+				unknown = true;
+				return true;
+			case Kind::Selfdestruct:
+				unknown = true;
+				return true;
+			case Kind::Internal:
+				// Handled below via resolveWriteOracleCallTarget.
+				break;
+			case Kind::External:
+			case Kind::BareCall:
+			case Kind::BareStaticCall:
+			case Kind::Creation:
+			case Kind::Send:
+			case Kind::Transfer:
+				// Executes in the CALLEE's own storage context (or
+				// creates a new contract) — not a direct write to THIS
+				// contract's state. (Re-entrancy back into this contract
+				// through such a call is a separate, already-modeled
+				// concern elsewhere in the pipeline and out of scope for
+				// this direct write-set oracle.)
+				return true;
+			default:
+				// Every remaining Kind (KECCAK256/SHA256/RIPEMD160/
+				// ECRecover/AddMod/MulMod/BlockHash/BlobHash/GasLeft/
+				// Assert/Require/Revert/Error/Event/ABIEncode*/ABIDecode/
+				// Wrap/Unwrap/BytesConcat/StringConcat/MetaType/SetGas/
+				// SetValue/ERC7201/Declaration/ObjectCreation/...) is a
+				// pure or otherwise side-effect-free compiler builtin:
+				// never a write to THIS contract's persistent storage.
+				return true;
+			}
+		}
+
+		// No FunctionType (or Kind::Internal): try to resolve the actual
+		// FunctionDefinition target and recurse. The worklist in
+		// computeAstWriteOracle drains calleesToVisit so this stays
+		// iterative, not recursive, for arbitrarily deep call graphs.
+		if (FunctionDefinition const* target = resolveWriteOracleCallTarget(calleeExpr, mostDerivedContract))
+		{
+			if (isKnownOzStorageRefLibraryMutator(*target))
+			{
+				// Attribute the write directly to the call site's self/set/map
+				// argument instead of recursing into the library body (whose
+				// OWN storage-pointer parameter cannot see through to it).
+				if (Expression const* selfArg = ozStorageRefSelfArgument(_call))
+					recordWriteToBase(*selfArg);
+				else
+					unknown = true;
+				return true;
+			}
+			if (target->isImplemented())
+				calleesToVisit.insert(target);
+			return true;
+		}
+
+		// `new Foo(...)` / `new T[](...)`: contract creation or memory
+		// allocation, not a write to OUR persistent storage.
+		if (dynamic_cast<NewExpression const*>(&calleeExpr))
+			return true;
+
+		// Anything else is a call whose target we could not positively
+		// identify — most notably an indirect call through a function-
+		// typed local/parameter/array element. Fail closed.
+		unknown = true;
+		return true;
+	}
+};
+
+// Compute the AST write-set oracle for a single exported function, over the
+// transitive closure of internal/library/super/virtual calls AND the
+// modifier chain that actually runs whenever this function is invoked.
+// Mirrors collectSuperReferencedFunctions()'s worklist idiom (a visited set
+// plus an explicit std::vector worklist draining to a fixpoint) rather than
+// recursing directly, so this scales to arbitrarily deep call graphs. Must
+// never throw: anything unexpected is folded into `unknown`.
+WriteOracleResult computeAstWriteOracle(
+	FunctionDefinition const& _function,
+	ContractDefinition const& _contract)
+{
+	WriteOracleResult result;
+	if (!_function.isImplemented())
+		return result;
+
+	std::set<FunctionDefinition const*> visitedFunctions;
+	std::set<ModifierDefinition const*> visitedModifiers;
+	std::vector<FunctionDefinition const*> functionWorklist{ &_function };
+	std::vector<ModifierDefinition const*> modifierWorklist;
+
+	try
+	{
+		while (!functionWorklist.empty() || !modifierWorklist.empty())
+		{
+			if (!functionWorklist.empty())
+			{
+				FunctionDefinition const* fn = functionWorklist.back();
+				functionWorklist.pop_back();
+				if (!fn || visitedFunctions.count(fn) || !fn->isImplemented())
+					continue;
+				visitedFunctions.insert(fn);
+
+				WriteOracleCollector collector;
+				collector.mostDerivedContract = &_contract;
+				fn->body().accept(collector);
+				result.writes.insert(collector.writes.begin(), collector.writes.end());
+				result.unknown = result.unknown || collector.unknown;
+				for (FunctionDefinition const* callee: collector.calleesToVisit)
+					if (!visitedFunctions.count(callee))
+						functionWorklist.push_back(callee);
+
+				for (auto const& modifierInvocation: fn->modifiers())
+				{
+					ModifierDefinition const* modDef =
+						resolveModifierDefinition(*fn, *modifierInvocation);
+					if (modDef && modDef->isImplemented() && !visitedModifiers.count(modDef))
+						modifierWorklist.push_back(modDef);
+				}
+				continue;
+			}
+
+			ModifierDefinition const* mod = modifierWorklist.back();
+			modifierWorklist.pop_back();
+			if (!mod || visitedModifiers.count(mod) || !mod->isImplemented())
+				continue;
+			visitedModifiers.insert(mod);
+
+			WriteOracleCollector collector;
+			collector.mostDerivedContract = &_contract;
+			mod->body().accept(collector);
+			result.writes.insert(collector.writes.begin(), collector.writes.end());
+			result.unknown = result.unknown || collector.unknown;
+			for (FunctionDefinition const* callee: collector.calleesToVisit)
+				if (!visitedFunctions.count(callee))
+					functionWorklist.push_back(callee);
+		}
+	}
+	catch (...)
+	{
+		// The oracle must never throw. If something truly unexpected
+		// happens mid-walk, the safe answer is "we don't know", not a
+		// crash and not a silently-empty write-set.
+		result.unknown = true;
+	}
+
+	return result;
+}
+
+Json astWriteOracleJson(FunctionDefinition const& _function, ContractDefinition const& _contract)
+{
+	WriteOracleResult oracle = computeAstWriteOracle(_function, _contract);
+	Json result = Json::object();
+	result["writes"] = Json::array();
+	for (std::string const& name: oracle.writes)
+		result["writes"].emplace_back(name);
+	result["unknown"] = oracle.unknown;
+	return result;
+}
+
 Json exportBody(FunctionDefinition const& _function)
 {
 	// Save and clear per-function namespaced storage aliases
@@ -4172,17 +5173,40 @@ Json exportBody(FunctionDefinition const& _function)
 	catch (...)
 	{
 		namespacedStorageAliases = savedAliases;
-		body = Json::object();
-		body["kind"] = "block";
-		body["statements"] = Json::array();
-		// Return empty body as fallback
-		Json ret = Json::object();
-		ret["kind"] = "return";
-		Json unit = Json::object();
-		unit["kind"] = "unit";
-		ret["value"] = unit;
-		body["statements"].emplace_back(ret);
-		return body;
+		// Capture a diagnostic reason where we can (UnsupportedSolCore
+		// carries a human-readable message; anything else is opaque).
+		std::string reason = "unknown export failure";
+		try
+		{
+			throw;
+		}
+		catch (UnsupportedSolCore const& e)
+		{
+			reason = e.what();
+		}
+		catch (std::exception const& e)
+		{
+			reason = e.what();
+		}
+		catch (...)
+		{
+			// Truly unknown throw (e.g. not derived from std::exception) —
+			// keep the generic reason string above.
+		}
+		// Deliberately NOT a valid "block"/"statements" shape (the shape a
+		// well-formed function body always has). Substituting a normal
+		// no-op block here would let ANY consumer of this JSON — including
+		// ones that don't know about this exporter's failure modes —
+		// silently accept a wrong-but-plausible empty function. Instead,
+		// surface a body value that fails to parse for every consumer: our
+		// own OCaml frontend (see SolCoreOfJson.ml's parse_body) raises a
+		// hard parse error the moment it sees "kind":"unsupported_body",
+		// and any other tool trying to read "statements" off this object
+		// will find it missing rather than (wrongly) empty.
+		Json failedBody = Json::object();
+		failedBody["kind"] = "unsupported_body";
+		failedBody["error"] = reason;
+		return failedBody;
 	}
 	if (!body.is_object() || body.value("kind", ""s) != "block")
 	{
@@ -4269,7 +5293,7 @@ Json exportBody(FunctionDefinition const& _function)
 	return body;
 }
 
-Json exportFunction(FunctionDefinition const& _function, bool _isInternal = false)
+Json exportFunction(FunctionDefinition const& _function, ContractDefinition const& _contract, bool _isInternal = false)
 {
 	if (!_function.isOrdinary() || !_function.isImplemented())
 		throw UnsupportedSolCore("Only ordinary implemented functions are supported.");
@@ -4334,10 +5358,14 @@ Json exportFunction(FunctionDefinition const& _function, bool _isInternal = fals
 		result["return"] = tupleType;
 	}
 	result["body"] = exportBody(_function);
+	// Layer 2 (SOL-PLAN-FIDELITY): independent AST write-set cross-check.
+	// Computed even when the body export above succeeded — it is a second
+	// opinion, not just a failure fallback.
+	result["ast_write_oracle"] = astWriteOracleJson(_function, _contract);
 	return result;
 }
 
-Json exportConstructor(FunctionDefinition const& _function)
+Json exportConstructor(FunctionDefinition const& _function, ContractDefinition const& _contract)
 {
 	if (_function.isOrdinary() || !_function.isImplemented())
 		throw UnsupportedSolCore("Only implemented constructors are supported.");
@@ -4361,6 +5389,7 @@ Json exportConstructor(FunctionDefinition const& _function)
 	}
 	result["return"] = Json("unit");
 	result["body"] = exportBody(_function);
+	result["ast_write_oracle"] = astWriteOracleJson(_function, _contract);
 	return result;
 }
 
@@ -4376,7 +5405,22 @@ Json exportOrigins(ContractDefinition const& _contract)
 			continue;
 		Json entry = Json::object();
 		entry["originId"] = "state:" + stateVar->name();
-		entry["kind"] = "stateVariable";
+		// SOLCORE_TLOAD_TSTORE_ARCHITECTURE_SPEC.md §8 Stage 4 gate: mark
+		// `transient`-location state variables distinctly rather than
+		// silently tagging them "stateVariable" (which would misleadingly
+		// imply an ordinary persistent slot). The primary fail-closed gate
+		// for this keyword lives in `exportStateVars` above (which throws
+		// `UnsupportedSolCore` and fails the whole contract's export before
+		// this function even runs, in the only pipeline that currently
+		// calls both) — this is defense-in-depth for `exportOrigins`
+		// specifically, since it is pure provenance/audit metadata, not the
+		// semantic `Storage` model itself, so "mark it" (not "fail") is the
+		// right-sized response here per the spec's own "either mark it in
+		// JSON or fail the export" phrasing.
+		entry["kind"] =
+			stateVar->referenceLocation() == VariableDeclaration::Location::Transient
+				? "stateVariableTransient"
+				: "stateVariable";
 		entry["astId"] = stateVar->id();
 		entry["name"] = stateVar->name();
 		entry["storageSlot"] = slotIndex;
@@ -4593,7 +5637,10 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	// --- End namespaced storage getter detection ---
 
 	Json solcore = Json::object();
-	solcore["solcoreVersion"] = "0.1.0";
+	// 0.2.0: hardened body-export-failure marker ("unsupported_body" instead
+	// of a silently-valid no-op block) + per-function "ast_write_oracle"
+	// (independent AST write-set cross-check; see computeAstWriteOracle).
+	solcore["solcoreVersion"] = "0.2.0";
 	solcore["solidityVersion"] = VersionString;
 	solcore["featureFlags"] = featureFlags();
 	Json metadata = exporterMetadata(_contractName);
@@ -4617,6 +5664,32 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 			// Skip constant variables — they are inlined at usage sites
 			if (stateVar->isConstant())
 				continue;
+			// SOLCORE_TLOAD_TSTORE_ARCHITECTURE_SPEC.md §8 Stage 4 gate: a
+			// `transient`-location state variable (solc 0.8.28+,
+			// `uint256 transient x;`) is a DIFFERENT feature from the raw
+			// `tload`/`tstore` Yul builtins Stage 1 models — it has its own
+			// (currently unimplemented) reset/slot semantics. Silently
+			// falling through to the code below would export it exactly
+			// like an ordinary persistent state variable: a false model
+			// (wrong reset semantics, wrong slot space) that every
+			// downstream `Storage`-preservation theorem would then be
+			// "proving" about the wrong thing. No corpus contract uses this
+			// keyword today (OZ's transient-storage helpers stay on raw
+			// assembly for pre-0.8.28 compatibility), so failing the whole
+			// contract's export now is cheap and exactly matches this
+			// exporter's existing `UnsupportedSolCore` idiom — propagates to
+			// `exportContract`'s outer catch, which turns it into a
+			// structured `{"unsupported": true, "reason": ...}` export
+			// rather than a silently-dropped field. Fail-closed beats wrong.
+			if (stateVar->referenceLocation() == VariableDeclaration::Location::Transient)
+				throw UnsupportedSolCore(
+					"`transient`-location state variable '" + stateVar->name() +
+					"' is not yet modeled (EIP-1153 transient storage is only "
+					"supported via raw tload/tstore Yul builtins in inline "
+					"assembly, not the `transient` state-variable keyword); "
+					"exporting it as an ordinary persistent field would be a "
+					"false model."
+				);
 			// Skip already-exported fields (can happen with diamond inheritance)
 			if (exportedFieldNames.count(stateVar->name()))
 				continue;
@@ -4859,15 +5932,70 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	stateFields.emplace_back(Json{{"name", "returndata"}, {"type", Json{{"kind", "named"}, {"name", "ByteArray"}}}});
 	stateFields.emplace_back(Json{{"name", "logs"}, {"type", Json{{"kind", "named"}, {"name", "Logs"}}}});
 	stateFields.emplace_back(Json{{"name", "env"}, {"type", Json{{"kind", "named"}, {"name", "CallEnv"}}}});
+	// SOLCORE_TLOAD_TSTORE_ARCHITECTURE_SPEC.md §3.1: deliberately NOT
+	// listing the new `transient` ExecState field here. This list is not
+	// purely informational/inert as originally assumed while implementing
+	// Stage 1 — SolCoreOfJson.ml's `parse_state_decl` feeds it into
+	// `type_env.state.fields`, which downstream code keys named lookups off
+	// of (e.g. LeanSupport.ml's `storage_record_context`), and adding an
+	// entry with a `type.name` ("TransientStorage") that has no registered
+	// SolCore named-type mapping broke real-corpus generation (verified:
+	// `state.transient` mis-typed to `U256` instead of `TransientStorage`,
+	// a Lean compile failure on MetricReentrancyGuardTransient). The
+	// `transient` field is real and fully wired at the runtime-type level
+	// (Types.lean/Mapping.lean) and in the Yul translation
+	// (Base.ml's tload/tstore dispatch); it does not need a `state.fields`
+	// entry for either of those to work correctly.
 	state["fields"] = std::move(stateFields);
 	solcore["state"] = std::move(state);
+
+	// Assign export names (and register `f__super__Owner` aliases for every
+	// statically-bound base-call target that needs flattening) BEFORE
+	// exporting the constructor and dispatch entries below: both lower call
+	// names via exportedFunctionName, which previously ran against a stale
+	// map (whatever the previously exported contract left behind — empty for
+	// the first contract), so a constructor-body `super.f()`/`Base.f()` call
+	// or a cross-contract overload could get a name inconsistent with the
+	// sibling definitions this same artifact exports further below.
+	std::set<FunctionDefinition const*> namespacedGetterDefinitions;
+	for (auto const& getter : namespacedGetters)
+		namespacedGetterDefinitions.insert(getter.function);
+
+	std::vector<FunctionDefinition const*> overloadCandidates;
+	for (FunctionDefinition const* function : contract.definedFunctions())
+	{
+		if (!function->isOrdinary() || !function->isImplemented())
+			continue;
+		if (namespacedGetterDefinitions.count(function))
+			continue;
+		overloadCandidates.push_back(function);
+	}
+	for (auto const* baseContract : contract.annotation().linearizedBaseContracts)
+	{
+		if (baseContract == &contract)
+			continue;
+		for (FunctionDefinition const* function : baseContract->definedFunctions())
+		{
+			if (!function->isOrdinary() || !function->isImplemented())
+				continue;
+			if (namespacedGetterDefinitions.count(function))
+				continue;
+			overloadCandidates.push_back(function);
+		}
+	}
+	assignExportedFunctionNames(overloadCandidates);
+	std::set<FunctionDefinition const*> superReferencedFunctions =
+		collectSuperReferencedFunctions(contract);
+	for (FunctionDefinition const* function: superReferencedFunctions)
+		exportedFunctionNames[function] = contractScopedSuperAlias(*function);
+
 	if (auto const* ctor = contract.constructor())
 	{
 		if (ctor->isImplemented())
 		{
 			try
 			{
-				solcore["constructor"] = exportConstructor(*ctor);
+				solcore["constructor"] = exportConstructor(*ctor, contract);
 			}
 			catch (UnsupportedSolCore const&)
 			{
@@ -4907,39 +6035,6 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	// Collect exported internal function names to avoid duplicates
 	std::set<std::string> exportedInternalNames;
 
-	// Build a set of namespaced getter definitions to skip during export
-	std::set<FunctionDefinition const*> namespacedGetterDefinitions;
-	for (auto const& getter : namespacedGetters)
-		namespacedGetterDefinitions.insert(getter.function);
-
-	std::vector<FunctionDefinition const*> overloadCandidates;
-	for (FunctionDefinition const* function : contract.definedFunctions())
-	{
-		if (!function->isOrdinary() || !function->isImplemented())
-			continue;
-		if (namespacedGetterDefinitions.count(function))
-			continue;
-		overloadCandidates.push_back(function);
-	}
-	for (auto const* baseContract : contract.annotation().linearizedBaseContracts)
-	{
-		if (baseContract == &contract)
-			continue;
-		for (FunctionDefinition const* function : baseContract->definedFunctions())
-		{
-			if (!function->isOrdinary() || !function->isImplemented())
-				continue;
-			if (namespacedGetterDefinitions.count(function))
-				continue;
-			overloadCandidates.push_back(function);
-		}
-	}
-	assignExportedFunctionNames(overloadCandidates);
-	std::set<FunctionDefinition const*> superReferencedFunctions =
-		collectSuperReferencedFunctions(contract);
-	for (FunctionDefinition const* function: superReferencedFunctions)
-		exportedFunctionNames[function] = contractScopedSuperAlias(*function);
-
 	subStorageGetters = Json::array();
 	for (auto const& getter : namespacedGetters)
 	{
@@ -4962,7 +6057,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 		{
 			try
 			{
-				functions.emplace_back(exportFunction(*function));
+				functions.emplace_back(exportFunction(*function, contract));
 			}
 			catch (UnsupportedSolCore const&)
 			{
@@ -4978,7 +6073,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 			// Internal/private helper functions
 			try
 			{
-				internalFunctions.emplace_back(exportFunction(*function, /*_isInternal=*/true));
+				internalFunctions.emplace_back(exportFunction(*function, contract, /*_isInternal=*/true));
 			}
 			catch (UnsupportedSolCore const&)
 			{
@@ -5026,7 +6121,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 					continue;
 				try
 				{
-					functions.emplace_back(exportFunction(*function));
+					functions.emplace_back(exportFunction(*function, contract));
 					exportedPublicNames.insert(exportedFunctionName(*function));
 				}
 				catch (UnsupportedSolCore const&) {}
@@ -5058,7 +6153,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 				continue; // Already exported (overridden in derived contract)
 			try
 			{
-				internalFunctions.emplace_back(exportFunction(*function, /*_isInternal=*/true));
+				internalFunctions.emplace_back(exportFunction(*function, contract, /*_isInternal=*/true));
 				exportedInternalNames.insert(exportedFunctionName(*function));
 			}
 			catch (UnsupportedSolCore const&) {}
@@ -5098,6 +6193,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 				else
 					f["return"] = Json("unit");
 				f["body"] = exportBody(*recv);
+				f["ast_write_oracle"] = astWriteOracleJson(*recv, contract);
 				functions.emplace_back(f);
 			}
 			catch (UnsupportedSolCore const&)
@@ -5142,6 +6238,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 				else
 					f["return"] = Json("unit");
 				f["body"] = exportBody(*fb);
+				f["ast_write_oracle"] = astWriteOracleJson(*fb, contract);
 				functions.emplace_back(f);
 			}
 			catch (UnsupportedSolCore const&)
