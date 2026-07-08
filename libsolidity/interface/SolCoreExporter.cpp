@@ -2211,6 +2211,97 @@ Json exportExpr(Expression const& _expr)
 			}
 		}
 
+		// `.selector` on a function/method reference (e.g.
+		// IERC20.transfer.selector, IERC721Receiver.onERC721Received.selector,
+		// token.upgradeTo.selector). The base is a function reference whose
+		// annotation carries the FunctionType / FunctionDefinition; lowering
+		// that base to a *value* is neither meaningful nor possible (functions
+		// are not values), so the generic `field` fallback below would
+		// substitute a `{u256,0}` placeholder and silently lose the selector.
+		// Instead emit explicit selector/signature/contract metadata taken
+		// straight from the type annotations — the same FunctionType APIs the
+		// contract-level exportForeignMethodSummary uses
+		// (externalIdentifierHex / externalSignature). The OCaml frontend
+		// consumes this as an opaque U256 selector literal; no name-based
+		// recovery is performed here.
+		if (memberAccess->memberName() == "selector")
+		{
+			Expression const& selBase = memberAccess->expression();
+			FunctionType const* funType =
+				dynamic_cast<FunctionType const*>(selBase.annotation().type);
+			FunctionDefinition const* funcDef = nullptr;
+			std::string methodName;
+			if (auto const* baseMember = dynamic_cast<MemberAccess const*>(&selBase))
+			{
+				methodName = baseMember->memberName();
+				funcDef = dynamic_cast<FunctionDefinition const*>(
+					baseMember->annotation().referencedDeclaration);
+			}
+			if (!funcDef)
+				if (auto const* baseIdent = dynamic_cast<Identifier const*>(&selBase))
+					funcDef = dynamic_cast<FunctionDefinition const*>(
+						baseIdent->annotation().referencedDeclaration);
+			if (methodName.empty() && funcDef)
+				methodName = funcDef->name();
+
+			// Resolve a canonical external selector + signature: prefer the
+			// annotation FunctionType (already the external interface function
+			// type for a qualified member access); otherwise synthesize one from
+			// the FunctionDefinition, exactly as the cross-contract resolver
+			// (resolveStaticBaseCallTarget) and exportForeignMethodSummary do.
+			std::string selectorHex;
+			std::string signature;
+			if (funType)
+			{
+				selectorHex = funType->externalIdentifierHex();
+				signature = funType->externalSignature();
+			}
+			else if (funcDef)
+			{
+				selectorHex = funcDef->externalIdentifierHex();
+				FunctionType ft(*funcDef);
+				if (FunctionType const* iface = ft.interfaceFunctionType())
+					signature = iface->externalSignature();
+			}
+
+			// Only treat this as a function selector when the type annotations
+			// actually resolve to an external function. A struct/storage field
+			// literally named "selector" has neither a FunctionType nor a
+			// FunctionDefinition base and must fall through to the generic
+			// `field` handling below unchanged.
+			if (!selectorHex.empty())
+			{
+				Json result = Json::object();
+				result["kind"] = "method_selector";
+				result["method_name"] = methodName;
+				if (signature.empty())
+					result["method_signature"] = nullptr;
+				else
+					result["method_signature"] = signature;
+				result["selector_hex"] = selectorHex;
+
+				// contractId: prefer an explicit contract-qualified base
+				// (IERC721Receiver.onERC721Received). null otherwise —
+				// selector_hex and method_signature remain authoritative, so a
+				// null contractId is never a guess.
+				std::string contractId;
+				if (auto const* baseMember = dynamic_cast<MemberAccess const*>(&selBase))
+				{
+					if (auto const* baseIdent =
+							dynamic_cast<Identifier const*>(&baseMember->expression()))
+					{
+						if (auto const* cd = dynamic_cast<ContractDefinition const*>(
+								baseIdent->annotation().referencedDeclaration))
+							contractId = cd->name();
+					}
+				}
+				if (contractId.empty())
+					result["contractId"] = nullptr;
+				else
+					result["contractId"] = contractId;
+				return result;
+			}
+		}
 		Json result = Json::object();
 		result["kind"] = "field";
 		try
