@@ -1219,6 +1219,26 @@ std::string runtimeFieldForMagicMember(std::string const& _base, std::string con
 
 Json exportExpr(Expression const& _expr);
 
+/// [SolCore audit finding #10] Whether `_expr` denotes this contract's own
+/// address, i.e. is (possibly wrapped in one or more no-op `address(...)`/
+/// `payable(...)` type conversions around) the magic identifier `this`. Used
+/// to distinguish `address(this).balance` (correctly modeled as the shared
+/// world's `contractBalance`, which `syncLegacyContractBalance` keeps aligned
+/// with the currently-executing address) from `X.balance` for any other
+/// address `X`, which must NOT take that shortcut (see the `.balance`
+/// handling below).
+bool isThisAddressExpr(Expression const& _expr)
+{
+	if (auto const* identifier = dynamic_cast<Identifier const*>(&_expr))
+		return dynamic_cast<MagicVariableDeclaration const*>(identifier->annotation().referencedDeclaration)
+			&& identifier->name() == "this";
+	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
+		if (call->annotation().kind.set() && *call->annotation().kind == FunctionCallKind::TypeConversion
+			&& call->arguments().size() == 1 && call->arguments().front())
+			return isThisAddressExpr(*call->arguments().front());
+	return false;
+}
+
 Json u256Literal(std::string const& _value)
 {
 	Json result = Json::object();
@@ -1936,50 +1956,58 @@ Json exportExpr(Expression const& _expr)
 			}
 			throw UnsupportedSolCore("Unsupported magic variable: " + identifier->name());
 		}
-		// Identifiers that reference contracts/interfaces/libraries
-		// These are address-typed in expressions (e.g., address(L))
+		// [SolCore audit finding #18] Each of the four cases below used to
+		// emit a silent `{u256,0}` placeholder for an identifier this
+		// exporter has no real value-context lowering for -- a real
+		// occurrence would previously read as the literal number 0 to every
+		// downstream consumer with no trace that anything was substituted
+		// (e.g. `require(x != address(SomeLibrary))` would tautologically
+		// compare against 0 instead of failing to export). Fail closed
+		// instead: the (rare) real occurrence becomes a diagnosable
+		// "unsupported_body" for its containing function rather than a
+		// silently-wrong value baked into a proof.
+
+		// Identifiers that reference contracts/interfaces/libraries used
+		// directly as a value (e.g. a bare library/interface name outside
+		// of `address(...)`/a qualified member access, both handled above).
 		if (dynamic_cast<ContractDefinition const*>(identifier->annotation().referencedDeclaration))
-		{
-			// Library/contract address — return zero address as placeholder
-			Json result = Json::object();
-			result["kind"] = "u256";
-			result["value"] = "0";
-			return result;
-		}
-		// Identifiers that reference function definitions used as values (function pointers)
-		// Internal function pointers are represented as U256 at the EVM level
+			throw UnsupportedSolCore(
+				"A bare contract/interface/library identifier used as a "
+				"value has no real address representation in the SolCore "
+				"exporter.");
+		// Identifiers that reference function definitions used as values
+		// (internal function pointers) -- not modeled at all.
 		if (dynamic_cast<FunctionDefinition const*>(identifier->annotation().referencedDeclaration))
-		{
-			Json result = Json::object();
-			result["kind"] = "u256";
-			result["value"] = "0";
-			return result;
-		}
-		// Identifiers that reference user-defined value type definitions (e.g., MyAddress in MyAddress.wrap)
+			throw UnsupportedSolCore(
+				"An internal function used as a value (a function pointer) "
+				"is not modeled by the SolCore exporter.");
+		// Identifiers that reference user-defined value type definitions
+		// (e.g. the bare `MyAddress` in `MyAddress.wrap(...)`/`.unwrap(...)`,
+		// used as a value rather than as the base of a wrap/unwrap call).
 		if (dynamic_cast<UserDefinedValueTypeDefinition const*>(identifier->annotation().referencedDeclaration))
-		{
-			Json result = Json::object();
-			result["kind"] = "u256";
-			result["value"] = "0";
-			return result;
-		}
+			throw UnsupportedSolCore(
+				"A user-defined value type name used as a value has no "
+				"real representation in the SolCore exporter.");
 		// Any other non-variable declaration used in expression context
-		// (e.g., struct name, error name, event name) — emit a U256 placeholder
-		// since these are type-level references, not runtime values.
-		// The VariableDeclaration case was already handled above, so only
-		// non-variable declarations reach here.
+		// (e.g., struct name, error name, event name): these are
+		// type/declaration-level references, not runtime values, and the
+		// VariableDeclaration case was already handled above.
 		if (identifier->annotation().referencedDeclaration)
-		{
-			Json result = Json::object();
-			result["kind"] = "u256";
-			result["value"] = "0";
-			return result;
-		}
-		// Fallback: no declaration found — assume it's a local variable reference
-		Json result = Json::object();
-		result["kind"] = "local";
-		result["name"] = identifier->name();
-		return result;
+			throw UnsupportedSolCore(
+				"'" + identifier->name() +
+				"' is a declaration-level reference (not a variable) used "
+				"in value context, which the SolCore exporter cannot "
+				"represent as a real value.");
+		// No declaration resolved at all for this identifier. Every genuine
+		// local-variable reference resolves to a VariableDeclaration above,
+		// so reaching here means name resolution didn't attach a
+		// declaration -- guessing "local" would silently synthesize a
+		// reference to a variable that may never have been declared in the
+		// translated scope. Fail closed rather than guess.
+		throw UnsupportedSolCore(
+			"Identifier '" + identifier->name() +
+			"' has no resolved declaration; the SolCore exporter cannot "
+			"determine what value it refers to.");
 	}
 
 	if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_expr))
@@ -2086,11 +2114,34 @@ Json exportExpr(Expression const& _expr)
 			Type const* baseType = memberAccess->expression().annotation().type;
 			if (baseType && baseType->category() == Type::Category::Address)
 			{
-				// address(expr).balance → get contract balance from world state
-				Json result = Json::object();
-				result["kind"] = "state_get";
-				result["path"] = jsonStringArray({"world", "contractBalance"});
-				return result;
+				// [SolCore audit finding #10] This used to unconditionally
+				// return the shared world's `contractBalance` regardless of
+				// which address's `.balance` was actually accessed, so
+				// `address(attacker).balance`, `token.balance`, and
+				// `address(this).balance` all silently collapsed to THIS
+				// contract's own balance. `contractBalance` genuinely is
+				// this contract's balance (kept in sync by
+				// `syncLegacyContractBalance`), so the shortcut is correct
+				// ONLY for `address(this).balance` (or an equivalent chain
+				// of no-op `address(...)`/`payable(...)` conversions around
+				// `this`). For any other address expression there is no
+				// per-address balance lookup this exporter can wire up yet
+				// (the Lean runtime's `WorldState.balances`/`getBalance`
+				// support querying an arbitrary address, but nothing on the
+				// OCaml-frontend side consumes such a node), so fail closed
+				// instead of silently reading the wrong account's balance.
+				if (isThisAddressExpr(memberAccess->expression()))
+				{
+					Json result = Json::object();
+					result["kind"] = "state_get";
+					result["path"] = jsonStringArray({"world", "contractBalance"});
+					return result;
+				}
+				throw UnsupportedSolCore(
+					"'.balance' on an address other than address(this) is not "
+					"modeled by the SolCore exporter yet -- it used to silently "
+					"return this contract's own balance instead of the queried "
+					"address's balance.");
 			}
 		}
 
@@ -2166,11 +2217,35 @@ Json exportExpr(Expression const& _expr)
 								return result;
 							}
 						}
-						// Fallback for unknown type argument — return 0
-						Json result = Json::object();
-						result["kind"] = "u256";
-						result["value"] = "0";
-						return result;
+						// [SolCore audit finding #18] type(E).max/min for an enum type
+						// (valid Solidity since 0.8.8) used to fall through to the
+						// generic "unknown type argument" 0-placeholder below, so
+						// e.g. `require(x <= type(RoundingMode).max)` silently became
+						// `require(x <= 0)`. Enums are always densely numbered
+						// starting at 0, so both bounds have a real, exact value:
+						// `min` is always 0, and `max` is the member count minus one
+						// (`EnumType::minValue()`/`maxValue()` compute exactly this).
+						if (typeArg && typeArg->category() == Type::Category::Enum)
+						{
+							auto const* enumType = dynamic_cast<EnumType const*>(typeArg);
+							if (enumType)
+							{
+								Json result = Json::object();
+								result["kind"] = "u256";
+								result["value"] = std::to_string(
+									memberAccess->memberName() == "min" ?
+										enumType->minValue() : enumType->maxValue());
+								return result;
+							}
+						}
+						// Genuinely unknown/unhandled type(X).max/min type argument --
+						// fail closed instead of silently substituting a `0` that a
+						// caller (e.g. a `require(x <= type(X).max)` bound check) would
+						// then treat as a real, meaningful value.
+						throw UnsupportedSolCore(
+							"type(X)." + memberAccess->memberName() +
+							" is not supported by the SolCore exporter for this type "
+							"argument.");
 					}
 					if (memberAccess->memberName() == "interfaceId")
 					{
@@ -2304,18 +2379,14 @@ Json exportExpr(Expression const& _expr)
 		}
 		Json result = Json::object();
 		result["kind"] = "field";
-		try
-		{
-			result["base"] = exportExpr(memberAccess->expression());
-		}
-		catch (...)
-		{
-			// If the base expression is unsupported, use a zero placeholder
-			Json zero = Json::object();
-			zero["kind"] = "u256";
-			zero["value"] = "0";
-			result["base"] = zero;
-		}
+		// [SolCore audit finding #9] No catch here: an unlowerable base
+		// expression must propagate (to exportBody's catch-all, which turns
+		// it into a diagnosable "unsupported_body" marker), not silently
+		// become an untraceable `{u256,0}` -- the field access would then
+		// read a real struct/tuple field off a fabricated zero base, exactly
+		// the reintroduced `.selector`-class placeholder bug this file's
+		// abi_encode*/generic-call sites were already hardened against.
+		result["base"] = exportExpr(memberAccess->expression());
 		result["field"] = memberAccess->memberName();
 		return result;
 	}
@@ -2394,6 +2465,37 @@ Json exportExpr(Expression const& _expr)
 	if (auto const* binary = dynamic_cast<BinaryOperation const*>(&_expr))
 	{
 		Json result = Json::object();
+
+		// SolCore audit finding #5: `<, <=, >, >=, /, %, >>` have different
+		// bit patterns/results for signed vs. unsigned operands (e.g.
+		// int256(-1) < int256(1) is true under SLT but u256_lt(2^256-1, 1)
+		// is false), yet this lowering used to route every one of these
+		// operators to its unsigned EVM-node counterpart with no signedness
+		// marker at all. `commonType` (set by the type checker on the
+		// `BinaryOperation` itself) is the actual operand type used for the
+		// operation -- not necessarily the expression's result type, which
+		// for comparisons is `bool` -- so it is the right thing to consult
+		// here, except for the shift operators: Solidity always types the
+		// shift *amount* (rhs) as unsigned regardless of the value being
+		// shifted, so `commonType` doesn't reflect the signedness that
+		// matters for `>>`; the left operand's own type does.
+		//
+		// There is no signed counterpart of `u256_div`/`u256_mod`/`u256_lt`/
+		// `u256_le`/`u256_gt`/`u256_ge`/`u256_shr` that the OCaml frontend
+		// and Lean runtime can consume yet (seeing one of these `kind`s
+		// with a signed operand would previously produce a false, silently
+		// wrong preservation certificate downstream). Until that signed
+		// vocabulary exists end-to-end, fail closed here -- via the same
+		// `UnsupportedSolCore` -> `unsupported_body` mechanism used
+		// throughout this file -- instead of manufacturing a certificate
+		// over the wrong semantics.
+		auto isSignedIntegerType = [](Type const* _type) -> bool {
+			if (!_type || _type->category() != Type::Category::Integer)
+				return false;
+			auto const* intType = dynamic_cast<IntegerType const*>(_type);
+			return intType && intType->isSigned();
+		};
+
 		switch (binary->getOperator())
 		{
 		case Token::Add:
@@ -2409,9 +2511,21 @@ Json exportExpr(Expression const& _expr)
 			markUncheckedContext(result);
 			break;
 		case Token::Div:
+			if (isSignedIntegerType(binary->annotation().commonType))
+				throw UnsupportedSolCore(
+					"Signed division ('/' on a signed integer type) has no "
+					"faithful SolCore lowering yet; the unsigned u256_div "
+					"primitive would silently produce the wrong result "
+					"whenever an operand is negative.");
 			result["kind"] = "u256_div";
 			break;
 		case Token::Mod:
+			if (isSignedIntegerType(binary->annotation().commonType))
+				throw UnsupportedSolCore(
+					"Signed modulo ('%' on a signed integer type) has no "
+					"faithful SolCore lowering yet; the unsigned u256_mod "
+					"primitive would silently produce the wrong result "
+					"whenever an operand is negative.");
 			result["kind"] = "u256_mod";
 			break;
 		case Token::Exp:
@@ -2424,15 +2538,39 @@ Json exportExpr(Expression const& _expr)
 			result["kind"] = "u256_ne";
 			break;
 		case Token::LessThan:
+			if (isSignedIntegerType(binary->annotation().commonType))
+				throw UnsupportedSolCore(
+					"Signed comparison ('<' on a signed integer type) has "
+					"no faithful SolCore lowering yet; the unsigned "
+					"u256_lt primitive silently flips the result whenever "
+					"an operand is negative.");
 			result["kind"] = "u256_lt";
 			break;
 		case Token::LessThanOrEqual:
+			if (isSignedIntegerType(binary->annotation().commonType))
+				throw UnsupportedSolCore(
+					"Signed comparison ('<=' on a signed integer type) has "
+					"no faithful SolCore lowering yet; the unsigned "
+					"u256_le primitive silently flips the result whenever "
+					"an operand is negative.");
 			result["kind"] = "u256_le";
 			break;
 		case Token::GreaterThan:
+			if (isSignedIntegerType(binary->annotation().commonType))
+				throw UnsupportedSolCore(
+					"Signed comparison ('>' on a signed integer type) has "
+					"no faithful SolCore lowering yet; the unsigned "
+					"u256_gt primitive silently flips the result whenever "
+					"an operand is negative.");
 			result["kind"] = "u256_gt";
 			break;
 		case Token::GreaterThanOrEqual:
+			if (isSignedIntegerType(binary->annotation().commonType))
+				throw UnsupportedSolCore(
+					"Signed comparison ('>=' on a signed integer type) has "
+					"no faithful SolCore lowering yet; the unsigned "
+					"u256_ge primitive silently flips the result whenever "
+					"an operand is negative.");
 			result["kind"] = "u256_ge";
 			break;
 		case Token::And:
@@ -2454,6 +2592,12 @@ Json exportExpr(Expression const& _expr)
 			result["kind"] = "u256_shl";
 			break;
 		case Token::SAR:
+			if (isSignedIntegerType(binary->leftExpression().annotation().type))
+				throw UnsupportedSolCore(
+					"Signed right shift ('>>' on a signed integer type) "
+					"has no faithful SolCore lowering yet; the logical-"
+					"shift u256_shr primitive silently drops sign "
+					"extension for negative values.");
 			result["kind"] = "u256_shr";
 			break;
 		default:
@@ -2621,16 +2765,12 @@ Json exportExpr(Expression const& _expr)
 			else
 				result["name"] = "Unknown";
 			result["args"] = Json::array();
+			// [SolCore audit finding #9] No catch-and-substitute-0 here: an
+			// unlowerable struct-constructor argument must propagate to
+			// exportBody's catch-all rather than silently becoming an
+			// untraceable `{u256,0}` field value.
 			for (auto const& arg: call->arguments())
-			{
-				try { result["args"].emplace_back(exportExpr(*arg)); }
-				catch (...) {
-					Json zero = Json::object();
-					zero["kind"] = "u256";
-					zero["value"] = "0";
-					result["args"].emplace_back(zero);
-				}
-			}
+				result["args"].emplace_back(exportExpr(*arg));
 			return result;
 		}
 
@@ -2653,17 +2793,13 @@ Json exportExpr(Expression const& _expr)
 			result["kind"] = "internal_call";
 			result["function"] = "new_array";
 			result["args"] = Json::array();
-			// The argument is the size
+			// The argument is the size.
+			// [SolCore audit finding #9] No catch-and-substitute-0 here: an
+			// unlowerable size argument must propagate to exportBody's
+			// catch-all rather than silently allocating an untraceable
+			// zero-sized/zero-length array.
 			for (auto const& arg: call->arguments())
-			{
-				try { result["args"].emplace_back(exportExpr(*arg)); }
-				catch (...) {
-					Json zero = Json::object();
-					zero["kind"] = "u256";
-					zero["value"] = "0";
-					result["args"].emplace_back(zero);
-				}
-			}
+				result["args"].emplace_back(exportExpr(*arg));
 			// Also include the type information
 			try
 			{
@@ -2725,16 +2861,12 @@ Json exportExpr(Expression const& _expr)
 				result["kind"] = "internal_call";
 				result["function"] = callee->name();
 				result["args"] = Json::array();
+				// [SolCore audit finding #9] No catch-and-substitute-0 here:
+				// an unlowerable hash/ecrecover/gasleft argument must
+				// propagate to exportBody's catch-all rather than silently
+				// hashing/recovering over an untraceable zero.
 				for (auto const& arg: call->arguments())
-				{
-					try { result["args"].emplace_back(exportExpr(*arg)); }
-					catch (...) {
-						Json zero = Json::object();
-						zero["kind"] = "u256";
-						zero["value"] = "0";
-						result["args"].emplace_back(zero);
-					}
-				}
+					result["args"].emplace_back(exportExpr(*arg));
 				return result;
 			}
 
@@ -3659,18 +3791,14 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		callExpr["kind"] = "internal_call";
 		callExpr["function"] = "tuple_assign";
 		callExpr["args"] = Json::array();
+		// [SolCore audit finding #9] No catch-and-substitute-0 here: an
+		// unlowerable tuple-assignment-target component must propagate to
+		// exportBody's catch-all rather than silently assigning through an
+		// untraceable zero target.
 		for (auto const& component: tuple->components())
 		{
 			if (component)
-			{
-				try { callExpr["args"].emplace_back(exportExpr(*component)); }
-				catch (...) {
-					Json zero = Json::object();
-					zero["kind"] = "u256";
-					zero["value"] = "0";
-					callExpr["args"].emplace_back(zero);
-				}
-			}
+				callExpr["args"].emplace_back(exportExpr(*component));
 			else
 				callExpr["args"].emplace_back(Json());
 		}
@@ -3687,13 +3815,11 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		callExpr["kind"] = "internal_call";
 		callExpr["function"] = "generic_assign";
 		callExpr["args"] = Json::array();
-		try { callExpr["args"].emplace_back(exportExpr(_lhs)); }
-		catch (...) {
-			Json zero = Json::object();
-			zero["kind"] = "u256";
-			zero["value"] = "0";
-			callExpr["args"].emplace_back(zero);
-		}
+		// [SolCore audit finding #9] No catch-and-substitute-0 here: an
+		// unlowerable assignment target must propagate to exportBody's
+		// catch-all rather than silently assigning through an untraceable
+		// zero target.
+		callExpr["args"].emplace_back(exportExpr(_lhs));
 		callExpr["args"].emplace_back(rhsJson);
 		result["value"] = callExpr;
 		return result;
@@ -3880,13 +4006,14 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 		callExpr["kind"] = "internal_call";
 		callExpr["function"] = "tuple_assign";
 		callExpr["args"] = Json::array();
+		// [SolCore audit finding #9] No catch-and-substitute-0 here: an
+		// unlowerable tuple-assignment-target component must propagate to
+		// exportBody's catch-all rather than silently assigning through an
+		// untraceable zero target.
 		for (auto const& component: tuple->components())
 		{
 			if (component)
-			{
-				try { callExpr["args"].emplace_back(exportExpr(*component)); }
-				catch (...) { callExpr["args"].emplace_back(u256Literal("0")); }
-			}
+				callExpr["args"].emplace_back(exportExpr(*component));
 			else
 				callExpr["args"].emplace_back(Json());
 		}
@@ -3901,8 +4028,11 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 	callExpr["kind"] = "internal_call";
 	callExpr["function"] = "generic_assign";
 	callExpr["args"] = Json::array();
-	try { callExpr["args"].emplace_back(exportExpr(_lhs)); }
-	catch (...) { callExpr["args"].emplace_back(u256Literal("0")); }
+	// [SolCore audit finding #9] No catch-and-substitute-0 here: an
+	// unlowerable assignment target must propagate to exportBody's
+	// catch-all rather than silently assigning through an untraceable zero
+	// target.
+	callExpr["args"].emplace_back(exportExpr(_lhs));
 	callExpr["args"].emplace_back(_value);
 	result["value"] = callExpr;
 	return result;
