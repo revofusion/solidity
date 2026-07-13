@@ -129,6 +129,43 @@ void markUncheckedContext(Json& _result)
 		_result["unchecked"] = true;
 }
 
+// --- Declared-width signal for narrow-integer arithmetic (SolCore audit:
+// narrow-width arithmetic soundness gap) ---
+//
+// Solidity >=0.8 bounds checked arithmetic at the DECLARED type's width
+// (`uint8 + uint8` reverts past 255), and `unchecked { }` arithmetic wraps
+// at that same declared width — never at 2^256. Before this tag existed,
+// `u256_add`/`u256_sub`/`u256_mul` JSON nodes carried no width at all, so
+// the OCaml frontend could only model every add/sub/mul at the full
+// 256-bit word: a `uint8` sum of 250+15 was modeled as succeeding with 265
+// instead of reverting (checked) or wrapping to 9 (unchecked) — silently
+// masking narrow-overflow bypasses of downstream `require` gates.
+//
+// `tagNarrowArithWidth` records the operation's static integer width as
+// `"bits": N` (8..248) on the just-built arithmetic node whenever the
+// operation is typed at a narrow UNSIGNED integer type. The right type to
+// consult is the OPERATION's type — `commonType` for a `BinaryOperation`,
+// the mutated/assigned expression's own type for `++`/`--`/`+=`-family
+// sites — which the type checker has already resolved through implicit
+// conversions, so `uint256(a) + uint256(b)` (256-bit arithmetic on widened
+// narrow operands) correctly stays untagged while `a + b` on two `uint8`s
+// is tagged 8. Additive-only: absent means what it always meant (the full
+// 256-bit word), so pre-existing corpus JSON keeps its exact old meaning;
+// the `featureFlags.arithWidths` marker lets consumers detect artifacts
+// that predate this signal. Narrow SIGNED types are deliberately NOT
+// tagged: signed arithmetic has no faithful SolCore lowering yet (audit
+// bug #5's fail-closed domain), and a width tag alone would not repair the
+// missing two's-complement value model, so signed sites keep the
+// status-quo lowering unchanged.
+void tagNarrowArithWidth(Json& _result, Type const* _operationType)
+{
+	if (!_operationType)
+		return;
+	auto const* intType = dynamic_cast<IntegerType const*>(_operationType);
+	if (intType && !intType->isSigned() && intType->numBits() < 256)
+		_result["bits"] = static_cast<int>(intType->numBits());
+}
+
 std::string exportedFunctionName(FunctionDefinition const& _function);
 
 template <class F>
@@ -344,6 +381,12 @@ Json featureFlags()
 	flags["fixedBytes"] = true;
 	flags["smallUints"] = true;
 	flags["signedInts"] = true;
+	// Narrow-unsigned arithmetic nodes carry their declared width as
+	// `"bits": N` (see tagNarrowArithWidth). Artifacts without this flag
+	// predate the signal: their untagged add/sub/mul nodes are AMBIGUOUS
+	// between genuine 256-bit arithmetic and mis-modeled narrow arithmetic,
+	// and consumers that need the distinction must treat them as stale.
+	flags["arithWidths"] = true;
 	return flags;
 }
 
@@ -2501,14 +2544,17 @@ Json exportExpr(Expression const& _expr)
 		case Token::Add:
 			result["kind"] = "u256_add";
 			markUncheckedContext(result);
+			tagNarrowArithWidth(result, binary->annotation().commonType);
 			break;
 		case Token::Sub:
 			result["kind"] = "u256_sub";
 			markUncheckedContext(result);
+			tagNarrowArithWidth(result, binary->annotation().commonType);
 			break;
 		case Token::Mul:
 			result["kind"] = "u256_mul";
 			markUncheckedContext(result);
+			tagNarrowArithWidth(result, binary->annotation().commonType);
 			break;
 		case Token::Div:
 			if (isSignedIntegerType(binary->annotation().commonType))
@@ -2625,6 +2671,7 @@ Json exportExpr(Expression const& _expr)
 		{
 			result["kind"] = "u256_add";
 			markUncheckedContext(result);
+			tagNarrowArithWidth(result, unary->subExpression().annotation().type);
 			result["lhs"] = exportExpr(unary->subExpression());
 			Json one = Json::object();
 			one["kind"] = "u256";
@@ -2636,6 +2683,7 @@ Json exportExpr(Expression const& _expr)
 		{
 			result["kind"] = "u256_sub";
 			markUncheckedContext(result);
+			tagNarrowArithWidth(result, unary->subExpression().annotation().type);
 			result["lhs"] = exportExpr(unary->subExpression());
 			Json one = Json::object();
 			one["kind"] = "u256";
@@ -3506,14 +3554,20 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		case Token::AssignAdd:
 			value["kind"] = "u256_add";
 			markUncheckedContext(value);
+			// Compound assignment operates at the assigned expression's own
+			// type (`a += b` is `a = a + b` at type(a)); the type checker
+			// guarantees `b` is implicitly convertible to it.
+			tagNarrowArithWidth(value, _lhs.annotation().type);
 			break;
 		case Token::AssignSub:
 			value["kind"] = "u256_sub";
 			markUncheckedContext(value);
+			tagNarrowArithWidth(value, _lhs.annotation().type);
 			break;
 		case Token::AssignMul:
 			value["kind"] = "u256_mul";
 			markUncheckedContext(value);
+			tagNarrowArithWidth(value, _lhs.annotation().type);
 			break;
 		case Token::AssignDiv:
 			value["kind"] = "u256_div";
@@ -4038,7 +4092,7 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 	return result;
 }
 
-Json mutationValue(Json const& _current, Token _op)
+Json mutationValue(Json const& _current, Token _op, Type const* _targetType)
 {
 	Json result = Json::object();
 	switch (_op)
@@ -4046,10 +4100,12 @@ Json mutationValue(Json const& _current, Token _op)
 	case Token::Inc:
 		result["kind"] = "u256_add";
 		markUncheckedContext(result);
+		tagNarrowArithWidth(result, _targetType);
 		break;
 	case Token::Dec:
 		result["kind"] = "u256_sub";
 		markUncheckedContext(result);
+		tagNarrowArithWidth(result, _targetType);
 		break;
 	default:
 		throw UnsupportedSolCore("Expected ++ or -- unary mutation.");
@@ -4061,7 +4117,7 @@ Json mutationValue(Json const& _current, Token _op)
 
 Json exportUnaryMutation(Expression const& _target, Token _op)
 {
-	return exportDirectAssignment(_target, mutationValue(exportExpr(_target), _op));
+	return exportDirectAssignment(_target, mutationValue(exportExpr(_target), _op, _target.annotation().type));
 }
 
 Json exportUnaryMutationReturn(UnaryOperation const& _unary)
@@ -4079,7 +4135,7 @@ Json exportUnaryMutationReturn(UnaryOperation const& _unary)
 		letStmt["kind"] = "let";
 		letStmt["name"] = tempName;
 		letStmt["type"] = "u256";
-		letStmt["value"] = mutationValue(exportExpr(target), _unary.getOperator());
+		letStmt["value"] = mutationValue(exportExpr(target), _unary.getOperator(), target.annotation().type);
 		block["statements"].emplace_back(std::move(letStmt));
 		block["statements"].emplace_back(exportDirectAssignment(target, localExpr(tempName)));
 	}
@@ -4091,7 +4147,7 @@ Json exportUnaryMutationReturn(UnaryOperation const& _unary)
 		letStmt["type"] = "u256";
 		letStmt["value"] = exportExpr(target);
 		block["statements"].emplace_back(std::move(letStmt));
-		block["statements"].emplace_back(exportDirectAssignment(target, mutationValue(localExpr(tempName), _unary.getOperator())));
+		block["statements"].emplace_back(exportDirectAssignment(target, mutationValue(localExpr(tempName), _unary.getOperator(), target.annotation().type)));
 	}
 
 	Json ret = Json::object();
