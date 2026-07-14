@@ -1954,6 +1954,193 @@ BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
 	BOOST_CHECK_EQUAL(origins["entries"][0]["originId"].get<std::string>(), "state:balances");
 }
 
+BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
+{
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"@openzeppelin/contracts/utils/structs/Checkpoints.sol", R"(
+				pragma solidity >=0.8.20;
+				library Checkpoints {
+					struct Trace256 {
+						uint256 value;
+					}
+
+					function upperLookup(Trace256 storage self, uint256) internal view returns (uint256) {
+						return self.value;
+					}
+
+					struct Trace224 {
+						uint224 value;
+					}
+
+					function lowerLookup(Trace224 storage self, uint32) internal view returns (uint224) {
+						return self.value;
+					}
+
+					function upperLookup(Trace224 storage self, uint32) internal view returns (uint224) {
+						return self.value;
+					}
+
+					function upperLookupRecent(Trace224 storage self, uint32) internal view returns (uint224) {
+						return self.value;
+					}
+
+					function latest(Trace224 storage self) internal view returns (uint224) {
+						return self.value;
+					}
+
+					function length(Trace224 storage self) internal view returns (uint256) {
+						return self.value;
+					}
+				}
+			)"},
+			{"@openzeppelin/contracts/utils/Checkpoints.sol", R"(
+				pragma solidity >=0.8.20;
+				library Checkpoints {
+					struct History {
+						uint256 value;
+					}
+
+					function latest(History storage self) internal view returns (uint256) {
+						return self.value;
+					}
+				}
+			)"},
+			{"counterfeit/Checkpoints.sol", R"(
+				pragma solidity >=0.8.20;
+				library Checkpoints {
+					struct Trace224 {
+						uint224 value;
+					}
+
+					function upperLookup(Trace224 storage self, uint32) internal view returns (uint224) {
+						return self.value;
+					}
+				}
+			)"},
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				import {Checkpoints} from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
+				import {Checkpoints as LegacyCheckpoints} from "@openzeppelin/contracts/utils/Checkpoints.sol";
+				import {Checkpoints as CounterfeitCheckpoints} from "counterfeit/Checkpoints.sol";
+
+				contract C {
+					using Checkpoints for Checkpoints.Trace224;
+					using Checkpoints for Checkpoints.Trace256;
+					using CounterfeitCheckpoints for CounterfeitCheckpoints.Trace224;
+
+					Checkpoints.Trace224 private trusted;
+					Checkpoints.Trace256 private trusted256;
+					CounterfeitCheckpoints.Trace224 private counterfeit;
+					LegacyCheckpoints.History private legacy;
+
+					function extension(uint32 key) external view returns (uint224) {
+						return trusted.upperLookup(key);
+					}
+
+					function qualified(uint32 key) external view returns (uint224) {
+						return Checkpoints.upperLookup(trusted, key);
+					}
+
+					function trace256(uint256 key) external view returns (uint256) {
+						return trusted256.upperLookup(key);
+					}
+
+					function lower(uint32 key) external view returns (uint224) {
+						return trusted.lowerLookup(key);
+					}
+
+					function recent(uint32 key) external view returns (uint224) {
+						return trusted.upperLookupRecent(key);
+					}
+
+					function latestValue() external view returns (uint224) {
+						return trusted.latest();
+					}
+
+					function checkpointCount() external view returns (uint256) {
+						return trusted.length();
+					}
+
+					function legacyLatest() external view returns (uint256) {
+						return LegacyCheckpoints.latest(legacy);
+					}
+
+					function fake(uint32 key) external view returns (uint224) {
+						return counterfeit.upperLookup(key);
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "C");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE(solcore["functions"].is_array());
+
+	auto queryCall = [&solcore](std::string const& _functionName) -> Json const*
+	{
+		for (Json const& function: solcore["functions"])
+		{
+			if (
+				!function.contains("name") ||
+				!function["name"].is_string() ||
+				function["name"].get<std::string>() != _functionName
+			)
+				continue;
+
+			Json const& statements = function["body"]["statements"];
+			if (
+				statements.size() == 1 &&
+				statements[0].contains("value") &&
+				statements[0]["value"].is_object()
+			)
+				return &statements[0]["value"];
+		}
+		return nullptr;
+	};
+	auto checkQuery = [&queryCall](
+		std::string const& _functionName,
+		std::string const& _contractId
+	)
+	{
+		Json const* call = queryCall(_functionName);
+		BOOST_REQUIRE(call);
+		BOOST_REQUIRE(call->contains("contractId"));
+		BOOST_REQUIRE(call->contains("runtimeKind"));
+		BOOST_CHECK_EQUAL(call->at("kind").get<std::string>(), "internal_call");
+		BOOST_CHECK_EQUAL(call->at("contractId").get<std::string>(), _contractId);
+		BOOST_CHECK_EQUAL(call->at("runtimeKind").get<std::string>(), "oz_checkpoints_query");
+	};
+
+	// `extension` and `qualified` take the distinct using-for and
+	// library-qualified expression emission paths, respectively.
+	checkQuery("extension", "@openzeppelin/contracts/utils/structs/Checkpoints.sol:Checkpoints");
+	checkQuery("qualified", "@openzeppelin/contracts/utils/structs/Checkpoints.sol:Checkpoints");
+	checkQuery("trace256", "@openzeppelin/contracts/utils/structs/Checkpoints.sol:Checkpoints");
+	checkQuery("lower", "@openzeppelin/contracts/utils/structs/Checkpoints.sol:Checkpoints");
+	checkQuery("recent", "@openzeppelin/contracts/utils/structs/Checkpoints.sol:Checkpoints");
+	checkQuery("latestValue", "@openzeppelin/contracts/utils/structs/Checkpoints.sol:Checkpoints");
+	checkQuery("checkpointCount", "@openzeppelin/contracts/utils/structs/Checkpoints.sol:Checkpoints");
+	checkQuery("legacyLatest", "@openzeppelin/contracts/utils/Checkpoints.sol:Checkpoints");
+
+	Json const* counterfeitCall = queryCall("fake");
+	BOOST_REQUIRE(counterfeitCall);
+	BOOST_REQUIRE(counterfeitCall->contains("contractId"));
+	BOOST_CHECK_EQUAL(
+		counterfeitCall->at("contractId").get<std::string>(),
+		"counterfeit/Checkpoints.sol:Checkpoints"
+	);
+	BOOST_CHECK(!counterfeitCall->contains("runtimeKind"));
+}
+
 BOOST_AUTO_TEST_CASE(solcore_export_is_version_tagged_when_unsupported)
 {
 	// A `transient`-location state variable is deliberately fail-closed at

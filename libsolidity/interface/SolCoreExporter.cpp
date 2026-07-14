@@ -424,11 +424,148 @@ std::string exportedContractId(ContractDefinition const& _contract)
 	return _contract.fullyQualifiedName();
 }
 
+// The runtime implements only this fixed set of read-only Checkpoints queries.
+// Do not infer this tag from the exported function name: a library with a
+// matching name/signature is not an OpenZeppelin Checkpoints declaration unless
+// its resolved AST declaration also belongs to one of the canonical OZ sources.
+bool isKnownOzCheckpointsQuery(FunctionDefinition const& _function)
+{
+	auto const* library = dynamic_cast<ContractDefinition const*>(_function.scope());
+	if (
+		!library ||
+		!library->isLibrary() ||
+		_function.annotation().contract != library ||
+		!_function.isOrdinary() ||
+		!_function.isImplemented() ||
+		_function.visibility() != Visibility::Internal ||
+		_function.stateMutability() != StateMutability::View
+	)
+		return false;
+
+	std::string const sourceName = library->sourceUnitName();
+	bool const legacySource =
+		sourceName == "@openzeppelin/contracts/utils/Checkpoints.sol" ||
+		sourceName == "@openzeppelin/contracts-upgradeable/utils/CheckpointsUpgradeable.sol";
+	bool const modernSource =
+		sourceName == "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
+	bool const upgradeableSource =
+		sourceName == "@openzeppelin/contracts-upgradeable/utils/CheckpointsUpgradeable.sol";
+	std::string const expectedLibraryName = upgradeableSource ? "CheckpointsUpgradeable" : "Checkpoints";
+	if (
+		(!legacySource && !modernSource) ||
+		library->name() != expectedLibraryName ||
+		library->fullyQualifiedName() != sourceName + ":" + expectedLibraryName
+	)
+		return false;
+
+	auto const& sourceUnit = library->sourceUnit();
+	auto hasExpectedSourceLocation = [&sourceName](ASTNode const& _node)
+	{
+		return _node.location().sourceName && *_node.location().sourceName == sourceName;
+	};
+	if (
+		&sourceUnit != &_function.sourceUnit() ||
+		!sourceUnit.location().sourceName ||
+		*sourceUnit.location().sourceName != sourceName ||
+		!hasExpectedSourceLocation(sourceUnit) ||
+		!hasExpectedSourceLocation(*library) ||
+		!hasExpectedSourceLocation(_function) ||
+		!sourceUnit.location().contains(library->location()) ||
+		!sourceUnit.location().contains(_function.location())
+	)
+		return false;
+
+	auto const& parameters = _function.parameters();
+	auto const& returns = _function.returnParameters();
+	if (
+		parameters.empty() ||
+		parameters.front()->referenceLocation() != VariableDeclaration::Location::Storage ||
+		returns.size() != 1
+	)
+		return false;
+
+	auto const* selfType = dynamic_cast<StructType const*>(parameters.front()->type());
+	if (!selfType)
+		return false;
+	StructDefinition const& selfStruct = selfType->structDefinition();
+	if (
+		selfStruct.scope() != library ||
+		&selfStruct.sourceUnit() != &sourceUnit ||
+		selfStruct.sourceUnitName() != sourceName ||
+		!hasExpectedSourceLocation(selfStruct) ||
+		!sourceUnit.location().contains(selfStruct.location())
+	)
+		return false;
+
+	unsigned keyBits = 0;
+	unsigned valueBits = 0;
+	bool const isHistory = selfStruct.name() == "History" && legacySource;
+	if (isHistory)
+	{
+		keyBits = 32;
+		valueBits = 224;
+	}
+	else if (selfStruct.name() == "Trace224")
+	{
+		keyBits = 32;
+		valueBits = 224;
+	}
+	else if (selfStruct.name() == "Trace208" && modernSource)
+	{
+		keyBits = 48;
+		valueBits = 208;
+	}
+	else if (selfStruct.name() == "Trace256" && modernSource)
+	{
+		keyBits = 256;
+		valueBits = 256;
+	}
+	else if (selfStruct.name() == "Trace160")
+	{
+		keyBits = 96;
+		valueBits = 160;
+	}
+	else
+		return false;
+
+	auto isUnsignedInteger = [](Type const* _type, unsigned _bits)
+	{
+		auto const* integer = dynamic_cast<IntegerType const*>(_type);
+		return integer && !integer->isSigned() && integer->numBits() == _bits;
+	};
+
+	std::string const& functionName = _function.name();
+	if (functionName == "latest")
+		return
+			parameters.size() == 1 &&
+			(
+				isHistory ?
+					(isUnsignedInteger(returns.front()->type(), 224) || isUnsignedInteger(returns.front()->type(), 256)) :
+					isUnsignedInteger(returns.front()->type(), valueBits)
+			);
+	if (functionName == "length")
+		return parameters.size() == 1 && isUnsignedInteger(returns.front()->type(), 256);
+	if (
+		functionName != "lowerLookup" &&
+		functionName != "upperLookup" &&
+		functionName != "upperLookupRecent"
+	)
+		return false;
+	return
+		parameters.size() == 2 &&
+		isUnsignedInteger(parameters[1]->type(), keyBits) &&
+		isUnsignedInteger(returns.front()->type(), valueBits);
+}
+
 void addInternalLibraryCallContractId(Json& _result, FunctionDefinition const& _function)
 {
 	auto const* library = dynamic_cast<ContractDefinition const*>(_function.scope());
-	if (library && library->isLibrary())
-		_result["contractId"] = exportedContractId(*library);
+	if (!library || !library->isLibrary())
+		return;
+
+	_result["contractId"] = exportedContractId(*library);
+	if (isKnownOzCheckpointsQuery(_function))
+		_result["runtimeKind"] = "oz_checkpoints_query";
 }
 
 std::string solcoreDeployedCodeSize(ContractDefinition const& _contract)
