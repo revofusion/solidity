@@ -129,6 +129,124 @@ void markUncheckedContext(Json& _result)
 		_result["unchecked"] = true;
 }
 
+// --- Side-effect hoisting for mutating sub-expressions ---
+//
+// `x++` / `x--` / `++x` / `--x` and assignments are EXPRESSIONS in Solidity,
+// so they can appear nested arbitrarily deep inside a larger expression
+// (e.g. `abi.encode(nonces[owner]++, ...)` in the classic permit pattern).
+// exportExpr used to lower such a nested mutation to just its pure value —
+// silently DROPPING the underlying storage/local write, which made the
+// generated model unsound (a `preserves_storage_except` claim could hold in
+// the model while the real contract writes the field). Postfix `x++` was
+// additionally lowered to the WRONG value (`x+1` instead of the pre-value).
+//
+// The fix: every statement export installs a HoistScope. When exportExpr
+// meets a mutating sub-expression in a hoist-safe position, it appends an
+// explicit capture-let plus the real mutation statement to the scope's
+// buffer and substitutes a read of the temporary at the original use site.
+// exportStmt then emits `block { <hoisted...>, <statement> }` (the OCaml
+// frontend flattens nested blocks into the surrounding statement list, so
+// the hoisted statements execute immediately before the statement and any
+// `let` inside the wrapped statement stays visible to later statements).
+//
+// Soundness of moving the write to just before the statement: Solidity
+// deliberately leaves intra-expression evaluation order unspecified (only
+// statement order and short-circuiting are guaranteed), and solc's two
+// codegen pipelines actually differ here, so the model must only commit to
+// an order when every order is observationally equivalent. That is enforced
+// by checkHoistConflictsOrThrow: the mutated base variable must not be
+// referenced anywhere else in the statement's once-evaluated header
+// expressions, and (for storage-backed targets) every call reachable from
+// those expressions must be a storage-inert builtin or an internal
+// view/pure function that provably never touches the mutated variable.
+// Anything else fails CLOSED (UnsupportedSolCore -> unsupported_body), it
+// is never silently dropped again. Known accepted divergence: when the
+// hoisted checked arithmetic AND another sub-expression of the same
+// statement would both revert, the model may report the other revert
+// reason than the compiled code (the revert SET is identical either way;
+// only the reason payload of such double-revert executions can differ).
+//
+// Positions where the mutation is conditionally or repeatedly evaluated
+// (ternary branches, `&&`/`||` right operands, loop conditions) cannot be
+// hoisted to statement level at all — executing the write exactly once
+// unconditionally would be wrong — so they fail closed via the
+// allowed=false barrier below rather than getting a wrong model.
+struct HoistScope
+{
+	/// Hoisted statements, in required execution order.
+	std::vector<Json> statements;
+	/// The enclosing statement's once-evaluated header expressions (the
+	/// conflict-scan domain; empty means hoisting is not allowed here).
+	std::vector<Expression const*> roots;
+	/// AST node id -> temp local name. Some export paths legitimately
+	/// export the same sub-expression more than once (compound-assignment
+	/// lvalues, exception-based lowering fallbacks); the memo makes the
+	/// second export reuse the already-hoisted temp instead of duplicating
+	/// the side effect.
+	std::map<int64_t, std::string> memo;
+	bool allowed = false;
+};
+
+static thread_local HoistScope* activeHoistScope = nullptr;
+
+/// RAII: installs a fresh HoistScope for one statement export.
+struct HoistScopeGuard
+{
+	explicit HoistScopeGuard(std::vector<Expression const*> _roots):
+		m_previous(activeHoistScope)
+	{
+		m_scope.roots = std::move(_roots);
+		m_scope.allowed = !m_scope.roots.empty();
+		activeHoistScope = &m_scope;
+	}
+	~HoistScopeGuard() { activeHoistScope = m_previous; }
+	HoistScopeGuard(HoistScopeGuard const&) = delete;
+	HoistScopeGuard& operator=(HoistScopeGuard const&) = delete;
+
+	/// Wrap the exported statement with any hoisted statements.
+	Json wrap(Json&& _stmt)
+	{
+		if (m_scope.statements.empty())
+			return std::move(_stmt);
+		Json block = Json::object();
+		block["kind"] = "block";
+		block["statements"] = Json::array();
+		for (auto& hoisted: m_scope.statements)
+			block["statements"].emplace_back(std::move(hoisted));
+		block["statements"].emplace_back(std::move(_stmt));
+		m_scope.statements.clear();
+		return block;
+	}
+
+private:
+	HoistScope m_scope;
+	HoistScope* m_previous;
+};
+
+/// RAII: temporarily forbids hoisting (conditionally-evaluated positions:
+/// ternary branches and short-circuit right operands).
+struct HoistBarrierGuard
+{
+	HoistBarrierGuard():
+		m_scope(activeHoistScope),
+		m_previousAllowed(m_scope ? m_scope->allowed : false)
+	{
+		if (m_scope)
+			m_scope->allowed = false;
+	}
+	~HoistBarrierGuard()
+	{
+		if (m_scope)
+			m_scope->allowed = m_previousAllowed;
+	}
+	HoistBarrierGuard(HoistBarrierGuard const&) = delete;
+	HoistBarrierGuard& operator=(HoistBarrierGuard const&) = delete;
+
+private:
+	HoistScope* m_scope;
+	bool m_previousAllowed;
+};
+
 // --- Declared-width signal for narrow-integer arithmetic (SolCore audit:
 // narrow-width arithmetic soundness gap) ---
 //
@@ -1398,6 +1516,8 @@ std::string runtimeFieldForMagicMember(std::string const& _base, std::string con
 }
 
 Json exportExpr(Expression const& _expr);
+Json exportHoistedUnaryMutation(UnaryOperation const& _unary);
+Json exportHoistedAssignExpr(Assignment const& _assignment);
 
 /// [SolCore audit finding #10] Whether `_expr` denotes this contract's own
 /// address, i.e. is (possibly wrapped in one or more no-op `address(...)`/
@@ -2787,7 +2907,18 @@ Json exportExpr(Expression const& _expr)
 			throw UnsupportedSolCore("Unsupported binary operator in SolCore exporter.");
 		}
 		result["lhs"] = exportExpr(binary->leftExpression());
-		result["rhs"] = exportExpr(binary->rightExpression());
+		{
+			// `&&`/`||` short-circuit: the RHS is only conditionally
+			// evaluated, so a mutating sub-expression inside it must not be
+			// hoisted to (unconditional) statement level — fail closed.
+			std::optional<HoistBarrierGuard> shortCircuitBarrier;
+			if (
+				binary->getOperator() == Token::And ||
+				binary->getOperator() == Token::Or
+			)
+				shortCircuitBarrier.emplace();
+			result["rhs"] = exportExpr(binary->rightExpression());
+		}
 		return result;
 	}
 
@@ -2805,29 +2936,15 @@ Json exportExpr(Expression const& _expr)
 			result["operand"] = exportExpr(unary->subExpression());
 			return result;
 		case Token::Inc:
-		{
-			result["kind"] = "u256_add";
-			markUncheckedContext(result);
-			tagNarrowArithWidth(result, unary->subExpression().annotation().type);
-			result["lhs"] = exportExpr(unary->subExpression());
-			Json one = Json::object();
-			one["kind"] = "u256";
-			one["value"] = "1";
-			result["rhs"] = one;
-			return result;
-		}
 		case Token::Dec:
-		{
-			result["kind"] = "u256_sub";
-			markUncheckedContext(result);
-			tagNarrowArithWidth(result, unary->subExpression().annotation().type);
-			result["lhs"] = exportExpr(unary->subExpression());
-			Json one = Json::object();
-			one["kind"] = "u256";
-			one["value"] = "1";
-			result["rhs"] = one;
-			return result;
-		}
+			// `x++`/`x--`/`++x`/`--x` used as a SUB-expression. The old
+			// lowering here computed only a pure value (and even the wrong
+			// one for postfix: `x+1` instead of the pre-value) and silently
+			// dropped the write — a confirmed soundness bug (e.g.
+			// `abi.encode(nonces[owner]++, ...)` in permit lost the nonce
+			// bump entirely). Hoist the real mutation to statement level
+			// and substitute the correctly-captured temp value instead.
+			return exportHoistedUnaryMutation(*unary);
 		case Token::Sub:
 		{
 			result["kind"] = "u256_sub";
@@ -2849,8 +2966,14 @@ Json exportExpr(Expression const& _expr)
 		Json result = Json::object();
 		result["kind"] = "conditional";
 		result["cond"] = exportExpr(conditional->condition());
-		result["true_value"] = exportExpr(conditional->trueExpression());
-		result["false_value"] = exportExpr(conditional->falseExpression());
+		{
+			// Ternary branches are conditionally evaluated: a mutating
+			// sub-expression inside them must not be hoisted to
+			// (unconditional) statement level — fail closed.
+			HoistBarrierGuard conditionalBarrier;
+			result["true_value"] = exportExpr(conditional->trueExpression());
+			result["false_value"] = exportExpr(conditional->falseExpression());
+		}
 		return result;
 	}
 
@@ -2874,26 +2997,14 @@ Json exportExpr(Expression const& _expr)
 	}
 
 	if (auto const* assignment = dynamic_cast<Assignment const*>(&_expr))
-	{
-		// Assignment as expression (e.g. `while((y = x) > 1)`)
-		if (auto const* identifier = dynamic_cast<Identifier const*>(&assignment->leftHandSide()))
-		{
-			auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
-			Json result = Json::object();
-			result["kind"] = "assign_expr";
-			result["name"] = (decl && !decl->name().empty()) ? decl->name() : identifier->name();
-			result["value"] = exportExpr(assignment->rightHandSide());
-			return result;
-		}
-		// Non-identifier LHS: index access, member access, etc. — export as generic assign_expr
-		{
-			Json result = Json::object();
-			result["kind"] = "assign_expr";
-			result["target"] = exportExpr(assignment->leftHandSide());
-			result["value"] = exportExpr(assignment->rightHandSide());
-			return result;
-		}
-	}
+		// Assignment used as a VALUE inside a larger expression (e.g.
+		// `while ((y = x) > 1)` or `f(x = y)`). The old `assign_expr`
+		// lowering was the same bug class as nested `x++`: the OCaml
+		// frontend's expression translation returns the value and drops
+		// the write (and a state-variable identifier LHS was even
+		// misdirected to a LOCAL-name assignment node). Hoist the real
+		// assignment statement instead and substitute the assigned value.
+		return exportHoistedAssignExpr(*assignment);
 
 	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
 	{
@@ -3678,6 +3789,64 @@ Json expandModifiers(FunctionDefinition const& _function, Json _body)
 	return _body;
 }
 
+/// The combined value written by an assignment: `_rhsJson` for `=`, or
+/// `<current> op <rhs>` (at the assigned expression's own type) for the
+/// compound operators. Shared by statement-level exportAssignment and the
+/// nested-assignment hoisting path (exportHoistedAssignExpr).
+Json compoundAssignmentValue(Token _op, Type const* _lhsType, Json const& _current, Json const& _rhsJson)
+{
+	Json value = Json::object();
+	switch (_op)
+	{
+	case Token::Assign:
+		return _rhsJson;
+	case Token::AssignAdd:
+		value["kind"] = "u256_add";
+		markUncheckedContext(value);
+		// Compound assignment operates at the assigned expression's own
+		// type (`a += b` is `a = a + b` at type(a)); the type checker
+		// guarantees `b` is implicitly convertible to it.
+		tagNarrowArithWidth(value, _lhsType);
+		break;
+	case Token::AssignSub:
+		value["kind"] = "u256_sub";
+		markUncheckedContext(value);
+		tagNarrowArithWidth(value, _lhsType);
+		break;
+	case Token::AssignMul:
+		value["kind"] = "u256_mul";
+		markUncheckedContext(value);
+		tagNarrowArithWidth(value, _lhsType);
+		break;
+	case Token::AssignDiv:
+		value["kind"] = "u256_div";
+		break;
+	case Token::AssignMod:
+		value["kind"] = "u256_mod";
+		break;
+	case Token::AssignBitAnd:
+		value["kind"] = "u256_bitand";
+		break;
+	case Token::AssignBitOr:
+		value["kind"] = "u256_bitor";
+		break;
+	case Token::AssignBitXor:
+		value["kind"] = "u256_bitxor";
+		break;
+	case Token::AssignShl:
+		value["kind"] = "u256_shl";
+		break;
+	case Token::AssignSar:
+		value["kind"] = "u256_shr";
+		break;
+	default:
+		throw UnsupportedSolCore("Unsupported assignment operator in SolCore exporter.");
+	}
+	value["lhs"] = _current;
+	value["rhs"] = _rhsJson;
+	return value;
+}
+
 Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 {
 	auto mkDirectStorage = [&](std::string const& _field, Json const& _value) {
@@ -3701,56 +3870,7 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 	};
 
 	auto compoundValue = [&](Json const& _current, Json const& _rhsJson) {
-		Json value = Json::object();
-		switch (_op)
-		{
-		case Token::Assign:
-			return _rhsJson;
-		case Token::AssignAdd:
-			value["kind"] = "u256_add";
-			markUncheckedContext(value);
-			// Compound assignment operates at the assigned expression's own
-			// type (`a += b` is `a = a + b` at type(a)); the type checker
-			// guarantees `b` is implicitly convertible to it.
-			tagNarrowArithWidth(value, _lhs.annotation().type);
-			break;
-		case Token::AssignSub:
-			value["kind"] = "u256_sub";
-			markUncheckedContext(value);
-			tagNarrowArithWidth(value, _lhs.annotation().type);
-			break;
-		case Token::AssignMul:
-			value["kind"] = "u256_mul";
-			markUncheckedContext(value);
-			tagNarrowArithWidth(value, _lhs.annotation().type);
-			break;
-		case Token::AssignDiv:
-			value["kind"] = "u256_div";
-			break;
-		case Token::AssignMod:
-			value["kind"] = "u256_mod";
-			break;
-		case Token::AssignBitAnd:
-			value["kind"] = "u256_bitand";
-			break;
-		case Token::AssignBitOr:
-			value["kind"] = "u256_bitor";
-			break;
-		case Token::AssignBitXor:
-			value["kind"] = "u256_bitxor";
-			break;
-		case Token::AssignShl:
-			value["kind"] = "u256_shl";
-			break;
-		case Token::AssignSar:
-			value["kind"] = "u256_shr";
-			break;
-		default:
-			throw UnsupportedSolCore("Unsupported assignment operator in SolCore exporter.");
-		}
-		value["lhs"] = _current;
-		value["rhs"] = _rhsJson;
-		return value;
+		return compoundAssignmentValue(_op, _lhs.annotation().type, _current, _rhsJson);
 	};
 
 	Json rhsJson = exportExpr(_rhs);
@@ -4341,6 +4461,475 @@ Json exportUnaryMutationReturn(UnaryOperation const& _unary)
 	return block;
 }
 
+// === Hoisting of mutating sub-expressions (see HoistScope above) ===========
+
+// Defined with the AST write-set oracle further below; reused here so the
+// hoisting conflict scan resolves lvalue bases and virtual call targets with
+// exactly the same rules as the independent fidelity oracle.
+Identifier const* peelToBaseIdentifierForWriteOracle(Expression const& _expr);
+FunctionDefinition const* resolveWriteOracleCallTarget(
+	Expression const& _callee,
+	ContractDefinition const* _mostDerivedContract);
+
+/// Builtin call kinds that can neither write persistent storage nor invoke
+/// other code that could (no external calls, no storage array push/pop, no
+/// contract creation, no value transfer). Reads of storage are impossible
+/// for these too, so they are order-insensitive w.r.t. a hoisted write.
+bool isHoistStorageInertCallKind(FunctionType::Kind _kind)
+{
+	switch (_kind)
+	{
+	case FunctionType::Kind::KECCAK256:
+	case FunctionType::Kind::SHA256:
+	case FunctionType::Kind::RIPEMD160:
+	case FunctionType::Kind::ECRecover:
+	case FunctionType::Kind::AddMod:
+	case FunctionType::Kind::MulMod:
+	case FunctionType::Kind::ABIEncode:
+	case FunctionType::Kind::ABIEncodePacked:
+	case FunctionType::Kind::ABIEncodeWithSelector:
+	case FunctionType::Kind::ABIEncodeCall:
+	case FunctionType::Kind::ABIEncodeWithSignature:
+	case FunctionType::Kind::ABIDecode:
+	case FunctionType::Kind::Event:
+	case FunctionType::Kind::Error:
+	case FunctionType::Kind::Assert:
+	case FunctionType::Kind::Require:
+	case FunctionType::Kind::Wrap:
+	case FunctionType::Kind::Unwrap:
+	case FunctionType::Kind::GasLeft:
+	case FunctionType::Kind::BlockHash:
+	case FunctionType::Kind::BlobHash:
+	case FunctionType::Kind::BytesConcat:
+	case FunctionType::Kind::StringConcat:
+	case FunctionType::Kind::ObjectCreation: // `new T[](n)` memory allocation
+	case FunctionType::Kind::MetaType:
+	case FunctionType::Kind::ERC7201:
+		return true;
+	default:
+		return false;
+	}
+}
+
+enum class HoistCallClass
+{
+	Inert,        ///< cannot read or write persistent storage at all
+	InternalView, ///< internal view/pure callee — safe iff its transitive body never touches the mutated variable
+	Blocking      ///< anything else (external, unknown, state-mutating) — conflicts
+};
+
+HoistCallClass classifyCallForHoistScan(FunctionCall const& _call, FunctionDefinition const*& _calleeOut)
+{
+	_calleeOut = nullptr;
+	if (
+		*_call.annotation().kind == FunctionCallKind::TypeConversion ||
+		*_call.annotation().kind == FunctionCallKind::StructConstructorCall
+	)
+		return HoistCallClass::Inert;
+	auto const* funType = dynamic_cast<FunctionType const*>(_call.expression().annotation().type);
+	if (!funType)
+		return HoistCallClass::Blocking;
+	if (isHoistStorageInertCallKind(funType->kind()))
+		return HoistCallClass::Inert;
+	if (funType->kind() == FunctionType::Kind::Internal)
+	{
+		FunctionDefinition const* callee =
+			resolveWriteOracleCallTarget(_call.expression(), activeExportContract);
+		if (!callee || !callee->isImplemented())
+			return HoistCallClass::Blocking;
+		if (
+			callee->stateMutability() != StateMutability::View &&
+			callee->stateMutability() != StateMutability::Pure
+		)
+			return HoistCallClass::Blocking;
+		_calleeOut = callee;
+		return HoistCallClass::InternalView;
+	}
+	return HoistCallClass::Blocking;
+}
+
+bool viewCalleeCannotTouchDecl(
+	FunctionDefinition const& _callee,
+	VariableDeclaration const& _decl,
+	std::set<FunctionDefinition const*>& _visited,
+	int _depth);
+
+/// Scans an internal view/pure callee's body for anything that could make
+/// the callee's result (or behavior) depend on the hoisted-over variable:
+/// a direct reference to it, any storage-pointer local (may alias it), any
+/// inline assembly (opaque sload), or any call that is not itself provably
+/// inert. `safe` stays true only when none of those occur.
+struct HoistCalleeBodyScanner: ASTConstVisitor
+{
+	HoistCalleeBodyScanner(
+		VariableDeclaration const& _decl,
+		std::set<FunctionDefinition const*>& _visited,
+		int _depth
+	):
+		decl(_decl), visited(_visited), depth(_depth)
+	{}
+
+	VariableDeclaration const& decl;
+	std::set<FunctionDefinition const*>& visited;
+	int depth;
+	bool safe = true;
+
+	bool visit(Identifier const& _identifier) override
+	{
+		Declaration const* referenced = _identifier.annotation().referencedDeclaration;
+		if (referenced == &decl)
+			safe = false;
+		else if (auto const* varDecl = dynamic_cast<VariableDeclaration const*>(referenced))
+			// A storage-pointer local inside the callee could alias the
+			// mutated variable's slots — fail closed.
+			if (
+				!varDecl->isStateVariable() &&
+				varDecl->referenceLocation() == VariableDeclaration::Location::Storage
+			)
+				safe = false;
+		return safe;
+	}
+
+	bool visit(MemberAccess const& _memberAccess) override
+	{
+		// Qualified access to the mutated variable (e.g. `Base.stateVar`).
+		if (_memberAccess.annotation().referencedDeclaration == &decl)
+			safe = false;
+		return safe;
+	}
+
+	bool visit(InlineAssembly const&) override
+	{
+		safe = false;
+		return false;
+	}
+
+	bool visit(FunctionCall const& _call) override
+	{
+		if (!safe)
+			return false;
+		FunctionDefinition const* callee = nullptr;
+		switch (classifyCallForHoistScan(_call, callee))
+		{
+		case HoistCallClass::Inert:
+			break;
+		case HoistCallClass::InternalView:
+			if (!viewCalleeCannotTouchDecl(*callee, decl, visited, depth - 1))
+				safe = false;
+			break;
+		case HoistCallClass::Blocking:
+			safe = false;
+			break;
+		}
+		return safe;
+	}
+};
+
+bool viewCalleeCannotTouchDecl(
+	FunctionDefinition const& _callee,
+	VariableDeclaration const& _decl,
+	std::set<FunctionDefinition const*>& _visited,
+	int _depth)
+{
+	if (_depth <= 0)
+		return false;
+	if (!_visited.insert(&_callee).second)
+		// Already scanned (or being scanned) in this analysis: a cycle
+		// introduces no references beyond what its own scan covers.
+		return true;
+	if (!_callee.isImplemented())
+		return false;
+
+	// Modifiers execute as part of the callee; scan their resolved bodies
+	// and invocation arguments too.
+	for (auto const& modifierInvocation: _callee.modifiers())
+	{
+		ModifierDefinition const* modifierDefinition =
+			resolveModifierDefinition(_callee, *modifierInvocation);
+		if (!modifierDefinition || !modifierDefinition->isImplemented())
+			return false;
+		HoistCalleeBodyScanner modifierScanner(_decl, _visited, _depth);
+		modifierDefinition->body().accept(modifierScanner);
+		if (modifierInvocation->arguments())
+			for (auto const& arg: *modifierInvocation->arguments())
+				arg->accept(modifierScanner);
+		if (!modifierScanner.safe)
+			return false;
+	}
+
+	HoistCalleeBodyScanner scanner(_decl, _visited, _depth);
+	_callee.body().accept(scanner);
+	return scanner.safe;
+}
+
+/// Scans one once-evaluated header expression of the enclosing statement
+/// for accesses that would make the hoisted write's position observable:
+/// - any reference to the mutated base variable OUTSIDE the mutation
+///   expression itself (a re-ordered read/write of the same location);
+/// - in strict (storage-backed) mode: any storage-pointer identifier
+///   (potential alias) outside the mutation, and any call anywhere in the
+///   statement that is not storage-inert or a provably-unrelated internal
+///   view/pure function;
+/// - in non-strict (plain local) mode, calls inside the MUTATION subtree
+///   still need the inert/view rule: the emitted read+write pair evaluates
+///   the lvalue subtree twice, so calls in it must be duplication-safe.
+struct HoistRootConflictScanner: ASTConstVisitor
+{
+	HoistRootConflictScanner(
+		Expression const& _mutation,
+		VariableDeclaration const& _decl,
+		bool _strict
+	):
+		mutation(_mutation), decl(_decl), strict(_strict)
+	{}
+
+	Expression const& mutation;
+	VariableDeclaration const& decl;
+	bool strict;
+	int insideMutation = 0;
+	bool conflict = false;
+	bool foundMutation = false;
+	std::set<FunctionDefinition const*> visited;
+
+	bool visit(UnaryOperation const& _unary) override
+	{
+		if (&_unary == &mutation)
+		{
+			++insideMutation;
+			foundMutation = true;
+		}
+		return !conflict;
+	}
+	void endVisit(UnaryOperation const& _unary) override
+	{
+		if (&_unary == &mutation)
+			--insideMutation;
+	}
+
+	bool visit(Assignment const& _assignment) override
+	{
+		if (&_assignment == &mutation)
+		{
+			++insideMutation;
+			foundMutation = true;
+		}
+		return !conflict;
+	}
+	void endVisit(Assignment const& _assignment) override
+	{
+		if (&_assignment == &mutation)
+			--insideMutation;
+	}
+
+	bool visit(Identifier const& _identifier) override
+	{
+		if (insideMutation == 0)
+		{
+			Declaration const* referenced = _identifier.annotation().referencedDeclaration;
+			if (referenced == &decl)
+				conflict = true;
+			else if (strict)
+				if (auto const* varDecl = dynamic_cast<VariableDeclaration const*>(referenced))
+					if (
+						!varDecl->isStateVariable() &&
+						varDecl->referenceLocation() == VariableDeclaration::Location::Storage
+					)
+						conflict = true;
+		}
+		return !conflict;
+	}
+
+	bool visit(MemberAccess const& _memberAccess) override
+	{
+		if (insideMutation == 0 && _memberAccess.annotation().referencedDeclaration == &decl)
+			conflict = true;
+		return !conflict;
+	}
+
+	bool visit(FunctionCall const& _call) override
+	{
+		if (conflict)
+			return false;
+		// Calls cannot observe or mutate a plain stack local, so in
+		// non-strict mode only calls inside the (duplicated) mutation
+		// subtree need checking.
+		if (!strict && insideMutation == 0)
+			return true;
+		FunctionDefinition const* callee = nullptr;
+		switch (classifyCallForHoistScan(_call, callee))
+		{
+		case HoistCallClass::Inert:
+			break;
+		case HoistCallClass::InternalView:
+			if (!viewCalleeCannotTouchDecl(*callee, decl, visited, 8))
+				conflict = true;
+			break;
+		case HoistCallClass::Blocking:
+			conflict = true;
+			break;
+		}
+		return !conflict;
+	}
+};
+
+std::string hoistTempName(ASTNode const& _node)
+{
+	return "__solcore_hoist_" + std::to_string(static_cast<int64_t>(_node.id()));
+}
+
+void requireHoistScopeAllowed()
+{
+	if (!activeHoistScope || !activeHoistScope->allowed)
+		throw UnsupportedSolCore(
+			"Mutating sub-expression (++/--/assignment used as a value) in a "
+			"conditionally- or repeatedly-evaluated position (loop condition, "
+			"ternary branch, short-circuit RHS, or outside statement context) "
+			"cannot be soundly hoisted to statement level.");
+}
+
+/// Throws UnsupportedSolCore unless hoisting `_mutation` (whose lvalue is
+/// `_lvalue`) out of the current statement is observation-equivalent for
+/// every intra-statement evaluation order (see the HoistScope comment for
+/// the soundness argument). Must be called BEFORE anything is appended to
+/// the hoist buffer so a refusal leaves no partial state behind.
+void checkHoistConflictsOrThrow(Expression const& _mutation, Expression const& _lvalue)
+{
+	HoistScope& scope = *activeHoistScope;
+
+	Identifier const* baseIdent = peelToBaseIdentifierForWriteOracle(_lvalue);
+	if (!baseIdent)
+		throw UnsupportedSolCore(
+			"Mutating sub-expression whose target has no identifiable base "
+			"variable cannot be hoisted soundly.");
+	auto const* decl = dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration);
+	if (!decl)
+		throw UnsupportedSolCore(
+			"Mutating sub-expression targets something that is not a variable.");
+
+	bool strict =
+		decl->isStateVariable() ||
+		decl->referenceLocation() == VariableDeclaration::Location::Storage ||
+		namespacedStorageAliases.count(decl->name()) > 0;
+
+	bool found = false;
+	for (Expression const* root: scope.roots)
+	{
+		HoistRootConflictScanner scanner(_mutation, *decl, strict);
+		root->accept(scanner);
+		if (scanner.conflict)
+			throw UnsupportedSolCore(
+				"Mutating sub-expression cannot be soundly hoisted: the "
+				"enclosing statement contains another access that may read or "
+				"write the mutated location, so intra-statement evaluation "
+				"order (unspecified in Solidity) would become observable.");
+		if (scanner.foundMutation)
+			found = true;
+	}
+	if (!found)
+		// Safety net: the mutation is being exported from a position that
+		// is not part of the registered once-evaluated statement header —
+		// an unaudited context. Fail closed.
+		throw UnsupportedSolCore(
+			"Mutating sub-expression in an unrecognized expression position "
+			"cannot be hoisted.");
+}
+
+Json exportHoistedUnaryMutation(UnaryOperation const& _unary)
+{
+	Expression const& target = _unary.subExpression();
+
+	if (activeHoistScope)
+	{
+		auto it = activeHoistScope->memo.find(static_cast<int64_t>(_unary.id()));
+		if (it != activeHoistScope->memo.end())
+			// This exact mutation node was already hoisted during this
+			// statement's export (compound-assignment lvalues and
+			// exception-based lowering fallbacks re-export sub-expressions):
+			// reuse the temp, never duplicate the side effect.
+			return localExpr(it->second);
+	}
+
+	requireHoistScopeAllowed();
+	checkHoistConflictsOrThrow(_unary, target);
+
+	std::string tempName = hoistTempName(_unary);
+	Json letStmt = Json::object();
+	letStmt["kind"] = "let";
+	letStmt["name"] = tempName;
+	letStmt["type"] = "u256";
+	Json writeStmt;
+	if (_unary.isPrefixOperation())
+	{
+		// ++x / --x: the value is the POST-mutation value.
+		letStmt["value"] = mutationValue(exportExpr(target), _unary.getOperator(), target.annotation().type);
+		writeStmt = exportDirectAssignment(target, localExpr(tempName));
+	}
+	else
+	{
+		// x++ / x--: the value is the PRE-mutation value.
+		letStmt["value"] = exportExpr(target);
+		writeStmt = exportDirectAssignment(
+			target,
+			mutationValue(localExpr(tempName), _unary.getOperator(), target.annotation().type));
+	}
+
+	// Append + memoize only now, after every piece lowered successfully:
+	// a throw above must leave no partial hoist state behind.
+	activeHoistScope->statements.emplace_back(std::move(letStmt));
+	activeHoistScope->statements.emplace_back(std::move(writeStmt));
+	activeHoistScope->memo[static_cast<int64_t>(_unary.id())] = tempName;
+	return localExpr(tempName);
+}
+
+Json exportHoistedAssignExpr(Assignment const& _assignment)
+{
+	Expression const& lhs = _assignment.leftHandSide();
+
+	if (activeHoistScope)
+	{
+		auto it = activeHoistScope->memo.find(static_cast<int64_t>(_assignment.id()));
+		if (it != activeHoistScope->memo.end())
+			return localExpr(it->second);
+	}
+
+	requireHoistScopeAllowed();
+	checkHoistConflictsOrThrow(_assignment, lhs);
+
+	// The value of an assignment expression is the assigned value (the
+	// combined value for compound operators), captured in a temp BEFORE the
+	// write so no post-write re-read of the lvalue is needed.
+	std::optional<Json> simpleType =
+		lhs.annotation().type ? exportSimpleType(*lhs.annotation().type) : std::nullopt;
+	if (!simpleType)
+		throw UnsupportedSolCore(
+			"Assignment of a non-word-sized value used as a sub-expression "
+			"cannot be hoisted soundly.");
+
+	Json rhsJson = exportExpr(_assignment.rightHandSide());
+	Json valueJson;
+	if (_assignment.assignmentOperator() == Token::Assign)
+		valueJson = rhsJson;
+	else
+		valueJson = compoundAssignmentValue(
+			_assignment.assignmentOperator(),
+			lhs.annotation().type,
+			exportExpr(lhs),
+			rhsJson);
+
+	std::string tempName = hoistTempName(_assignment);
+	Json letStmt = Json::object();
+	letStmt["kind"] = "let";
+	letStmt["name"] = tempName;
+	letStmt["type"] = *simpleType;
+	letStmt["value"] = valueJson;
+	Json writeStmt = exportDirectAssignment(lhs, localExpr(tempName));
+
+	activeHoistScope->statements.emplace_back(std::move(letStmt));
+	activeHoistScope->statements.emplace_back(std::move(writeStmt));
+	activeHoistScope->memo[static_cast<int64_t>(_assignment.id())] = tempName;
+	return localExpr(tempName);
+}
+
 // --- Yul AST export functions ---
 
 Json exportYulExpr(yul::Expression const& _expr, yul::Dialect const& _dialect);
@@ -4493,7 +5082,7 @@ Json exportYulStmt(yul::Statement const& _stmt, yul::Dialect const& _dialect)
 
 // --- End Yul AST export functions ---
 
-Json exportStmt(Statement const& _stmt)
+Json exportStmtDispatch(Statement const& _stmt)
 {
 	if (auto const* block = dynamic_cast<Block const*>(&_stmt))
 	{
@@ -5101,6 +5690,51 @@ Json exportStmt(Statement const& _stmt)
 		result["_unsupported_stmt"] = true;
 		return result;
 	}
+}
+
+/// The statement's once-evaluated header expressions: the expression
+/// subtrees this statement evaluates exactly once, unconditionally, before
+/// (or as) its own effect. These are the positions from which a mutating
+/// sub-expression may be hoisted to just before the statement, and they
+/// form the conflict-scan domain (see HoistScope). Statement kinds whose
+/// directly-embedded expressions are re-evaluated (while/for conditions)
+/// or that have none return an empty list — hoisting is then disallowed
+/// under them (nested statements install their own scopes).
+std::vector<Expression const*> statementHeaderExpressions(Statement const& _stmt)
+{
+	if (auto const* exprStmt = dynamic_cast<ExpressionStatement const*>(&_stmt))
+		return {&exprStmt->expression()};
+	if (auto const* ifStmt = dynamic_cast<IfStatement const*>(&_stmt))
+		// Only the condition: the branches are their own statements.
+		return {&ifStmt->condition()};
+	if (auto const* returnStmt = dynamic_cast<Return const*>(&_stmt))
+	{
+		if (returnStmt->expression())
+			return {returnStmt->expression()};
+		return {};
+	}
+	if (auto const* varDeclStmt = dynamic_cast<VariableDeclarationStatement const*>(&_stmt))
+	{
+		if (varDeclStmt->initialValue())
+			return {varDeclStmt->initialValue()};
+		return {};
+	}
+	if (auto const* emitStmt = dynamic_cast<EmitStatement const*>(&_stmt))
+		return {&emitStmt->eventCall()};
+	if (auto const* revertStmt = dynamic_cast<RevertStatement const*>(&_stmt))
+		return {&revertStmt->errorCall()};
+	if (auto const* tryStmt = dynamic_cast<TryStatement const*>(&_stmt))
+		return {&tryStmt->externalCall()};
+	// Block, While (condition re-evaluated each iteration!), For (ditto),
+	// Break, Continue, InlineAssembly, PlaceholderStatement, ...
+	return {};
+}
+
+Json exportStmt(Statement const& _stmt)
+{
+	HoistScopeGuard hoistScope(statementHeaderExpressions(_stmt));
+	Json result = exportStmtDispatch(_stmt);
+	return hoistScope.wrap(std::move(result));
 }
 
 // ===========================================================================
