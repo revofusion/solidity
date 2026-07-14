@@ -4138,6 +4138,35 @@ Json exportUnaryMutation(Expression const& _target, Token _op)
 	return exportDirectAssignment(_target, mutationValue(exportExpr(_target), _op, _target.annotation().type));
 }
 
+// `delete x;` resets `x` to its type's default value. This is only sound to
+// lower here for a WORD-SIZED target (bool/address/integer/fixed-bytes/
+// contract) -- exactly the categories `exportSimpleType` already recognizes
+// as representable as a single SolCore scalar ("bool" or "u256" on the
+// wire). A struct/array/mapping/string/bytes/enum target's "default value"
+// is not a single scalar (e.g. deleting an array resets its length AND
+// clears every element), so those fail closed here rather than guessing.
+Json defaultValueForResolvedType(Type const* _type)
+{
+	std::optional<Json> simple = _type ? exportSimpleType(*_type) : std::nullopt;
+	if (!simple)
+		throw UnsupportedSolCore(
+			"delete on a non-word-sized target (struct/array/mapping/string/bytes/enum) is unsupported");
+	if (*simple == Json("bool"))
+	{
+		Json result = Json::object();
+		result["kind"] = "bool";
+		result["value"] = false;
+		return result;
+	}
+	// "address" or "u256" both default to numeric zero on the wire.
+	return u256Literal("0");
+}
+
+Json exportDelete(Expression const& _target)
+{
+	return exportDirectAssignment(_target, defaultValueForResolvedType(_target.annotation().type));
+}
+
 Json exportUnaryMutationReturn(UnaryOperation const& _unary)
 {
 	Expression const& target = _unary.subExpression();
@@ -4517,8 +4546,12 @@ Json exportStmt(Statement const& _stmt)
 			return exportAssignment(assignment->leftHandSide(), assignment->assignmentOperator(), assignment->rightHandSide());
 
 		if (auto const* unary = dynamic_cast<UnaryOperation const*>(&expr))
+		{
 			if (unary->getOperator() == Token::Inc || unary->getOperator() == Token::Dec)
 				return exportUnaryMutation(unary->subExpression(), unary->getOperator());
+			if (unary->getOperator() == Token::Delete)
+				return exportDelete(unary->subExpression());
+		}
 
 		if (auto const* call = dynamic_cast<FunctionCall const*>(&expr))
 		{
