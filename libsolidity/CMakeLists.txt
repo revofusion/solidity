@@ -158,6 +158,8 @@ set(sources
 	interface/ReadFile.h
 	interface/SMTSolverCommand.cpp
 	interface/SMTSolverCommand.h
+	interface/SolCoreExporter.cpp
+	interface/SolCoreExporter.h
 	interface/StandardCompiler.cpp
 	interface/StandardCompiler.h
 	interface/StorageLayout.cpp
