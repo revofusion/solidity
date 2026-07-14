@@ -5350,12 +5350,132 @@ Expression const* ozStorageRefSelfArgument(FunctionCall const& _call)
 	return nullptr;
 }
 
+// --- ERC-7201 namespaced-storage extension to the write-set oracle ---
+//
+// A bounded, structural recognizer in exactly the spirit of
+// isKnownOzStorageRefLibraryMutator above: instead of relaxing the generic
+// (and correct-by-default) "local storage pointer ⇒ unknown" rule for every
+// local storage pointer, this recognizes ONE additional fixed shape — the
+// OpenZeppelin ERC-7201 namespaced-storage getter — and resolves writes
+// through it to the real flattened field, exactly as exportContract's own
+// "Flatten namespaced storage struct fields into Storage" pass names it
+// (`derivePrefix(structDef->name()) + member->name()`). Anything that does
+// not match this exact shape keeps failing closed.
+//
+// isNamespacedStorageGetter (above, used by body export) only needs to
+// confirm the STATEMENT SHAPE of a getter, because each `$.field`
+// substitution it performs is scoped to one call site and one field. This
+// oracle is different: once it resolves a local pointer to a field name,
+// EVERY write through that pointer for the rest of the function is
+// attributed to that field, so it additionally demands the getter's
+// `.slot :=` target be a compile-time CONSTANT — otherwise two different
+// calls to the "same" getter could alias different real storage locations,
+// and folding them into one named field would be unsound.
+bool isKnownNamespacedStorageGetter(
+	FunctionDefinition const& _funcDef,
+	StructDefinition const** _outStructDef)
+{
+	if (!isNamespacedStorageGetter(_funcDef, _outStructDef))
+		return false;
+	// Only Pattern 1 (a bare single-statement assembly block) is trusted
+	// here. Pattern 2 (`bytes32 slot = fn(); assembly { $.slot := slot }`)
+	// would require separately proving that intermediate local is itself a
+	// compile-time constant, which this bounded recognizer does not take
+	// on — it simply stays unresolved (fails closed).
+	if (_funcDef.body().statements().size() != 1)
+		return false;
+	auto const* asmStmt = dynamic_cast<InlineAssembly const*>(_funcDef.body().statements().front().get());
+	if (!asmStmt)
+		return false;
+
+	yul::Block const& root = asmStmt->operations().root();
+	if (root.statements.size() != 1)
+		return false;
+	auto const* yulAssignment = std::get_if<yul::Assignment>(&root.statements.front());
+	if (!yulAssignment || yulAssignment->variableNames.size() != 1 || !yulAssignment->value)
+		return false;
+
+	// externalReferences maps each Yul identifier used in this assembly
+	// block to the Solidity declaration/suffix it resolves to — the same
+	// mechanism ContractCompiler's own codegen consults to compile `.slot`/
+	// `.offset` accesses.
+	auto const& externalReferences = asmStmt->annotation().externalReferences;
+
+	// LHS must be exactly this getter's own storage-located return
+	// parameter's `.slot` — not some other variable's, and not `.offset`/
+	// `.length`/etc.
+	yul::Identifier const& lhsIdent = yulAssignment->variableNames.front();
+	auto lhsIt = externalReferences.find(&lhsIdent);
+	if (lhsIt == externalReferences.end() || lhsIt->second.suffix != "slot")
+		return false;
+	if (_funcDef.returnParameters().size() != 1 || lhsIt->second.declaration != _funcDef.returnParameters().front().get())
+		return false;
+
+	// RHS must be a raw Yul literal, or a reference to a Solidity
+	// `constant`-qualified variable (never another external reference's
+	// `.slot`/`.offset`/..., and never a computed Yul expression — solc's
+	// own frontend already required a `constant` variable's initializer to
+	// be compile-time-evaluable, so isConstant() is sufficient here without
+	// re-deriving that ourselves).
+	if (std::holds_alternative<yul::Literal>(*yulAssignment->value))
+		return true;
+	auto const* rhsIdent = std::get_if<yul::Identifier>(yulAssignment->value.get());
+	if (!rhsIdent)
+		return false;
+	auto rhsIt = externalReferences.find(rhsIdent);
+	if (rhsIt == externalReferences.end() || !rhsIt->second.suffix.empty())
+		return false;
+	auto const* rhsVarDecl = dynamic_cast<VariableDeclaration const*>(rhsIt->second.declaration);
+	return rhsVarDecl && rhsVarDecl->isConstant();
+}
+
+// Called only after peelToBaseIdentifierForWriteOracle has already resolved
+// a write target down to `_base`: re-walks the same Index/Member chain to
+// find the MemberAccess applied DIRECTLY to `_base` — the first `.field`
+// off of it. Any further Index/Member layers stacked on top (the
+// `.push(...)`/`[i]` in `$.revenues.push(...)`/`$.revenues[i]`, say) are
+// discarded, matching how an ordinary top-level state variable write is
+// already tracked at whole-variable granularity elsewhere in this
+// collector. Returns nullptr if `_base` IS the entire target — i.e. no
+// MemberAccess was ever applied (e.g. reassigning the pointer itself,
+// `$ = ...`) — a shape this recognizer does not attempt to resolve.
+MemberAccess const* innermostMemberAccessOntoBase(Expression const& _target, Identifier const& _base)
+{
+	Expression const* current = &_target;
+	MemberAccess const* innermost = nullptr;
+	while (current != static_cast<Expression const*>(&_base))
+	{
+		if (auto const* indexAccess = dynamic_cast<IndexAccess const*>(current))
+		{
+			current = &indexAccess->baseExpression();
+			continue;
+		}
+		auto const* memberAccess = dynamic_cast<MemberAccess const*>(current);
+		if (!memberAccess)
+			return nullptr; // Defensive: unreachable given the caller's precondition.
+		innermost = memberAccess;
+		current = &memberAccess->expression();
+	}
+	return innermost;
+}
+
+// --- End ERC-7201 namespaced-storage extension ---
+
 struct WriteOracleCollector: ASTConstVisitor
 {
 	std::set<std::string> writes;
 	bool unknown = false;
 	std::set<FunctionDefinition const*> calleesToVisit;
 	ContractDefinition const* mostDerivedContract = nullptr;
+	// Local storage-pointer variables (within THIS function body) recognized
+	// as ERC-7201 namespaced-storage aliases — see
+	// isKnownNamespacedStorageGetter above — mapped to their field prefix
+	// (`derivePrefix(structDef->name())`, the same prefix exportContract's
+	// "Flatten namespaced storage struct fields into Storage" pass uses).
+	// Populated by visit(VariableDeclarationStatement) below; consulted by
+	// recordWriteToBase in place of failing closed on that one bounded
+	// shape.
+	std::map<VariableDeclaration const*, std::string> namespacedAliasPrefixes;
 
 	void recordWriteToBase(Expression const& _target)
 	{
@@ -5391,14 +5511,59 @@ struct WriteOracleCollector: ASTConstVisitor
 		}
 		if (varDecl->isLocalVariable() && varDecl->referenceLocation() == VariableDeclaration::Location::Storage)
 		{
-			// A local storage-pointer variable: without alias analysis we
-			// cannot statically tell which state variable it points at.
-			// Fail closed rather than guessing.
+			// ERC-7201 extension: if this local storage pointer was
+			// initialized, in this same function body, from a call
+			// recognized by isKnownNamespacedStorageGetter, attribute the
+			// write to the real flattened field instead of giving up.
+			auto aliasIt = namespacedAliasPrefixes.find(varDecl);
+			if (aliasIt != namespacedAliasPrefixes.end())
+			{
+				if (MemberAccess const* member = innermostMemberAccessOntoBase(_target, *base))
+				{
+					writes.insert(aliasIt->second + member->memberName());
+					return;
+				}
+				// The alias pointer itself was the whole write target
+				// (e.g. `$ = ...`, reassigning the pointer) rather than a
+				// `.field` access through it — not a shape this
+				// recognizer covers. Fall through to fail-closed below.
+			}
+			// Every other local storage-pointer variable: without alias
+			// analysis we cannot statically tell which state variable it
+			// points at. Fail closed rather than guessing.
 			unknown = true;
 			return;
 		}
 		// Otherwise a plain memory/calldata/stack local: not a storage
 		// write at all, nothing to record.
+	}
+
+	bool visit(VariableDeclarationStatement const& _stmt) override
+	{
+		// Namespaced storage (ERC-7201): `XStorage storage $ = _getXStorage();`
+		// — mirrors the alias registration exportStmt/exportBody already do
+		// for body export (namespacedStorageAliases/namespacedGetterPrefix
+		// near the top of this file), but independently, using this
+		// oracle's own STRICTER getter recognizer
+		// (isKnownNamespacedStorageGetter) rather than trusting that pass.
+		if (
+			_stmt.declarations().size() == 1 &&
+			_stmt.declarations().front() &&
+			_stmt.declarations().front()->referenceLocation() == VariableDeclaration::Location::Storage &&
+			_stmt.initialValue()
+		)
+		{
+			if (auto const* call = dynamic_cast<FunctionCall const*>(_stmt.initialValue()))
+			{
+				if (FunctionDefinition const* target = resolveWriteOracleCallTarget(call->expression(), mostDerivedContract))
+				{
+					StructDefinition const* structDef = nullptr;
+					if (isKnownNamespacedStorageGetter(*target, &structDef))
+						namespacedAliasPrefixes[_stmt.declarations().front().get()] = derivePrefix(structDef->name());
+				}
+			}
+		}
+		return true;
 	}
 
 	bool visit(Assignment const& _assignment) override
