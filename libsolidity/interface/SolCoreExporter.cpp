@@ -83,6 +83,16 @@ static thread_local std::map<FunctionDefinition const*, std::string> exportedFun
 static thread_local CompilerStack const* activeCompilerStack = nullptr;
 static thread_local ContractDefinition const* activeExportContract = nullptr;
 
+/// Thread-local set of exported callee names that `virtualCallTargetName`
+/// resolved to a virtual slot with NO implementation anywhere in the current
+/// export unit's own inheritance linearization (populated only while
+/// exporting an abstract/interface unit — see `virtualCallTargetName`).
+/// Cleared once per contract export, alongside `exportedFunctionNames`.
+/// Recorded EXACTLY as `exportedFunctionName(*target)` would return it, so
+/// the string matches byte-for-byte the name emitted into a call site's
+/// `"function"` field with no re-mangling needed by consumers.
+static thread_local std::set<std::string> unboundVirtualSlotNames;
+
 // --- `unchecked { }` block signal (SOLCORE_MATH_BUG_CLASSES_PLAN.md §3.5/Task 11) ---
 //
 // Before this, `unchecked { ... }` carried zero signal through the exporter:
@@ -1832,7 +1842,30 @@ std::string virtualCallTargetName(FunctionDefinition const& _funcDef)
 		// their slot's most-derived implementation), so this lookup yields
 		// the plain exported slot name.
 		target = &_funcDef.resolveVirtual(*activeExportContract);
-	return exportedFunctionName(*target);
+	std::string resolvedName = exportedFunctionName(*target);
+	if (activeExportContract && !target->isImplemented())
+	{
+		// The resolved slot winner has no body anywhere in this export
+		// unit's own inheritance linearization. Inside an abstract/interface
+		// unit this is expected (the definition of an abstract contract):
+		// the binding exists only in a concrete deployable's linearization,
+		// which that deployable's OWN export resolves and embeds separately.
+		// Record it so downstream consumers (the OCaml generator) can
+		// distinguish "expected unbound slot" from exporter drift. For a
+		// concrete (non-abstract, non-interface) export, solc's type checker
+		// guarantees every virtual slot reachable from the deployable
+		// resolves to an implementation, so reaching this branch for a
+		// concrete contract means exporter/compiler drift: fail closed
+		// instead of silently emitting a callee name with no body.
+		if (activeExportContract->abstract() || activeExportContract->isInterface())
+			unboundVirtualSlotNames.insert(resolvedName);
+		else
+			throw UnsupportedSolCore(
+				"internal virtual call to '" + resolvedName +
+				"' has no implementation in the linearization of concrete contract '" +
+				activeExportContract->name() + "'");
+	}
+	return resolvedName;
 }
 
 std::set<FunctionDefinition const*> collectSuperReferencedFunctions(
@@ -6848,6 +6881,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	namespacedGetterPrefixes.clear();
 	namespacedMappingFields.clear();
 	exportedFunctionNames.clear();
+	unboundVirtualSlotNames.clear();
 
 	std::vector<NamespacedStorageGetter> namespacedGetters;
 	// Scan all functions in the contract hierarchy for namespaced storage getters
@@ -7579,6 +7613,18 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 
 	solcore["functions"] = std::move(functions);
 	solcore["internal_functions"] = std::move(internalFunctions);
+
+	// Additive schema field (SOLCORE_UNRESOLVED_INTERNAL_CALL_DESIGN):
+	// exact set of virtual-slot callee names that resolved to no
+	// implementation anywhere in this unit's own inheritance linearization
+	// (populated only while exporting an abstract/interface unit — see
+	// `virtualCallTargetName`). Always emitted, even when empty, so
+	// consumers can distinguish "no unbound slots" from "field absent /
+	// artifact predates this signal".
+	Json unboundVirtualSlots = Json::array();
+	for (std::string const& slotName: unboundVirtualSlotNames)
+		unboundVirtualSlots.push_back(slotName);
+	solcore["unbound_virtual_slots"] = std::move(unboundVirtualSlots);
 
 	Json events = Json::array();
 	for (EventDefinition const* event: contract.events())
