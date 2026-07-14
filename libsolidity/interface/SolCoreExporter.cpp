@@ -3348,46 +3348,64 @@ Json exportRevertPayload(FunctionCall const& _call)
 	if (auto const* errorDef = dynamic_cast<ErrorDefinition const*>(calleeDecl))
 		return exportCustomError(*errorDef);
 
+	// Given the single argument expression that carries the revert reason
+	// (a string literal message, a custom-error constructor call, or some
+	// other non-literal expression), export it into `result` as
+	// "error"/"message"/"payload" exactly as before. Factored out so it can
+	// be applied at the correct argument INDEX for each builtin below --
+	// `require(cond, reason)` carries its reason at index 1 (index 0 is the
+	// condition), while the global `revert(reason)` builtin carries its
+	// (sole, optional) reason at index 0. Reusing one fixed index for both
+	// (the previous behavior) silently dropped every `revert(reason)` call's
+	// message, since `revert` never has a 2nd argument to find it at.
+	auto exportReasonArg = [&](Expression const& _reasonArg) -> Json {
+		if (auto const* errorCall = dynamic_cast<FunctionCall const*>(&_reasonArg))
+		{
+			if (auto const* errorDef =
+					dynamic_cast<ErrorDefinition const*>(
+						dynamic_cast<Identifier const*>(&errorCall->expression()) ?
+							dynamic_cast<Identifier const*>(&errorCall->expression())->annotation().referencedDeclaration :
+						dynamic_cast<MemberAccess const*>(&errorCall->expression()) ?
+							dynamic_cast<MemberAccess const*>(&errorCall->expression())->annotation().referencedDeclaration :
+							nullptr))
+				return exportCustomError(*errorDef);
+		}
+		auto const* message = dynamic_cast<Literal const*>(&_reasonArg);
+		if (message && message->token() == Token::StringLiteral)
+		{
+			Json reasonResult = Json::object();
+			reasonResult["message"] = message->value();
+			return reasonResult;
+		}
+		// Non-string revert message (e.g. custom error): export as generic expression
+		Json reasonResult = Json::object();
+		try
+		{
+			reasonResult["payload"] = exportExpr(_reasonArg);
+		}
+		catch (...)
+		{
+			reasonResult["message"] = "(non-string revert payload)";
+		}
+		return reasonResult;
+	};
+
 	if (auto const* callee = dynamic_cast<Identifier const*>(&_call.expression()))
 	{
-		if (callee->name() == "require" || callee->name() == "revert")
-		{
-			if (_call.arguments().size() >= 2)
-			{
-				if (auto const* errorCall =
-						dynamic_cast<FunctionCall const*>(_call.arguments().at(1).get()))
-				{
-					if (auto const* errorDef =
-							dynamic_cast<ErrorDefinition const*>(
-								dynamic_cast<Identifier const*>(&errorCall->expression()) ?
-									dynamic_cast<Identifier const*>(&errorCall->expression())->annotation().referencedDeclaration :
-								dynamic_cast<MemberAccess const*>(&errorCall->expression()) ?
-									dynamic_cast<MemberAccess const*>(&errorCall->expression())->annotation().referencedDeclaration :
-									nullptr))
-						return exportCustomError(*errorDef);
-				}
-				auto const* message = dynamic_cast<Literal const*>(_call.arguments().at(1).get());
-				if (message && message->token() == Token::StringLiteral)
-				{
-					result["message"] = message->value();
-					return result;
-				}
-				// Non-string revert message (e.g. custom error): export as generic expression
-				try
-				{
-					result["payload"] = exportExpr(*_call.arguments().at(1));
-				}
-				catch (...)
-				{
-					result["message"] = "(non-string revert payload)";
-				}
-				return result;
-			}
-			return result;
-		}
+		// `require(cond)` / `require(cond, reason)`: the reason, if present,
+		// is always the 2nd argument (index 1) -- index 0 is the condition.
+		if (callee->name() == "require" && _call.arguments().size() >= 2)
+			return exportReasonArg(*_call.arguments().at(1));
+
+		// The global `revert()` / `revert(reason)` builtin: unlike `require`,
+		// it takes no leading condition, so its (sole, optional) reason -- if
+		// the caller passed one -- is the 1st argument (index 0).
+		if (callee->name() == "revert" && _call.arguments().size() >= 1)
+			return exportReasonArg(*_call.arguments().at(0));
 	}
 
-	// Fallback: return empty payload rather than throwing
+	// Fallback: return empty payload rather than throwing (genuinely
+	// argument-less `require(cond)` / `revert()`, or an unrecognized callee).
 	return result;
 }
 
