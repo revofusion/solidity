@@ -6872,28 +6872,17 @@ struct WriteOracleCollector: ASTConstVisitor
 			// approximation at root granularity); an unresolvable
 			// (present-but-nullopt) or altogether untracked entry keeps
 			// the pre-existing fail-closed default.
+			// NOTE: a bare-identifier target reaching HERE is a genuine
+			// write-through, not a rebind — recordWriteToBase is invoked
+			// with bare identifiers for `.push()`/`.pop()` bases and for
+			// OZ-library-mutator receiver arguments (`q.push(v)`,
+			// `set.add(x)` where q/set are tracked aliases). Pointer
+			// REBINDS (assignment LHS) never reach this function: they
+			// are intercepted, poisoned, and failed closed in
+			// visit(Assignment) below.
 			auto rootIt = aliasRootCandidates.find(varDecl);
 			if (rootIt != aliasRootCandidates.end() && rootIt->second.has_value())
 			{
-				// [storage-ref-alias review fix] A bare-identifier target
-				// (nothing peeled: the "write" IS the pointer variable) is
-				// a pointer REBIND, not a storage write. The body-side
-				// export never tracks a rebound variable (its whole-
-				// function StorageRefRebindScanner pre-pass), so its
-				// writes stay copy-lowered/dropped — attributing them
-				// here would mask the drop from FIDELITY-001 whenever the
-				// candidate root is also touched by a real write. Poison
-				// the entry AND fail the whole function closed
-				// (`unknown = true` dominates any earlier-in-AST-order
-				// attribution through this variable, so this is order-
-				// insensitive) — exactly the pre-alias-tracking refusal
-				// behavior for functions that reassign storage pointers.
-				if (static_cast<Expression const*>(base) == &_target)
-				{
-					rootIt->second = std::nullopt;
-					unknown = true;
-					return;
-				}
 				writes.insert(rootIt->second->begin(), rootIt->second->end());
 				return;
 			}
@@ -6945,26 +6934,55 @@ struct WriteOracleCollector: ASTConstVisitor
 		return true;
 	}
 
+	// [storage-ref-alias review fix] Assignment-target dispatch: a BARE
+	// IDENTIFIER assignment target that is a storage-located local or
+	// parameter is a pointer REBIND (Solidity only allows assigning a
+	// storage reference into a storage-pointer variable), NOT a storage
+	// write. The body-side export NEVER tracks a rebound variable
+	// (StorageRefRebindScanner's whole-function pre-pass), so writes
+	// through it stay copy-lowered (dropped from the model); an earlier
+	// revision of this collector "precisely" merged candidate roots on
+	// rebind instead, which attributed those dropped writes to real
+	// roots and let the function pass both FIDELITY gates whenever the
+	// root was also touched by a genuine write (root-granularity
+	// masking) — including through storage-pointer PARAMETERS, which
+	// the design explicitly keeps fail-closed (Phase-2 scope). A rebind
+	// therefore poisons the variable's candidate entry AND fails the
+	// whole function closed (`unknown = true` dominates any earlier-in-
+	// AST-order attribution through this variable, so flow-insensitivity
+	// is harmless) — exactly the pre-alias-tracking refusal behavior.
+	// This dispatch deliberately lives at the ASSIGNMENT visitor, not in
+	// recordWriteToBase: bare identifiers are legitimate write-through
+	// targets in recordWriteToBase's OTHER call contexts (push/pop
+	// bases, OZ-mutator receivers).
+	void handleAssignmentTarget(Expression const& _target)
+	{
+		if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_target))
+		{
+			for (auto const& component: tuple->components())
+				if (component)
+					handleAssignmentTarget(*component);
+			return;
+		}
+		if (auto const* identifier = dynamic_cast<Identifier const*>(&_target))
+			if (auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration))
+				if (
+					!decl->isStateVariable() &&
+					decl->referenceLocation() == VariableDeclaration::Location::Storage
+				)
+				{
+					auto it = aliasRootCandidates.find(decl);
+					if (it != aliasRootCandidates.end())
+						it->second = std::nullopt;
+					unknown = true;
+					return;
+				}
+		recordWriteToBase(_target);
+	}
+
 	bool visit(Assignment const& _assignment) override
 	{
-		// [storage-ref-alias review fix] NO special-casing of storage-
-		// pointer REBINDS (`x = <storage lvalue>;` where `x` is a
-		// storage-located local or parameter) here: a rebind assignment
-		// must keep falling through to recordWriteToBase, whose
-		// local-storage-pointer arm fails closed (`unknown = true`) —
-		// the exact pre-alias-tracking behavior. The body-side export
-		// NEVER tracks a rebound variable (StorageRefRebindScanner's
-		// whole-function pre-pass), so its writes stay copy-lowered
-		// (dropped from the model); an earlier revision of this
-		// collector "precisely" merged candidate roots on rebind
-		// instead, which attributed those dropped writes to real roots
-		// and let the function pass both FIDELITY gates whenever the
-		// root was also touched by a genuine write (root-granularity
-		// masking) — including through storage-pointer PARAMETERS,
-		// which the design explicitly keeps fail-closed (Phase-2
-		// scope). See resolveOracleStorageRefRoots' envelope invariant
-		// note above.
-		recordWriteToBase(_assignment.leftHandSide());
+		handleAssignmentTarget(_assignment.leftHandSide());
 		return true;
 	}
 
