@@ -6705,6 +6705,59 @@ bool isKnownStorageSlotHelperOracle(FunctionDefinition const& _function)
 	return rhsIt->second.declaration == &param;
 }
 
+// [storage-ref-alias review fix] Resolve a slot-getter call argument to a
+// compile-time constant u256, or nullopt. Deliberately minimal (fail
+// closed): a plain number/hex literal, or an Identifier/MemberAccess chain
+// of `constant` variable declarations bottoming out in such a literal —
+// exactly the shape the OZ EIP-1967 slot constants use
+// (`bytes32 internal constant _ADMIN_SLOT = 0xb531...;`). Anything else
+// (arithmetic, keccak256 calls, non-constant variables) returns nullopt.
+std::optional<u256> resolveCompileTimeSlotConstant(Expression const& _expr, size_t _depth = 0)
+{
+	if (_depth > 16)
+		return std::nullopt;
+	if (auto const* literal = dynamic_cast<Literal const*>(&_expr))
+	{
+		if (auto const* rational = dynamic_cast<RationalNumberType const*>(literal->annotation().type))
+			if (!rational->isFractional())
+				return rational->literalValue(literal);
+		return std::nullopt;
+	}
+	Declaration const* declaration = nullptr;
+	if (auto const* identifier = dynamic_cast<Identifier const*>(&_expr))
+		declaration = identifier->annotation().referencedDeclaration;
+	else if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_expr))
+		declaration = memberAccess->annotation().referencedDeclaration;
+	if (auto const* varDecl = dynamic_cast<VariableDeclaration const*>(declaration))
+		if (varDecl->isConstant() && varDecl->value())
+			return resolveCompileTimeSlotConstant(*varDecl->value(), _depth + 1);
+	return std::nullopt;
+}
+
+// [storage-ref-alias review fix] Design §5 guard 1 for the write-oracle's
+// StorageSlot extension: a slot WRITE may only be treated as "soundly
+// modeled elsewhere" when its slot argument is a compile-time constant
+// >= 2^64. The OCaml frontend models `getXSlot(k).value = v` as a raw
+// `foreign_storage_write_slot` against world[thisAddress], which is a
+// SEPARATE model component from the named Storage record — if k collided
+// with a declared field's slot (sequential declared slots are small
+// integers < 2^64), the model would diverge from the EVM (named field
+// unchanged in the model, changed on chain). Keccak-image disjointness
+// against mapping/array-derived slots is the same standard-model
+// assumption the named-field storage model already makes. Non-constant
+// or small slots keep the pre-existing fail-closed `unknown` (slot
+// writes were ALWAYS refused before this extension, so this is
+// zero-regression).
+bool isDisjointConstantSlotArgument(FunctionCall const& _call)
+{
+	if (_call.arguments().size() != 1 || !_call.arguments().front())
+		return false;
+	auto slotValue = resolveCompileTimeSlotConstant(*_call.arguments().front());
+	if (!slotValue.has_value())
+		return false;
+	return *slotValue >= (u256(1) << 64);
+}
+
 // --- End EIP-1967 / StorageSlot write-oracle extension ---
 
 struct WriteOracleCollector: ASTConstVisitor
@@ -6816,13 +6869,19 @@ struct WriteOracleCollector: ASTConstVisitor
 		// soundly modeled by the OCaml frontend against
 		// world[thisAddress] — not a write to any NAMED field this export
 		// declares, so it must contribute nothing to `writes` and must NOT
-		// set `unknown`.
+		// set `unknown`. [storage-ref-alias review fix] Only when the slot
+		// argument is a compile-time constant >= 2^64
+		// (isDisjointConstantSlotArgument — design §5 guard 1): the
+		// world[thisAddress] slot map is a separate model component from
+		// the named Storage record, so a slot that could collide with a
+		// declared field's slot must keep the pre-existing fail-closed
+		// `unknown` instead.
 		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_target))
 			if (memberAccess->memberName() == "value")
 				if (auto const* call = dynamic_cast<FunctionCall const*>(&memberAccess->expression()))
 					if (FunctionDefinition const* target =
 							resolveWriteOracleCallTarget(call->expression(), mostDerivedContract))
-						if (isKnownStorageSlotHelperOracle(*target))
+						if (isKnownStorageSlotHelperOracle(*target) && isDisjointConstantSlotArgument(*call))
 							return;
 
 		Identifier const* base = peelToBaseIdentifierForWriteOracle(_target);
