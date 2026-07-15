@@ -2542,6 +2542,496 @@ BOOST_AUTO_TEST_CASE(solcore_export_nested_mapping_assignment)
 		"_approve should not degrade nested mapping writes to a top-level expr array_set_expr");
 }
 
+// === delete on non-word-sized targets ======================================
+// See documentation/skills (SolCore capability: "delete on a non-word-sized
+// target"). These fixtures cover the categories exportDeleteStructSpine /
+// deleteDefaultValueForResolvedType / exportStorageMapLValueDeep now handle,
+// plus the two deliberately-permanent fail-closed corners.
+
+namespace
+{
+Json findFunctionByName(Json const& _solcore, std::string const& _name)
+{
+	for (auto const& fn: _solcore["functions"])
+		if (fn["name"].get<std::string>() == _name)
+			return fn;
+	for (auto const& fn: _solcore["internal_functions"])
+		if (fn["name"].get<std::string>() == _name)
+			return fn;
+	BOOST_FAIL("function '" + _name + "' not found in solcore export");
+	return Json();
+}
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_dynamic_array_struct_member)
+{
+	// `delete conf.erc20s;`-shaped: a dynamic array field of a struct state
+	// variable. Must lower to an explicitly-typed `new_array(0)`, not the
+	// `{"kind":"unit"}` shortcut (see SolCoreExporter.cpp's
+	// deleteDefaultValueForResolvedType doc comment for why).
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					struct S { uint256[] items; }
+					S s;
+					function clearItems() external {
+						delete s.items;
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+
+	Json fn = findFunctionByName(solcore, "clearItems");
+	// [0] the delete write, [1] the implicit trailing `return unit;` every
+	// void function without an explicit return statement gets.
+	BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
+	Json const& stmt = fn["body"]["statements"][0];
+	BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_set");
+	BOOST_CHECK_EQUAL(stmt["field"].get<std::string>(), "s");
+	Json const& update = stmt["value"];
+	BOOST_CHECK_EQUAL(update["kind"].get<std::string>(), "struct_update");
+	BOOST_CHECK_EQUAL(update["field"].get<std::string>(), "items");
+	Json const& newArray = update["value"];
+	BOOST_CHECK_EQUAL(newArray["kind"].get<std::string>(), "internal_call");
+	BOOST_CHECK_EQUAL(newArray["function"].get<std::string>(), "new_array");
+	BOOST_REQUIRE(newArray["args"].is_array());
+	BOOST_REQUIRE_EQUAL(newArray["args"].size(), 1);
+	BOOST_CHECK_EQUAL(newArray["args"][0]["value"].get<std::string>(), "0");
+	// "element_type" carries the ARRAY type itself (matching the
+	// pre-existing `new T[](n)` NewExpression convention), not the bare
+	// element -- this is what lets the frontend's new_array__<ty> name
+	// mangling agree with a real `new uint256[](0)` call.
+	BOOST_CHECK_EQUAL(newArray["element_type"]["kind"].get<std::string>(), "array");
+	BOOST_CHECK_EQUAL(newArray["element_type"]["element"].get<std::string>(), "u256");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_whole_struct_preserves_mapping_member)
+{
+	// `delete s;` on a struct WITH a mapping member: every non-mapping
+	// member must be reset (in declared order); the mapping member must be
+	// left completely untouched (docs/types/operators.rst's "no effect on
+	// mappings" rule, YulUtilFunctions::clearStorageStructFunction's
+	// mapping-member skip).
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					struct S {
+						uint256 a;
+						mapping(address => uint256) m;
+						bool b;
+					}
+					S s;
+					function clearS() external {
+						delete s;
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	Json fn = findFunctionByName(solcore, "clearS");
+	BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
+	Json const& stmt = fn["body"]["statements"][0];
+	BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_set");
+	BOOST_CHECK_EQUAL(stmt["field"].get<std::string>(), "s");
+
+	// Outer struct_update is the LAST-applied member in declared order: "b".
+	Json const& outer = stmt["value"];
+	BOOST_CHECK_EQUAL(outer["kind"].get<std::string>(), "struct_update");
+	BOOST_CHECK_EQUAL(outer["field"].get<std::string>(), "b");
+	BOOST_CHECK_EQUAL(outer["value"]["kind"].get<std::string>(), "bool");
+	BOOST_CHECK_EQUAL(outer["value"]["value"].get<bool>(), false);
+
+	Json const& inner = outer["base"];
+	BOOST_CHECK_EQUAL(inner["kind"].get<std::string>(), "struct_update");
+	BOOST_CHECK_EQUAL(inner["field"].get<std::string>(), "a");
+	BOOST_CHECK_EQUAL(inner["value"]["kind"].get<std::string>(), "u256");
+	BOOST_CHECK_EQUAL(inner["value"]["value"].get<std::string>(), "0");
+
+	// The base of the innermost struct_update is the pristine snapshot read
+	// -- never touched for "m" -- so no struct_update anywhere names "m".
+	BOOST_CHECK_EQUAL(inner["base"]["kind"].get<std::string>(), "storage_get");
+	std::string serialized = fn.dump();
+	BOOST_CHECK_MESSAGE(
+		serialized.find("\"field\":\"m\"") == std::string::npos,
+		"delete must never touch the struct's mapping member");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_struct_array_element)
+{
+	// `delete arr[i];` on a state array of structs (no mapping members):
+	// every member is reset via the same struct_update spine, addressed
+	// through the state array's own array_set path.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					struct W { address account; uint256 amt; }
+					W[] queueArr;
+					function clear(uint256 i) external {
+						delete queueArr[i];
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	Json fn = findFunctionByName(solcore, "clear");
+	BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
+	Json const& stmt = fn["body"]["statements"][0];
+	BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "array_set");
+	BOOST_REQUIRE(stmt["base_path"].is_array());
+	BOOST_CHECK_EQUAL(stmt["base_path"][0].get<std::string>(), "queueArr");
+
+	Json const& outer = stmt["value"];
+	BOOST_CHECK_EQUAL(outer["kind"].get<std::string>(), "struct_update");
+	BOOST_CHECK_EQUAL(outer["field"].get<std::string>(), "amt");
+	Json const& inner = outer["base"];
+	BOOST_CHECK_EQUAL(inner["kind"].get<std::string>(), "struct_update");
+	BOOST_CHECK_EQUAL(inner["field"].get<std::string>(), "account");
+	// address's delete-default is numeric zero on the wire (kind "u256",
+	// same as the pre-existing word-scalar delete behavior) -- there is no
+	// distinct "address"-kind zero literal.
+	BOOST_CHECK_EQUAL(inner["value"]["kind"].get<std::string>(), "u256");
+	BOOST_CHECK_EQUAL(inner["value"]["value"].get<std::string>(), "0");
+	BOOST_CHECK_EQUAL(inner["base"]["kind"].get<std::string>(), "array_get");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_struct_element_through_local_storage_pointer)
+{
+	// The exact StRSRP0.cancelUnstake shape: `W[] storage queue =
+	// mappingOfArrays[key]; ... delete queue[i];`. `queue` is a local
+	// storage-POINTER, so this flows through the existing (coarse but
+	// oracle-CONTAINED) local array_set_local path -- confirms delete's
+	// struct spine composes correctly with that pre-existing machinery.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					struct W { address account; uint256 amt; }
+					mapping(address => W[]) queues;
+					function clear(address who, uint256 i) external {
+						W[] storage queue = queues[who];
+						delete queue[i];
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	Json fn = findFunctionByName(solcore, "clear");
+	std::string serialized = fn.dump();
+	BOOST_CHECK(serialized.find("unsupported_body") == std::string::npos);
+	BOOST_CHECK_MESSAGE(
+		serialized.find("\"function\":\"array_set_local\"") != std::string::npos,
+		"delete through a local storage-pointer element should use array_set_local");
+	BOOST_CHECK_MESSAGE(
+		serialized.find("\"kind\":\"struct_update\"") != std::string::npos,
+		"delete of a struct element should build a struct_update spine");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_mapping_value_array_single_and_struct_nested)
+{
+	// (d): a top-level state-mapping's array value (StRSRP0.bankruptWithdrawals
+	// shape) AND a struct-nested mapping's scalar value
+	// (BasketHandler._setPrimeBasket's `delete config.targetAmts[k];` shape,
+	// exercising exportStorageMapLValueDeep's multi-component "path").
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					mapping(address => uint256[]) lists;
+					struct Config { mapping(address => uint256) amounts; }
+					Config config;
+
+					function clearList(address who) external {
+						delete lists[who];
+					}
+					function clearAmount(address who) external {
+						delete config.amounts[who];
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	{
+		Json fn = findFunctionByName(solcore, "clearList");
+		BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
+		Json const& stmt = fn["body"]["statements"][0];
+		BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_map_set");
+		BOOST_CHECK_EQUAL(stmt["field"].get<std::string>(), "lists");
+		Json const& value = stmt["value"];
+		BOOST_CHECK_EQUAL(value["kind"].get<std::string>(), "internal_call");
+		BOOST_CHECK_EQUAL(value["function"].get<std::string>(), "new_array");
+		BOOST_CHECK_EQUAL(value["element_type"]["kind"].get<std::string>(), "array");
+		BOOST_CHECK_EQUAL(value["element_type"]["element"].get<std::string>(), "u256");
+	}
+	{
+		Json fn = findFunctionByName(solcore, "clearAmount");
+		BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
+		Json const& stmt = fn["body"]["statements"][0];
+		BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_map_set");
+		BOOST_REQUIRE(stmt["path"].is_array());
+		BOOST_REQUIRE_EQUAL(stmt["path"].size(), 2);
+		BOOST_CHECK_EQUAL(stmt["path"][0].get<std::string>(), "config");
+		BOOST_CHECK_EQUAL(stmt["path"][1].get<std::string>(), "amounts");
+		BOOST_CHECK_EQUAL(stmt["value"]["kind"].get<std::string>(), "u256");
+		BOOST_CHECK_EQUAL(stmt["value"]["value"].get<std::string>(), "0");
+	}
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_enum_resets_to_first_variant)
+{
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					enum Status { Idle, Active, Done }
+					Status status;
+					function resetStatus() external {
+						delete status;
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	Json fn = findFunctionByName(solcore, "resetStatus");
+	BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
+	Json const& stmt = fn["body"]["statements"][0];
+	BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_set");
+	BOOST_CHECK_EQUAL(stmt["field"].get<std::string>(), "status");
+	Json const& value = stmt["value"];
+	BOOST_CHECK_EQUAL(value["kind"].get<std::string>(), "enum_variant");
+	BOOST_CHECK_EQUAL(value["variant"].get<std::string>(), "Idle");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_bytes_and_string)
+{
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					bytes data;
+					string label;
+					function clearData() external { delete data; }
+					function clearLabel() external { delete label; }
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	for (std::string const& fnName: {std::string("clearData"), std::string("clearLabel")})
+	{
+		Json fn = findFunctionByName(solcore, fnName);
+		BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
+		Json const& stmt = fn["body"]["statements"][0];
+		BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_set");
+		Json const& value = stmt["value"];
+		BOOST_CHECK_EQUAL(value["kind"].get<std::string>(), "internal_call");
+		BOOST_CHECK_EQUAL(value["function"].get<std::string>(), "new_array");
+		BOOST_CHECK_EQUAL(value["element_type"]["kind"].get<std::string>(), "array");
+		BOOST_CHECK_EQUAL(value["element_type"]["element"].get<std::string>(), "u8");
+	}
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_fixed_size_array_fails_closed)
+{
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					uint256[4] fixedArr;
+					function clearFixed() external {
+						delete fixedArr;
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	Json fn = findFunctionByName(solcore, "clearFixed");
+	BOOST_CHECK_EQUAL(fn["body"]["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_MESSAGE(
+		fn["body"]["error"].get<std::string>().find("fixed-size array") != std::string::npos,
+		"error should precisely name the fixed-size-array category");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_array_with_nested_mapping_element_fails_closed)
+{
+	// The EVM itself preserves a nested-mapping element's data across a
+	// delete-then-push (YulUtilFunctions::clearStorageStructFunction /
+	// clearStorageArrayFunction skip mapping-containing ranges), so an
+	// empty-list model would be UNSOUND here -- must fail closed, not
+	// silently produce a too-precise `[]`.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					struct Voter {
+						mapping(address => bool) voted;
+						uint256 weight;
+					}
+					Voter[] voters;
+					function clearVoters() external {
+						delete voters;
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	Json fn = findFunctionByName(solcore, "clearVoters");
+	BOOST_CHECK_EQUAL(fn["body"]["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_MESSAGE(
+		fn["body"]["error"].get<std::string>().find("nested mapping") != std::string::npos,
+		"error should precisely name the nested-mapping-element category");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_delete_vs_manual_reset_equivalence)
+{
+	// Differential: `delete p;` (one combined spine statement) must reset
+	// each member to exactly the same value that writing the members by
+	// hand (two separate statements) would -- equivalent modulo statement
+	// form, per field, in declared order.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					struct P { uint256 a; bool b; }
+					P p1;
+					P p2;
+					function deleteIt() external { delete p1; }
+					function manualReset() external {
+						p2.a = 0;
+						p2.b = false;
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	Json deleteFn = findFunctionByName(solcore, "deleteIt");
+	Json manualFn = findFunctionByName(solcore, "manualReset");
+
+	// delete: one storage_set with a struct_update(struct_update(base,a,0),b,false)
+	// spine, plus the implicit trailing `return unit;`.
+	BOOST_REQUIRE_EQUAL(deleteFn["body"]["statements"].size(), 2);
+	Json const& deleteOuter = deleteFn["body"]["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(deleteOuter["field"].get<std::string>(), "b");
+	BOOST_CHECK_EQUAL(deleteOuter["value"]["value"].get<bool>(), false);
+	Json const& deleteInner = deleteOuter["base"];
+	BOOST_CHECK_EQUAL(deleteInner["field"].get<std::string>(), "a");
+	BOOST_CHECK_EQUAL(deleteInner["value"]["value"].get<std::string>(), "0");
+
+	// manual: two storage_set statements (one struct_update each, same
+	// field/value pairs), plus the implicit trailing `return unit;`.
+	BOOST_REQUIRE_EQUAL(manualFn["body"]["statements"].size(), 3);
+	Json const& manualA = manualFn["body"]["statements"][0]["value"];
+	Json const& manualB = manualFn["body"]["statements"][1]["value"];
+	BOOST_CHECK_EQUAL(manualA["field"].get<std::string>(), "a");
+	BOOST_CHECK_EQUAL(manualA["value"]["value"].get<std::string>(), deleteInner["value"]["value"].get<std::string>());
+	BOOST_CHECK_EQUAL(manualB["field"].get<std::string>(), "b");
+	BOOST_CHECK_EQUAL(manualB["value"]["value"].get<bool>(), deleteOuter["value"]["value"].get<bool>());
+}
+
+// === end delete on non-word-sized targets ===================================
+
 BOOST_AUTO_TEST_CASE(solcore_export_overloaded_internal_function_keeps_nested_mapping_write)
 {
 	Json input = generateStandardJson(
