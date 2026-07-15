@@ -2482,6 +2482,77 @@ std::pair<std::vector<std::string>, Json> exportStorageMapLValue(Expression cons
 	throw UnsupportedSolCore("Only direct state-mapping index access is supported.");
 }
 
+// A WRITE-PATH-ONLY companion to exportStorageMapLValue: peels a chain of
+// plain struct-field `MemberAccess` hops (e.g. `config.targetAmts` above the
+// `[k]`) down to a root Identifier bound to a STATE VariableDeclaration,
+// building the multi-component path exportDirectAssignment/exportAssignment
+// already know how to emit as a `storage_map_set {"path":[...],...}` (the
+// wire shape is already fully supported downstream: storage_indexed_root /
+// update_storage_path / the narrow-width truncation pass / Summary are all
+// path-generic).
+//
+// This exists because exportStorageMapLValue only resolves a mapping whose
+// INDEX ACCESS BASE is itself a bare state-variable Identifier (or a
+// namespaced-storage alias) -- `config.targetAmts[k]` has a MemberAccess
+// base instead, which is a different (and, before this, unhandled) shape.
+// Deliberately NOT wired into the read path (exportExpr's IndexAccess arm):
+// reads of this shape already work today via the generic array_get fallback
+// (`array_get(field(storage_get(config), targetAmts), k)`), and touching
+// that path risks producing a byte-different (even if equally correct)
+// artifact for currently-green corpus functions. Kept write-only so it only
+// ever ADDS precision (turns a silently-dropped write into an attributed
+// one) and never changes anything that already worked.
+//
+// Every hop must be a storage StructType member; a storage-POINTER or
+// parameter root (rather than a state variable) still throws here and falls
+// through to the existing local-write path, which is fine: that path is
+// coarse but CONTAINED -- the AST write-oracle already marks any function
+// whose writes flow through an unresolvable storage-pointer local as
+// `unknown`, and Summary/ProofPlan gate all goals for such functions.
+std::pair<std::vector<std::string>, Json> exportStorageMapLValueDeep(Expression const& _expr)
+{
+	auto const* indexAccess = dynamic_cast<IndexAccess const*>(&_expr);
+	if (!indexAccess || !indexAccess->indexExpression())
+		throw UnsupportedSolCore("Expected mapping index access.");
+
+	// Peel MemberAccess hops off the index access's base, building the path
+	// in leaf-to-root order (reversed below). Each hop's own base must
+	// resolve to a storage struct -- namespaced-storage aliases and
+	// `_getTokenStorage()`-style getter-prefix patterns are already handled
+	// by exportStorageMapLValue above and are deliberately NOT re-matched
+	// here, so this function never produces a result that duplicates (or
+	// disagrees with) that one.
+	std::vector<std::string> reverseHops;
+	Expression const* cursor = &indexAccess->baseExpression();
+	while (auto const* memberAccess = dynamic_cast<MemberAccess const*>(cursor))
+	{
+		Type const* hopBaseType = memberAccess->expression().annotation().type;
+		if (!hopBaseType || hopBaseType->category() != Type::Category::Struct)
+			throw UnsupportedSolCore("Unsupported deep storage-mapping lvalue base.");
+		reverseHops.emplace_back(memberAccess->memberName());
+		cursor = &memberAccess->expression();
+	}
+	if (reverseHops.empty())
+		// No struct-field hop was peeled at all: this is exactly the shape
+		// exportStorageMapLValue already handles (or correctly rejects) --
+		// don't duplicate/shadow it.
+		throw UnsupportedSolCore("No struct-field hop above this mapping index access.");
+
+	auto const* identifier = dynamic_cast<Identifier const*>(cursor);
+	if (!identifier)
+		throw UnsupportedSolCore("Deep storage-mapping lvalue root is not an identifier.");
+	auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
+	if (!decl || !decl->isStateVariable())
+		throw UnsupportedSolCore("Deep storage-mapping lvalue root is not a state variable.");
+
+	std::vector<std::string> path;
+	path.emplace_back(decl->name());
+	for (auto it = reverseHops.rbegin(); it != reverseHops.rend(); ++it)
+		path.emplace_back(*it);
+
+	return {path, exportExpr(*indexAccess->indexExpression())};
+}
+
 // A bounded, well-known set of OpenZeppelin `SafeCast`/`SafeCastUpgradeable`
 // narrowing-downcast helpers (`toUint8`..`toUint248`, `toInt8`..`toInt248`,
 // including the commonly-used `toUint128`/`toUint240`/etc.) whose return
@@ -5001,6 +5072,29 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		}
 		catch (...)
 		{
+			// Struct-nested mapping assignment: config.targetAmts[k] = value
+			// (the mapping index-access base is a struct-field MemberAccess
+			// chain rooted at a state variable, not a bare mapping
+			// Identifier). Tried before the mapping-of-mapping case below
+			// since the two shapes never overlap: exportStorageMapLValueDeep
+			// requires at least one struct-field hop, which a real
+			// `outer[k1][k2]` mapping-of-mapping base (an IndexAccess, not a
+			// MemberAccess) never has.
+			try
+			{
+				auto [path, key] = exportStorageMapLValueDeep(_lhs);
+				Json current = Json::object();
+				current["kind"] = "storage_map_get";
+				if (path.size() == 1)
+					current["field"] = path.front();
+				else
+					current["path"] = jsonStringArray(path);
+				current["key"] = key;
+				return mkDirectMap(path, key, compoundValue(current, rhsJson));
+			}
+			catch (...)
+			{
+			}
 			// Nested mapping assignment:
 			// outer[innerKey][leafKey] = value
 			// Export this as a storage_map_set on the outer mapping whose value is an
@@ -5300,6 +5394,19 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 		}
 		catch (...)
 		{
+			// Struct-nested mapping lvalue: config.targetAmts[k] (this is
+			// exactly what `delete config.targetAmts[k];` and the identical
+			// plain assignment both need). See exportStorageMapLValueDeep's
+			// doc comment for why this is write-path-only and why it cannot
+			// shadow the mapping-of-mapping case below.
+			try
+			{
+				auto [path, key] = exportStorageMapLValueDeep(_lhs);
+				return mkDirectMap(path, key, _value);
+			}
+			catch (...)
+			{
+			}
 			try
 			{
 				auto [outerPath, outerKey] = exportStorageMapLValue(indexAccess->baseExpression());
@@ -5468,33 +5575,324 @@ Json exportUnaryMutation(Expression const& _target, Token _op)
 	return exportDirectAssignment(_target, mutationValue(exportExpr(_target), _op, _target.annotation().type));
 }
 
-// `delete x;` resets `x` to its type's default value. This is only sound to
-// lower here for a WORD-SIZED target (bool/address/integer/fixed-bytes/
-// contract) -- exactly the categories `exportSimpleType` already recognizes
-// as representable as a single SolCore scalar ("bool" or "u256" on the
-// wire). A struct/array/mapping/string/bytes/enum target's "default value"
-// is not a single scalar (e.g. deleting an array resets its length AND
-// clears every element), so those fail closed here rather than guessing.
-Json defaultValueForResolvedType(Type const* _type)
+// A resolved-Type* mirror of exportTypeName(TypeName const&) (~1241), needed
+// because `delete` targets only carry annotation().type -- there is no
+// TypeName AST node to walk for e.g. `delete config.erc20s;`. Kept in sync
+// with exportTypeName's integer-width table and its Bytes/String -> "array
+// of u8" special case: type decls and value expressions must monomorphize
+// to the same `new_array__<mangled>` runtime helper name, so any divergence
+// here would be a silent-mismatch bug, not just a style difference.
+// Fails closed (throws UnsupportedSolCore) on any category it does not
+// explicitly recognize, per [SolCore audit finding #9]: no zero-substitution.
+Json exportResolvedType(Type const* _type)
 {
-	std::optional<Json> simple = _type ? exportSimpleType(*_type) : std::nullopt;
-	if (!simple)
-		throw UnsupportedSolCore(
-			"delete on a non-word-sized target (struct/array/mapping/string/bytes/enum) is unsupported");
-	if (*simple == Json("bool"))
+	if (!_type)
+		throw UnsupportedSolCore("Unresolved type in SolCore exporter.");
+
+	switch (_type->category())
 	{
+	case Type::Category::Address:
+	case Type::Category::Contract:
+		return Json("address");
+	case Type::Category::Bool:
+		return Json("bool");
+	case Type::Category::Integer:
+	{
+		auto const* intType = dynamic_cast<IntegerType const*>(_type);
+		unsigned bits = intType->numBits();
+		if (!intType->isSigned())
+		{
+			switch (bits)
+			{
+			case 8:   return Json("u8");
+			case 16:  return Json("u16");
+			case 32:  return Json("u32");
+			case 64:  return Json("u64");
+			case 128: return Json("u128");
+			case 256: return Json("u256");
+			default:
+			{
+				Json result = Json::object();
+				result["kind"] = "narrowed";
+				result["base"] = "u256";
+				result["bits"] = bits;
+				return result;
+			}
+			}
+		}
+		switch (bits)
+		{
+		case 8:   return Json("i8");
+		case 16:  return Json("i16");
+		case 32:  return Json("i32");
+		case 64:  return Json("i64");
+		case 128: return Json("i128");
+		case 256: return Json("i256");
+		default:
+		{
+			Json result = Json::object();
+			result["kind"] = "narrowed";
+			result["base"] = "i256";
+			result["bits"] = bits;
+			return result;
+		}
+		}
+	}
+	case Type::Category::FixedBytes:
+	{
+		auto const* fbType = dynamic_cast<FixedBytesType const*>(_type);
+		return Json("bytes" + std::to_string(fbType->numBytes()));
+	}
+	case Type::Category::Enum:
+	{
+		auto const* enumType = dynamic_cast<EnumType const*>(_type);
 		Json result = Json::object();
-		result["kind"] = "bool";
-		result["value"] = false;
+		result["kind"] = "enum";
+		result["name"] = exportedEnumName(enumType->enumDefinition());
 		return result;
 	}
-	// "address" or "u256" both default to numeric zero on the wire.
-	return u256Literal("0");
+	case Type::Category::Struct:
+	{
+		auto const* structType = dynamic_cast<StructType const*>(_type);
+		Json result = Json::object();
+		result["kind"] = "named";
+		result["name"] = structType->structDefinition().name();
+		return result;
+	}
+	case Type::Category::Array:
+	{
+		auto const* arrayType = dynamic_cast<ArrayType const*>(_type);
+		// Dynamic bytes/string is represented on the wire as an array of u8,
+		// mirroring exportTypeName's Token::Bytes/Token::String arms -- this
+		// is what makes `new bytes(0)`-shaped and delete-shaped u8-array
+		// values monomorphize to the same `new_array__u8` helper as an
+		// actual `bytes`/`string` declaration.
+		Json element = arrayType->isByteArrayOrString()
+			? Json("u8")
+			: exportResolvedType(arrayType->baseType());
+		Json result = Json::object();
+		if (arrayType->isDynamicallySized())
+		{
+			result["kind"] = "array";
+			result["element"] = element;
+		}
+		else
+		{
+			u256 len = arrayType->length();
+			if (len > std::numeric_limits<unsigned long>::max())
+				throw UnsupportedSolCore("Fixed-size array length out of range in SolCore exporter.");
+			result["kind"] = "fixed_array";
+			result["element"] = element;
+			result["size"] = len.convert_to<unsigned long>();
+		}
+		return result;
+	}
+	case Type::Category::Mapping:
+	{
+		auto const* mappingType = dynamic_cast<MappingType const*>(_type);
+		Json result = Json::object();
+		result["kind"] = "mapping";
+		result["key"] = exportResolvedType(mappingType->keyType());
+		result["value"] = exportResolvedType(mappingType->valueType());
+		return result;
+	}
+	case Type::Category::UserDefinedValueType:
+	{
+		auto const* udvt = dynamic_cast<UserDefinedValueType const*>(_type);
+		return exportResolvedType(&udvt->underlyingType());
+	}
+	default:
+		break;
+	}
+	throw UnsupportedSolCore("Unsupported resolved type in SolCore exporter.");
+}
+
+// `delete x;` resets `x` to its type's default value (docs/types/operators.rst
+// "delete a ... is equivalent to assigning the initial value"). This computes
+// that default value for every LEAF (non-struct) category:
+//   - word scalars (bool/address/integer/fixed-bytes/contract, and
+//     UserDefinedValueType unwrapped to its underlying word type): unchanged
+//     from the old word-only behavior.
+//   - enum: the FIRST declared variant -- this is EVM value 0, which is
+//     exactly what `delete` produces (EnumType::unaryOperatorResult allows
+//     delete; Solidity forbids empty enums, so front() is total).
+//   - dynamic array (incl. bytes/string): `new_array(0)`, i.e. `[]`. Sound
+//     because storage codegen (clearStorageArrayFunction /
+//     ArrayUtils::clearDynamicArray) resizes to 0 AND clears the data
+//     region -- EXCEPT when the element type contains a nested mapping,
+//     where codegen deliberately skips clearing (old mapping data survives
+//     a delete-then-push). An empty-list model cannot represent that
+//     survival, so that category fails closed rather than silently
+//     producing an unsound (too-precise) model.
+//   - fixed-size array: fails closed (zero corpus instances; a sound
+//     elementwise-reset lowering is deferred, not designed here).
+//   - mapping: unreachable from valid Solidity -- `delete` on a
+//     mapping-typed lvalue is a compile-time type error (MappingType has no
+//     unaryOperatorResult override), so the type checker rejects it before
+//     this code ever runs. Throwing here (never a silent no-op) means an
+//     exporter bug can never masquerade as a dropped write.
+// Struct targets are NOT handled here -- see exportDeleteStructSpine below,
+// which needs the actual lvalue JSON to build a `struct_update` spine
+// (struct members can be skipped, which a single "default value" cannot
+// express: a whole-record `default` would incorrectly zero mapping members).
+Json deleteDefaultValueForResolvedType(Type const* _type)
+{
+	if (!_type)
+		throw UnsupportedSolCore("delete on a target with unresolved type is unsupported.");
+
+	if (auto const* udvt = dynamic_cast<UserDefinedValueType const*>(_type))
+		return deleteDefaultValueForResolvedType(&udvt->underlyingType());
+
+	if (std::optional<Json> simple = exportSimpleType(*_type))
+	{
+		if (*simple == Json("bool"))
+		{
+			Json result = Json::object();
+			result["kind"] = "bool";
+			result["value"] = false;
+			return result;
+		}
+		// "address" or "u256" both default to numeric zero on the wire.
+		return u256Literal("0");
+	}
+
+	if (_type->category() == Type::Category::Enum)
+	{
+		auto const* enumType = dynamic_cast<EnumType const*>(_type);
+		EnumDefinition const& enumDef = enumType->enumDefinition();
+		if (enumDef.members().empty())
+			// Unreachable: Solidity rejects empty enums at parse time.
+			throw UnsupportedSolCore("delete on an empty enum is unsupported.");
+		Json result = Json::object();
+		result["kind"] = "enum_variant";
+		result["enum"] = exportedEnumName(enumDef);
+		result["variant"] = enumDef.members().front()->name();
+		return result;
+	}
+
+	if (_type->category() == Type::Category::Array)
+	{
+		auto const* arrayType = dynamic_cast<ArrayType const*>(_type);
+		if (!arrayType->isDynamicallySized())
+			throw UnsupportedSolCore("delete on a fixed-size array is unsupported.");
+		if (arrayType->containsNestedMapping())
+			throw UnsupportedSolCore(
+				"delete on an array whose element type contains a nested mapping is unsupported "
+				"(the EVM itself preserves that mapping data across a delete-then-push, so no "
+				"value-level default can soundly model it)");
+		Json result = Json::object();
+		result["kind"] = "internal_call";
+		result["function"] = "new_array";
+		result["args"] = Json::array();
+		result["args"].emplace_back(u256Literal("0"));
+		// IMPORTANT: despite the field's name, "element_type" carries the
+		// ARRAY type itself, not the bare element -- verified against the
+		// pre-existing `new T[](n)`/`new bytes(n)` NewExpression lowering
+		// (~3106 above), which sets `element_type = exportTypeName(newExpr
+		// ->typeName())` where `typeName()` is the array TypeName (so e.g.
+		// `new uint256[](n)` emits `element_type:{"kind":"array",
+		// "element":"u256"}`, and `new bytes(n)` emits `element_type:
+		// {"kind":"array","element":"u8"}` -- never a bare scalar). Passing
+		// `arrayType` (not `arrayType->baseType()`) to exportResolvedType
+		// reproduces that exact shape, which is what lets the frontend's
+		// name-mangled `new_array__<ty>` monomorphization
+		// (SolCoreOfJsonBase.ml's parse_internal_call_function_name /
+		// SolCoreBase.ml's typed_new_array_function_name) resolve to the
+		// SAME helper a real `new T[](0)` would use.
+		result["element_type"] = exportResolvedType(arrayType);
+		return result;
+	}
+
+	if (_type->category() == Type::Category::Mapping)
+		throw UnsupportedSolCore(
+			"delete on a mapping-typed target is unsupported (unreachable from valid Solidity: "
+			"the type checker rejects `delete` on a mapping-typed lvalue).");
+
+	throw UnsupportedSolCore("delete on this target type is unsupported.");
+}
+
+// Builds a chained `struct_update` spine over `_base` (a JSON expression --
+// either the exported lvalue snapshot at the top level, or a synthetic
+// `{"kind":"field",...}` projection when recursing into a struct-typed
+// member) that resets every NON-MAPPING member to its delete-default,
+// leaving mapping members untouched. This mirrors
+// YulUtilFunctions::clearStorageStructFunction exactly: same declared
+// member order, same "skip mapping members" rule, recursing into
+// struct-typed members. Soundness: every leaf value is a constant (no
+// cross-member reads), so member order is irrelevant, and non-updated
+// (mapping) members flow through unchanged from `_base` -- exactly the
+// EVM's own per-member clear-with-mapping-skip.
+Json exportDeleteStructSpine(Json const& _base, StructDefinition const& _structDef)
+{
+	Json cur = _base;
+	for (ASTPointer<VariableDeclaration> const& memberPtr: _structDef.members())
+	{
+		VariableDeclaration const& member = *memberPtr;
+		Type const* memberType = member.type();
+		if (!memberType)
+			throw UnsupportedSolCore("delete: struct member '" + member.name() + "' has unresolved type.");
+		if (memberType->category() == Type::Category::Mapping)
+			continue; // preserved -- matches clearStorageStructFunction's mapping-member skip
+
+		Json fieldRead = Json::object();
+		fieldRead["kind"] = "field";
+		fieldRead["base"] = cur;
+		fieldRead["field"] = member.name();
+
+		Json value;
+		if (memberType->category() == Type::Category::Struct)
+		{
+			auto const* memberStructType = dynamic_cast<StructType const*>(memberType);
+			value = exportDeleteStructSpine(fieldRead, memberStructType->structDefinition());
+		}
+		else
+			value = deleteDefaultValueForResolvedType(memberType);
+
+		Json update = Json::object();
+		update["kind"] = "struct_update";
+		update["base"] = cur;
+		update["field"] = member.name();
+		update["value"] = value;
+		cur = update;
+	}
+	return cur;
 }
 
 Json exportDelete(Expression const& _target)
 {
-	return exportDirectAssignment(_target, defaultValueForResolvedType(_target.annotation().type));
+	Type const* type = _target.annotation().type;
+	if (!type)
+		throw UnsupportedSolCore("delete on a target with unresolved type is unsupported.");
+	if (auto const* udvt = dynamic_cast<UserDefinedValueType const*>(type))
+		type = &udvt->underlyingType();
+
+	if (type->category() == Type::Category::Struct)
+	{
+		auto const* structType = dynamic_cast<StructType const*>(type);
+		StructDefinition const& structDef = structType->structDefinition();
+		bool allMembersAreMappings = std::all_of(
+			structDef.members().begin(),
+			structDef.members().end(),
+			[](ASTPointer<VariableDeclaration> const& _member) {
+				Type const* memberType = _member->type();
+				return memberType && memberType->category() == Type::Category::Mapping;
+			}
+		);
+		if (allMembersAreMappings)
+		{
+			// Every member is preserved (mapping-skip): the delete is a
+			// genuine no-op, so emit exactly that rather than a spurious
+			// self-assignment.
+			Json block = Json::object();
+			block["kind"] = "block";
+			block["statements"] = Json::array();
+			return block;
+		}
+		Json spine = exportDeleteStructSpine(exportExpr(_target), structDef);
+		return exportDirectAssignment(_target, spine);
+	}
+
+	return exportDirectAssignment(_target, deleteDefaultValueForResolvedType(type));
 }
 
 Json exportUnaryMutationReturn(UnaryOperation const& _unary)
