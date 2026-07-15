@@ -6441,23 +6441,25 @@ bool isKnownOzStorageRefLibraryMutator(FunctionDefinition const& _funcDef)
 		((libName == "EnumerableMap" || libName == "EnumerableMapUpgradeable") &&
 			(fnName == "set" || fnName == "remove")) ||
 		((libName == "Checkpoints" || libName == "CheckpointsUpgradeable") &&
-			fnName == "push") ||
-		// General local storage-reference-variable alias tracking, Phase 1b
-		// (design §4): mirrors EXACTLY the hidden storage-mutator helper
-		// names Summary.ml's `hidden_mutator_writes_in_expr` already
-		// records on the OCaml/body-model side (the `"popFront" | "pushBack"
-		// | "clear" (* DoubleEndedQueue *) | "increment" | "reset" (* OZ
-		// Counters.Counter *)` arm) — deliberately not extended to
-		// `decrement`/`pushFront`, which that arm does NOT record, to keep
-		// this oracle-side attribution and the body-model's own write set
-		// in lockstep (adding a name here Summary.ml lacks would let the
-		// oracle claim a write the model doesn't also declare, which is
-		// harmless for FIDELITY-001's direction but would misrepresent
-		// which helpers are actually bounded-mutator-recognized).
-		((libName == "Counters" || libName == "CountersUpgradeable") &&
-			(fnName == "increment" || fnName == "reset")) ||
-		((libName == "DoubleEndedQueue" || libName == "DoubleEndedQueueUpgradeable") &&
-			(fnName == "pushBack" || fnName == "popFront" || fnName == "clear"));
+			fnName == "push");
+	// [storage-ref-alias review fix] Deliberately NOT extended to
+	// Counters.(increment|reset) / DoubleEndedQueue.(pushBack|popFront|
+	// clear), although the design's §4 named them: allowlisting a mutator
+	// here removes the oracle's `unknown = true` guard for its callers,
+	// which is only sound when the Lean VALUE MODEL actually performs the
+	// receiver write. The existing entries above have real model-side
+	// write-back semantics (e.g. EnumerableSet.add lowers to a full
+	// mapping_set/array_push RMW via the EnumerableSetAdd synthetic-ref-
+	// consumer machinery), but Counters.increment/reset and the
+	// DoubleEndedQueue mutators translate to OPAQUE Unit-returning
+	// builtins (`opaque internal_call_increment (p0 : Counter) : Unit` —
+	// a modeled NO-OP; see Analysis.ml's builtin return-type table).
+	// Summary.ml's hidden-mutator arm records the write for TOUCHED-FIELD
+	// ACCOUNTING only, which would make FIDELITY-001 pass while the model
+	// silently drops the mutation (verified concretely: StRSRP1._useNonce's
+	// generated Lean returned `(state, current)` with no _nonces write).
+	// Extending this list is only sound together with EnumerableSetAdd-
+	// style model semantics for each added helper.
 	if (!matches)
 		return false;
 	// Defensive shape check: every known signature for these entry points
