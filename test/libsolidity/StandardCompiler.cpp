@@ -1954,6 +1954,500 @@ BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
 	BOOST_CHECK_EQUAL(origins["entries"][0]["originId"].get<std::string>(), "state:balances");
 }
 
+// --- Internal function used as a value: bounded defunctionalization tests ---
+// (SOLCORE_FNPTR_DEFUNCTIONALIZATION_DESIGN §5.A). Looks up a JSON entry by
+// its exported "name" in a `solcore["functions"]` or
+// `solcore["internal_functions"]` array — the same lookup idiom already
+// used ad hoc (over "originalName") by
+// solcore_export_overloaded_internal_function_keeps_nested_mapping_write,
+// above.
+Json const* findExportedFunction(Json const& _functionArray, std::string const& _name)
+{
+	for (auto const& fn: _functionArray)
+		if (fn.value("name", ""s) == _name)
+			return &fn;
+	return nullptr;
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_direct_literal_argument_is_specialized)
+{
+	// T1 (positive/singleton): a receiver taking an internal-function-typed
+	// parameter, called from two sites with two different direct-literal
+	// targets. Both call sites must get REAL bodies calling distinct
+	// specialized siblings with the function-typed parameter erased; the
+	// GENERIC (unspecialized) receiver must keep failing closed at the now
+	// precise indirect-call message (not the old "used as a value" one).
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract FnPtrRepro {
+					function bump(uint256 x) external pure returns (uint256) {
+						return _apply(_add, x);
+					}
+					function drop(uint256 x) external pure returns (uint256) {
+						return _apply(_subtract, x);
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x) private pure returns (uint256) {
+						return op(x);
+					}
+					function _add(uint256 a) private pure returns (uint256) {
+						return a + 1;
+					}
+					function _subtract(uint256 a) private pure returns (uint256) {
+						return a - 1;
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "FnPtrRepro");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+	BOOST_CHECK_EQUAL(solcore["solcoreVersion"].get<std::string>(), "0.3.0");
+
+	Json const* bump = findExportedFunction(solcore["functions"], "bump");
+	Json const* drop = findExportedFunction(solcore["functions"], "drop");
+	BOOST_REQUIRE(bump != nullptr);
+	BOOST_REQUIRE(drop != nullptr);
+	BOOST_CHECK_MESSAGE(
+		bump->at("body").dump().find("\"kind\":\"unsupported_body\"") == std::string::npos,
+		"bump() must get a real (non-unsupported) body once its fn-ptr argument is specialized");
+	BOOST_CHECK_MESSAGE(
+		drop->at("body").dump().find("\"kind\":\"unsupported_body\"") == std::string::npos,
+		"drop() must get a real (non-unsupported) body once its fn-ptr argument is specialized");
+
+	std::string bumpCallee = bump->at("body")["statements"][0]["value"]["function"].get<std::string>();
+	std::string dropCallee = drop->at("body")["statements"][0]["value"]["function"].get<std::string>();
+	BOOST_CHECK_NE(bumpCallee, dropCallee);
+	BOOST_CHECK_NE(bumpCallee.find("_apply__fnptr__op__"), std::string::npos);
+	BOOST_CHECK_NE(dropCallee.find("_apply__fnptr__op__"), std::string::npos);
+
+	Json const* addSibling = findExportedFunction(solcore["internal_functions"], bumpCallee);
+	Json const* subSibling = findExportedFunction(solcore["internal_functions"], dropCallee);
+	BOOST_REQUIRE(addSibling != nullptr);
+	BOOST_REQUIRE(subSibling != nullptr);
+	// The function-typed parameter must be erased from the specialized
+	// signature: original _apply has 2 params (op, x), the siblings have 1.
+	BOOST_REQUIRE(addSibling->at("params").is_array());
+	BOOST_CHECK_EQUAL(addSibling->at("params").size(), 1u);
+	BOOST_CHECK_EQUAL(addSibling->at("params")[0]["name"].get<std::string>(), "x");
+	BOOST_CHECK_EQUAL(
+		addSibling->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_add");
+	BOOST_CHECK_EQUAL(
+		subSibling->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_subtract");
+	BOOST_CHECK_EQUAL(addSibling->at("fnptr_specialization")["of"].get<std::string>(), "_apply");
+	BOOST_REQUIRE(addSibling->at("ast_write_oracle").is_object());
+
+	// The GENERIC (unspecialized) _apply is still exported (append-only
+	// artifact policy) but now fails closed at the NEW precise indirect-call
+	// message rather than the old blanket "used as a value" one.
+	Json const* genericApply = findExportedFunction(solcore["internal_functions"], "_apply");
+	BOOST_REQUIRE(genericApply != nullptr);
+	BOOST_CHECK_EQUAL(genericApply->at("body")["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_MESSAGE(
+		genericApply->at("body")["error"].get<std::string>().find("indirect call through an internal function value") != std::string::npos,
+		"the generic _apply must fail at the new precise indirect-call message, not the old blanket one");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_virtual_argument_binds_derived_override)
+{
+	// T2 (virtual dispatch): the base passes a VIRTUAL function as a value;
+	// the derived contract overrides it. Specialization must bind the
+	// DERIVED override (the resolveVirtual winner against the exporting
+	// contract), not the lexically-referenced base declaration — mirrors
+	// virtualCallTargetName's existing rule and solc's own codegen
+	// (FunctionDefinition::resolveVirtual at pointer-creation time).
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract FnPtrVirtualBase {
+					function run(uint256 x) external pure returns (uint256) {
+						return _apply(_hook, x);
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x) internal pure returns (uint256) {
+						return op(x);
+					}
+					function _hook(uint256 a) internal virtual pure returns (uint256) {
+						return a;
+					}
+				}
+				contract FnPtrVirtualDerived is FnPtrVirtualBase {
+					function _hook(uint256 a) internal pure override returns (uint256) {
+						return a + 100;
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "FnPtrVirtualDerived");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+
+	// Exactly one _hook implementation is reachable in this export unit (the
+	// override) — confirms the pre-existing override-collapsing behavior
+	// this test relies on to distinguish base vs. derived binding.
+	unsigned hookCount = 0;
+	Json const* hookFn = nullptr;
+	for (auto const& fn: solcore["internal_functions"])
+		if (fn.value("originalName", fn["name"].get<std::string>()) == "_hook")
+		{
+			++hookCount;
+			hookFn = &fn;
+		}
+	BOOST_REQUIRE_EQUAL(hookCount, 1u);
+	BOOST_REQUIRE(hookFn != nullptr);
+	// The DERIVED override's body ("a + 100") must be what's exported under
+	// this name, not the base's plain passthrough ("a").
+	BOOST_CHECK_NE(hookFn->at("body").dump().find("\"kind\":\"u256_add\""), std::string::npos);
+
+	Json const* run = findExportedFunction(solcore["functions"], "run");
+	BOOST_REQUIRE(run != nullptr);
+	std::string runCallee = run->at("body")["statements"][0]["value"]["function"].get<std::string>();
+	Json const* sibling = findExportedFunction(solcore["internal_functions"], runCallee);
+	BOOST_REQUIRE(sibling != nullptr);
+	// The specialized sibling must call the SAME exported name as the
+	// override entry found above (the resolveVirtual winner), proving the
+	// binding resolved to the derived override.
+	BOOST_CHECK_EQUAL(
+		sibling->at("body")["statements"][0]["value"]["function"].get<std::string>(),
+		hookFn->at("name").get<std::string>());
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_conditional_argument_fails_closed)
+{
+	// T3 (adversarial: conditionally-selected target). A ternary between two
+	// function literals is not a single statically-known target — must fail
+	// closed with the new precise message, and must NOT emit any
+	// `__fnptr__` sibling.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract T3Conditional {
+					function pick(bool c, uint256 x) external pure returns (uint256) {
+						return _apply(c ? _add : _subtract, x);
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x) private pure returns (uint256) {
+						return op(x);
+					}
+					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
+					function _subtract(uint256 a) private pure returns (uint256) { return a - 1; }
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "T3Conditional");
+	Json const& solcore = contractResult["solcore"];
+
+	Json const* pick = findExportedFunction(solcore["functions"], "pick");
+	BOOST_REQUIRE(pick != nullptr);
+	BOOST_CHECK_EQUAL(pick->at("body")["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_MESSAGE(
+		pick->at("body")["error"].get<std::string>().find("not a direct internal function reference") != std::string::npos,
+		"a conditionally-selected fn-ptr argument must fail closed with the precise message");
+
+	for (auto const& fn: solcore["internal_functions"])
+		BOOST_CHECK_MESSAGE(
+			fn["name"].get<std::string>().find("__fnptr__") == std::string::npos,
+			"no specialized sibling may be emitted for a conditional argument");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_reassigned_parameter_fails_closed)
+{
+	// T4 (adversarial: reassignment). The callee reassigns its own
+	// function-typed parameter before calling it — the singleton-target
+	// claim is FALSE for this callee, so specialization must refuse
+	// (admissibility check), not silently bind to the call-site argument.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract T4Reassign {
+					function bump(uint256 x) external pure returns (uint256) {
+						return _apply(_add, x);
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x) private pure returns (uint256) {
+						op = _subtract;
+						return op(x);
+					}
+					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
+					function _subtract(uint256 a) private pure returns (uint256) { return a - 1; }
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "T4Reassign");
+	Json const& solcore = contractResult["solcore"];
+
+	Json const* bump = findExportedFunction(solcore["functions"], "bump");
+	BOOST_REQUIRE(bump != nullptr);
+	BOOST_CHECK_EQUAL(bump->at("body")["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_MESSAGE(
+		bump->at("body")["error"].get<std::string>().find("reassigned") != std::string::npos,
+		"a callee that reassigns its fn-typed parameter must refuse via the admissibility check");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_indirect_call_never_binds_to_same_named_function)
+{
+	// T5 (adversarial: name-collision regression — pins the exportExpr:3535
+	// fallback fix). The contract ALSO defines a real internal function
+	// literally named `op` (the fn-ptr parameter's name). The GENERIC
+	// (unspecialized) _apply is always exported alongside its specialized
+	// siblings; its own `op(x)` indirect call must fail closed, never
+	// silently bind to the unrelated same-named function.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract T5Collision {
+					function bump(uint256 x) external pure returns (uint256) {
+						return _apply(_add, x);
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x) private pure returns (uint256) {
+						return op(x);
+					}
+					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
+					function op(uint256 y) private pure returns (uint256) { return y + 999; }
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "T5Collision");
+	Json const& solcore = contractResult["solcore"];
+
+	Json const* genericApply = findExportedFunction(solcore["internal_functions"], "_apply");
+	BOOST_REQUIRE(genericApply != nullptr);
+	BOOST_CHECK_EQUAL(genericApply->at("body")["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_MESSAGE(
+		genericApply->at("body")["error"].get<std::string>().find("cannot be resolved to a static target") != std::string::npos,
+		"the generic _apply's op(x) must fail closed, not silently bind to the unrelated op() function");
+
+	// bump() must still get a real specialized body calling _add, never the
+	// unrelated same-named `op` function.
+	Json const* bump = findExportedFunction(solcore["functions"], "bump");
+	BOOST_REQUIRE(bump != nullptr);
+	BOOST_CHECK_MESSAGE(
+		bump->at("body").dump().find("\"kind\":\"unsupported_body\"") == std::string::npos,
+		"bump() itself must still specialize successfully");
+	std::string bumpCallee = bump->at("body")["statements"][0]["value"]["function"].get<std::string>();
+	Json const* sibling = findExportedFunction(solcore["internal_functions"], bumpCallee);
+	BOOST_REQUIRE(sibling != nullptr);
+	BOOST_CHECK_EQUAL(
+		sibling->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_add");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_transitive_forwarding_and_self_recursion)
+{
+	// T6 (transitive forwarding + self-recursion). `_f(op)` forwards `op`
+	// into `_g(op)` — the nested specialization must resolve correctly, and
+	// a self-recursive `_f(op){ ...; _f(op, ...); }` must terminate via the
+	// specialization memo (re-deriving the SAME specialized name on its own
+	// recursive call) rather than looping forever or leaving a dangling
+	// generic call.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract T6Transitive {
+					function bump(uint256 x) external pure returns (uint256) {
+						return _f(_add, x);
+					}
+					function _f(function(uint256) internal pure returns (uint256) op, uint256 x) private pure returns (uint256) {
+						return _g(op, x);
+					}
+					function _g(function(uint256) internal pure returns (uint256) op, uint256 x) private pure returns (uint256) {
+						return op(x);
+					}
+					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
+				}
+				contract T6SelfRecursive {
+					function bump(uint256 x, uint256 n) external pure returns (uint256) {
+						return _f(_add, x, n);
+					}
+					function _f(function(uint256) internal pure returns (uint256) op, uint256 x, uint256 n) private pure returns (uint256) {
+						if (n == 0) return x;
+						return _f(op, op(x), n - 1);
+					}
+					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	{
+		Json contractResult = getContractResult(result, "fileA", "T6Transitive");
+		Json const& solcore = contractResult["solcore"];
+		Json const* bump = findExportedFunction(solcore["functions"], "bump");
+		BOOST_REQUIRE(bump != nullptr);
+		BOOST_CHECK_MESSAGE(
+			bump->at("body").dump().find("\"kind\":\"unsupported_body\"") == std::string::npos,
+			"bump() must specialize through the _f -> _g forwarding chain");
+		std::string fSibling = bump->at("body")["statements"][0]["value"]["function"].get<std::string>();
+		Json const* fFn = findExportedFunction(solcore["internal_functions"], fSibling);
+		BOOST_REQUIRE(fFn != nullptr);
+		std::string gCallee = fFn->at("body")["statements"][0]["value"]["function"].get<std::string>();
+		Json const* gFn = findExportedFunction(solcore["internal_functions"], gCallee);
+		BOOST_REQUIRE_MESSAGE(gFn != nullptr, "the transitively-forwarded _g specialization must be emitted");
+		BOOST_CHECK_EQUAL(
+			gFn->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_add");
+	}
+
+	{
+		Json contractResult = getContractResult(result, "fileA", "T6SelfRecursive");
+		Json const& solcore = contractResult["solcore"];
+		Json const* bump = findExportedFunction(solcore["functions"], "bump");
+		BOOST_REQUIRE(bump != nullptr);
+		BOOST_CHECK_MESSAGE(
+			bump->at("body").dump().find("\"kind\":\"unsupported_body\"") == std::string::npos,
+			"bump() must specialize the self-recursive _f");
+		std::string fSibling = bump->at("body")["statements"][0]["value"]["function"].get<std::string>();
+		// Exactly ONE specialized sibling of _f may exist (the memo must
+		// collapse the recursive call onto the SAME name, not diverge into
+		// an unbounded chain of siblings).
+		unsigned siblingCount = 0;
+		for (auto const& fn: solcore["internal_functions"])
+			if (fn["name"].get<std::string>().find("_f__fnptr__") == 0)
+				++siblingCount;
+		BOOST_CHECK_EQUAL(siblingCount, 1u);
+		std::string dump = findExportedFunction(solcore["internal_functions"], fSibling)->at("body").dump();
+		// The recursive call inside the specialized body must target ITSELF
+		// (the same specialized name), and the inner op(x) call must
+		// resolve directly to _add.
+		BOOST_CHECK_NE(dump.find("\"function\":\"" + fSibling + "\""), std::string::npos);
+		BOOST_CHECK_NE(dump.find("\"function\":\"_add\""), std::string::npos);
+	}
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_statement_position_indirect_call_fails_closed)
+{
+	// T7 (statement-position indirect call). `op(x);` used as a bare
+	// statement (return value discarded) reaches the generic FunctionCall
+	// fallback via exportStmt's ultimate `exportExpr(expr)` fallback rather
+	// than exportStmt's own dedicated internal-call branch — confirms that
+	// single fallback fix covers both the expression and statement paths.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract T7Stmt {
+					function bump(uint256 x) external pure {
+						_apply(_add, x);
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x) private pure {
+						op(x);
+					}
+					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "T7Stmt");
+	Json const& solcore = contractResult["solcore"];
+
+	Json const* bump = findExportedFunction(solcore["functions"], "bump");
+	BOOST_REQUIRE(bump != nullptr);
+	BOOST_CHECK_MESSAGE(
+		bump->at("body").dump().find("\"kind\":\"unsupported_body\"") == std::string::npos,
+		"bump() must specialize even though _apply's own op(x) call is statement-position");
+
+	std::string sibling = bump->at("body")["statements"][0]["value"]["function"].get<std::string>();
+	Json const* siblingFn = findExportedFunction(solcore["internal_functions"], sibling);
+	BOOST_REQUIRE(siblingFn != nullptr);
+	BOOST_CHECK_MESSAGE(
+		siblingFn->at("body").dump().find("\"kind\":\"unsupported_body\"") == std::string::npos,
+		"the specialized sibling's statement-position op(x) call must resolve, not fail closed");
+	BOOST_CHECK_NE(siblingFn->at("body").dump().find("\"function\":\"_add\""), std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_named_argument_call_fails_closed)
+{
+	// T8 (adversarial: named-argument call). Positional binding is required;
+	// a named-argument call site must refuse rather than guess which named
+	// argument lands on the function-typed parameter.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract T8Named {
+					function bump(uint256 x) external pure returns (uint256) {
+						return _apply({op: _add, x: x});
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x) private pure returns (uint256) {
+						return op(x);
+					}
+					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "T8Named");
+	Json const& solcore = contractResult["solcore"];
+
+	Json const* bump = findExportedFunction(solcore["functions"], "bump");
+	BOOST_REQUIRE(bump != nullptr);
+	BOOST_CHECK_EQUAL(bump->at("body")["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_MESSAGE(
+		bump->at("body")["error"].get<std::string>().find("named-argument call") != std::string::npos,
+		"a named-argument call binding a fn-ptr parameter must fail closed with the precise message");
+}
+
 BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
 {
 	Json input = generateStandardJson(

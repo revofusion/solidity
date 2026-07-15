@@ -30,8 +30,12 @@
 #include <libsolutil/Visitor.h>
 
 #include <algorithm>
+#include <deque>
+#include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 using namespace solidity;
@@ -92,6 +96,76 @@ static thread_local ContractDefinition const* activeExportContract = nullptr;
 /// the string matches byte-for-byte the name emitted into a call site's
 /// `"function"` field with no re-mangling needed by consumers.
 static thread_local std::set<std::string> unboundVirtualSlotNames;
+
+// --- Internal function used as a value: bounded defunctionalization ---
+//
+// (SOLCORE_FNPTR_DEFUNCTIONALIZATION_DESIGN.) Solidity lets an internal
+// function be passed BY VALUE into a `function(...) internal ...`-typed
+// parameter (a function pointer). Every such call site used to fail closed
+// at body export with "An internal function used as a value ... is not
+// modeled" — AND (independently) the RECEIVING function's indirect call
+// through that parameter silently name-punted to a bare `internal_call`
+// using the PARAMETER's own name (see the generic FunctionCall fallback in
+// exportExpr) — an accidental fail-open that would mis-bind to any real
+// function sharing that name.
+//
+// The fix, applied only to the corpus-grounded shape (a call site passing a
+// DIRECT internal-function literal — never a conditional, a function-typed
+// local/storage read, or an external function value): synthesize a
+// specialized sibling of the callee with the function-typed parameter(s)
+// erased and every call through them resolved, at synthesis time, to the
+// one statically-known target. This is bounded defunctionalization
+// (Reynolds); with a statically-determined singleton candidate set per site
+// it degenerates to ordinary monomorphization. Ground truth for "one
+// statically-known target": solc's own IR codegen resolves an
+// internal-function VALUE at the point the pointer expression is created
+// (`FunctionDefinition::resolveVirtual`), with no dynamic dispatch
+// afterward — specializing on that same winner is exactly the compiled
+// semantics, not an approximation.
+//
+// Anything outside this fragment keeps failing CLOSED with a precise
+// message — see `lowerInternalCalleeAndArgs` below.
+
+/// One function-typed parameter of a specialized callee, bound to its
+/// statically-resolved target.
+struct FnPtrBinding
+{
+	VariableDeclaration const* param = nullptr; ///< The function-typed parameter decl, in the ORIGINAL (unspecialized) signature.
+	FunctionDefinition const* target = nullptr; ///< The resolveVirtual winner bound to it; always isImplemented().
+	std::string targetExportedName;             ///< exportedFunctionName(*target) — virtualCallTargetName-consistent.
+	size_t paramIndex = 0;                      ///< Index into the ORIGINAL (unspecialized) parameter list.
+};
+
+/// A specialized sibling of an internal function whose function-typed
+/// parameters have been bound to static targets at one or more call sites.
+struct FnPtrSpecializationRequest
+{
+	FunctionDefinition const* callee = nullptr; ///< The resolved implementation being specialized.
+	std::string baseExportedName;               ///< The name the plain (unspecialized) call would have used.
+	std::vector<FnPtrBinding> bindings;         ///< Ascending paramIndex.
+	std::string specializedName;
+};
+
+/// Memo of every specialization request discovered so far this export unit,
+/// keyed by its final exported name — doubles as the collision-detection
+/// table and the "already queued/emitted" check. Cleared once per contract
+/// export, alongside `exportedFunctionNames`.
+static thread_local std::map<std::string, FnPtrSpecializationRequest> fnPtrSpecializationsByName;
+/// FIFO of specialization names not yet emitted into `internal_functions`.
+/// Drained to a fixpoint in exportContract (transitive specialization
+/// discovery re-enqueues here while draining).
+static thread_local std::deque<std::string> fnPtrSpecializationQueue;
+/// Non-empty ONLY while exporting the body of a specialized sibling: maps
+/// each bound function-typed PARAMETER declaration to its binding, so a
+/// pass-through call (`f(op)` forwarding `op` into `g(op)`) resolves `op` to
+/// the already-bound target instead of failing closed.
+static thread_local std::map<VariableDeclaration const*, FnPtrBinding const*> activeFnPtrBindings;
+/// Per-callee memo: does this FunctionDefinition's body ever WRITE one of
+/// its own function-typed parameters (Assignment LHS, `delete`, or an
+/// inline-assembly external reference)? Populated once per FunctionDefinition
+/// regardless of which specific targets end up bound to it — the check only
+/// depends on the parameter DECLARATIONS, never on the bound targets.
+static thread_local std::map<FunctionDefinition const*, bool> fnPtrCalleeAdmissibleMemo;
 
 // --- `unchecked { }` block signal (SOLCORE_MATH_BUG_CLASSES_PLAN.md §3.5/Task 11) ---
 //
@@ -2101,6 +2175,310 @@ bool isKnownOzSafeCastNarrowingDowncast(FunctionDefinition const& _funcDef, int&
 	return true;
 }
 
+// --- Internal function used as a value: helpers (continued) ---
+//
+// See the thread-local state block above (near `unboundVirtualSlotNames`)
+// for the overall design. Placed here (after `virtualCallTargetName`,
+// `resolveStaticBaseCallTarget`, `exportedFunctionName`,
+// `sanitizeExportNameComponent`) and before `exportExpr`'s definition so
+// every helper this needs is already fully defined, while `exportExpr`
+// itself (used by `lowerInternalCalleeAndArgs` below) only needs its prior
+// forward declaration.
+
+/// The (index, declaration) of every parameter of `_fn` whose type is an
+/// internal function type — i.e. every parameter bounded defunctionalization
+/// can erase from a specialized sibling's signature.
+std::vector<std::pair<size_t, VariableDeclaration const*>> bindableFnPtrParams(FunctionDefinition const& _fn)
+{
+	std::vector<std::pair<size_t, VariableDeclaration const*>> result;
+	auto const& params = _fn.parameters();
+	for (size_t i = 0; i < params.size(); ++i)
+	{
+		auto const* fnType = dynamic_cast<FunctionType const*>(params[i]->annotation().type);
+		if (fnType && fnType->kind() == FunctionType::Kind::Internal)
+			result.emplace_back(i, params[i].get());
+	}
+	return result;
+}
+
+/// True iff none of `_watchedParams` is ever written in `_function`'s body
+/// (Assignment LHS — including tuple-assignment components —, `delete`, or
+/// referenced at all from inline assembly). This is what PROVES the
+/// singleton-target claim rather than assuming it: Solidity function-typed
+/// parameters are ordinary mutable locals, so a reassignment mid-body would
+/// invalidate a binding computed from the call-site argument.
+bool fnPtrParamsNeverWritten(
+	FunctionDefinition const& _function,
+	std::set<VariableDeclaration const*> const& _watchedParams)
+{
+	struct Detector: ASTConstVisitor
+	{
+		std::set<VariableDeclaration const*> const& watched;
+		bool violated = false;
+		explicit Detector(std::set<VariableDeclaration const*> const& _w): watched(_w) {}
+
+		void flagIfWatched(Expression const& _expr)
+		{
+			if (auto const* ident = dynamic_cast<Identifier const*>(&_expr))
+				if (auto const* varDecl = dynamic_cast<VariableDeclaration const*>(ident->annotation().referencedDeclaration))
+					if (watched.count(varDecl))
+						violated = true;
+		}
+		void flagAssignmentTarget(Expression const& _target)
+		{
+			if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_target))
+			{
+				for (auto const& component: tuple->components())
+					if (component)
+						flagAssignmentTarget(*component);
+				return;
+			}
+			flagIfWatched(_target);
+		}
+		bool visit(Assignment const& _assignment) override
+		{
+			flagAssignmentTarget(_assignment.leftHandSide());
+			return true;
+		}
+		bool visit(UnaryOperation const& _unary) override
+		{
+			if (_unary.getOperator() == Token::Delete)
+				flagIfWatched(_unary.subExpression());
+			return true;
+		}
+		bool visit(InlineAssembly const& _asm) override
+		{
+			for (auto const& entry: _asm.annotation().externalReferences)
+				if (auto const* varDecl = dynamic_cast<VariableDeclaration const*>(entry.second.declaration))
+					if (watched.count(varDecl))
+						violated = true;
+			return true;
+		}
+	};
+
+	Detector detector{_watchedParams};
+	_function.body().accept(detector);
+	return !detector.violated;
+}
+
+/// Memoized wrapper around `fnPtrParamsNeverWritten` over ALL of `_function`'s
+/// bindable (function-typed) parameters — the admissibility check for
+/// specializing `_function` at all, independent of which specific targets a
+/// given call site binds.
+bool fnPtrCalleeAdmissible(FunctionDefinition const& _function)
+{
+	auto memoIt = fnPtrCalleeAdmissibleMemo.find(&_function);
+	if (memoIt != fnPtrCalleeAdmissibleMemo.end())
+		return memoIt->second;
+	std::set<VariableDeclaration const*> watched;
+	for (auto const& indexAndDecl: bindableFnPtrParams(_function))
+		watched.insert(indexAndDecl.second);
+	bool admissible = fnPtrParamsNeverWritten(_function, watched);
+	fnPtrCalleeAdmissibleMemo[&_function] = admissible;
+	return admissible;
+}
+
+/// Resolve an argument expression bound to an internal-function-typed
+/// parameter to its ONE statically-known target, or nullptr if the shape is
+/// anything other than a direct internal-function literal or a pass-through
+/// of an already-bound parameter — callers must fail closed on nullptr.
+/// Applies the SAME virtual-resolution rule as `virtualCallTargetName`
+/// (mirrors solc's own codegen: `FunctionDefinition::resolveVirtual` at the
+/// point the pointer value is created).
+FunctionDefinition const* resolveFnPtrArgumentTarget(Expression const& _arg)
+{
+	auto const* ident = dynamic_cast<Identifier const*>(&_arg);
+	if (!ident)
+		return nullptr;
+	Declaration const* referenced = ident->annotation().referencedDeclaration;
+
+	if (auto const* funcDef = dynamic_cast<FunctionDefinition const*>(referenced))
+	{
+		FunctionDefinition const* target = funcDef;
+		if (
+			activeExportContract &&
+			funcDef->isOrdinary() &&
+			!funcDef->name().empty() &&
+			funcDef->virtualSemantics()
+		)
+			target = &funcDef->resolveVirtual(*activeExportContract);
+		if (!target->isOrdinary() || !target->isImplemented())
+			return nullptr;
+		if (target->visibility() == Visibility::External)
+			return nullptr;
+		return target;
+	}
+
+	if (auto const* varDecl = dynamic_cast<VariableDeclaration const*>(referenced))
+	{
+		auto bindingIt = activeFnPtrBindings.find(varDecl);
+		if (bindingIt != activeFnPtrBindings.end())
+			return bindingIt->second->target;
+	}
+
+	return nullptr;
+}
+
+/// The specialized sibling name for `_baseExportedName` bound per
+/// `_bindings` (ascending paramIndex): `<base>` + for each binding
+/// `"__fnptr__" + <param label> + "__" + <sanitized target name>`.
+std::string computeFnPtrSpecializedName(std::string const& _baseExportedName, std::vector<FnPtrBinding> const& _bindings)
+{
+	std::string name = _baseExportedName;
+	for (FnPtrBinding const& binding: _bindings)
+	{
+		std::string paramLabel =
+			binding.param->name().empty() ?
+				("arg" + std::to_string(binding.param->id())) :
+				binding.param->name();
+		name += "__fnptr__" + paramLabel + "__" + sanitizeExportNameComponent(binding.targetExportedName);
+	}
+	return name;
+}
+
+/// Register (memoized) a specialization request, enqueueing it for emission
+/// the first time it is seen. A name collision between two DIFFERENT
+/// (callee, bindings) pairs is an exporter naming-scheme bug — fail closed
+/// rather than silently merge two distinct specializations under one name.
+std::string registerFnPtrSpecialization(
+	FunctionDefinition const& _callee,
+	std::string const& _baseExportedName,
+	std::vector<FnPtrBinding> _bindings)
+{
+	std::string specializedName = computeFnPtrSpecializedName(_baseExportedName, _bindings);
+
+	auto existingIt = fnPtrSpecializationsByName.find(specializedName);
+	if (existingIt != fnPtrSpecializationsByName.end())
+	{
+		FnPtrSpecializationRequest const& existing = existingIt->second;
+		bool same = existing.callee == &_callee && existing.bindings.size() == _bindings.size();
+		for (size_t i = 0; same && i < _bindings.size(); ++i)
+			same =
+				existing.bindings[i].param == _bindings[i].param &&
+				existing.bindings[i].target == _bindings[i].target;
+		if (!same)
+			throw UnsupportedSolCore(
+				"internal-function-value specialization name collision on '" + specializedName +
+				"' between distinct bindings; not modeled.");
+		return specializedName;
+	}
+
+	FnPtrSpecializationRequest request;
+	request.callee = &_callee;
+	request.baseExportedName = _baseExportedName;
+	request.bindings = std::move(_bindings);
+	request.specializedName = specializedName;
+	fnPtrSpecializationsByName.emplace(specializedName, std::move(request));
+	fnPtrSpecializationQueue.push_back(specializedName);
+	return specializedName;
+}
+
+/// Applies the SAME predicate `virtualCallTargetName` uses to decide
+/// whether a plain-identifier internal call requires virtual resolution,
+/// returning the resolved FunctionDefinition (not just its name) so callers
+/// can inspect its parameter list. Kept independent of (rather than
+/// refactoring) `virtualCallTargetName` to avoid any risk of behavior drift
+/// in that already-relied-upon function.
+FunctionDefinition const& resolveInternalCallImplementation(FunctionDefinition const& _funcDef)
+{
+	if (
+		activeExportContract &&
+		_funcDef.isOrdinary() &&
+		!_funcDef.name().empty() &&
+		_funcDef.virtualSemantics()
+	)
+		return _funcDef.resolveVirtual(*activeExportContract);
+	return _funcDef;
+}
+
+/// Shared internal-call lowering helper: computes the callee name to emit
+/// and the (possibly parameter-erased) argument list for a call to
+/// `_resolvedImpl` whose plain (unspecialized) name would be `_plainName`.
+/// Returns `{_plainName, args}` UNCHANGED when `_resolvedImpl` has no
+/// internal-function-typed parameters — the corpus-wide no-op guarantee for
+/// every call site this exporter already knew how to lower.
+std::pair<std::string, Json> lowerInternalCalleeAndArgs(
+	FunctionCall const& _call,
+	FunctionDefinition const& _resolvedImpl,
+	std::string _plainName)
+{
+	std::vector<std::pair<size_t, VariableDeclaration const*>> bindable = bindableFnPtrParams(_resolvedImpl);
+	if (bindable.empty())
+	{
+		Json args = Json::array();
+		for (auto const& arg: _call.arguments())
+			args.emplace_back(exportExpr(*arg));
+		return {std::move(_plainName), std::move(args)};
+	}
+
+	if (!_call.names().empty())
+		throw UnsupportedSolCore(
+			"named-argument call to '" + _plainName + "' passes an internal-function-typed "
+			"parameter; bounded specialization requires positional binding.");
+	if (_call.arguments().size() != _resolvedImpl.parameters().size())
+		throw UnsupportedSolCore(
+			"call to '" + _plainName + "' has an argument-count mismatch against its resolved "
+			"implementation; cannot bind its internal-function-typed parameter(s).");
+	if (!_resolvedImpl.isOrdinary() || !_resolvedImpl.isImplemented())
+		throw UnsupportedSolCore(
+			"internal-function-value specialization of '" + _plainName + "' requires an "
+			"implemented ordinary callee body.");
+	if (!fnPtrCalleeAdmissible(_resolvedImpl))
+		throw UnsupportedSolCore(
+			"an internal-function-typed parameter of '" + _plainName + "' is reassigned (or "
+			"referenced from inline assembly) in its body; bounded specialization requires the "
+			"parameter to be a stable binding for the whole call.");
+
+	std::set<size_t> bindableIndices;
+	for (auto const& indexAndDecl: bindable)
+		bindableIndices.insert(indexAndDecl.first);
+
+	std::vector<FnPtrBinding> bindings;
+	Json args = Json::array();
+	for (size_t i = 0; i < _resolvedImpl.parameters().size(); ++i)
+	{
+		if (!bindableIndices.count(i))
+		{
+			args.emplace_back(exportExpr(*_call.arguments()[i]));
+			continue;
+		}
+		FunctionDefinition const* target = resolveFnPtrArgumentTarget(*_call.arguments()[i]);
+		if (!target)
+			throw UnsupportedSolCore(
+				"internal-function-typed argument #" + std::to_string(i) + " of call to '" +
+				_plainName + "' is not a direct internal function reference; bounded "
+				"specialization requires one statically-known target per site.");
+		FnPtrBinding binding;
+		binding.param = _resolvedImpl.parameters()[i].get();
+		binding.target = target;
+		binding.targetExportedName = exportedFunctionName(*target);
+		binding.paramIndex = i;
+		bindings.push_back(std::move(binding));
+	}
+
+	std::string specializedName = registerFnPtrSpecialization(_resolvedImpl, _plainName, std::move(bindings));
+	return {std::move(specializedName), std::move(args)};
+}
+
+/// RAII guard installing `activeFnPtrBindings` for the duration of exporting
+/// one specialized sibling's body, restoring the previous (normally empty —
+/// specialized bodies are exported top-level, not nested inside another
+/// specialization's export) value on scope exit for exception safety.
+struct FnPtrBindingScope
+{
+	std::map<VariableDeclaration const*, FnPtrBinding const*> saved;
+	explicit FnPtrBindingScope(FnPtrSpecializationRequest const& _request):
+		saved(activeFnPtrBindings)
+	{
+		activeFnPtrBindings.clear();
+		for (FnPtrBinding const& binding: _request.bindings)
+			activeFnPtrBindings[binding.param] = &binding;
+	}
+	~FnPtrBindingScope() { activeFnPtrBindings = saved; }
+	FnPtrBindingScope(FnPtrBindingScope const&) = delete;
+	FnPtrBindingScope& operator=(FnPtrBindingScope const&) = delete;
+};
+
 Json exportExpr(Expression const& _expr)
 {
 	if (auto const* literal = dynamic_cast<Literal const*>(&_expr))
@@ -2309,11 +2687,18 @@ Json exportExpr(Expression const& _expr)
 				"value has no real address representation in the SolCore "
 				"exporter.");
 		// Identifiers that reference function definitions used as values
-		// (internal function pointers) -- not modeled at all.
+		// (internal function pointers) in any NON-ARGUMENT value context
+		// (assignment RHS, return, storage store, comparison, ...). A direct
+		// internal-function literal passed as a call ARGUMENT into an
+		// internal-function-typed parameter is handled separately by
+		// bounded defunctionalization (see lowerInternalCalleeAndArgs,
+		// above exportExpr) and never reaches this fallback; every other
+		// use of a function value remains unmodeled.
 		if (dynamic_cast<FunctionDefinition const*>(identifier->annotation().referencedDeclaration))
 			throw UnsupportedSolCore(
 				"An internal function used as a value (a function pointer) "
-				"is not modeled by the SolCore exporter.");
+				"outside of a direct call-site argument is not modeled by the "
+				"SolCore exporter.");
 		// Identifiers that reference user-defined value type definitions
 		// (e.g. the bare `MyAddress` in `MyAddress.wrap(...)`/`.unwrap(...)`,
 		// used as a value rather than as the base of a wrap/unwrap call).
@@ -3214,16 +3599,20 @@ Json exportExpr(Expression const& _expr)
 			// Internal function call: callee references a FunctionDefinition.
 			// Plain-identifier calls are VIRTUAL dispatch — name the slot
 			// winner, not the lexically referenced declaration (see
-			// virtualCallTargetName).
+			// virtualCallTargetName). Delegates to lowerInternalCalleeAndArgs
+			// for internal-function-typed-parameter specialization (bounded
+			// defunctionalization); byte-for-byte identical output to before
+			// when the callee has no such parameters.
 			auto const* funcDef = dynamic_cast<FunctionDefinition const*>(callee->annotation().referencedDeclaration);
 			if (funcDef)
 			{
+				std::string plainName = virtualCallTargetName(*funcDef);
+				FunctionDefinition const& resolvedImpl = resolveInternalCallImplementation(*funcDef);
+				auto [calleeName, callArgs] = lowerInternalCalleeAndArgs(*call, resolvedImpl, plainName);
 				Json result = Json::object();
 				result["kind"] = "internal_call";
-				result["function"] = virtualCallTargetName(*funcDef);
-				result["args"] = Json::array();
-				for (auto const& arg: call->arguments())
-					result["args"].emplace_back(exportExpr(*arg));
+				result["function"] = std::move(calleeName);
+				result["args"] = std::move(callArgs);
 				return result;
 			}
 		}
@@ -3241,12 +3630,12 @@ Json exportExpr(Expression const& _expr)
 			// GovernorTimelockControl.state's timelock-queue logic).
 			if (auto resolved = resolveStaticBaseCallTarget(*call, *memberAccess, activeExportContract))
 			{
+				std::string plainName = flattenedStaticBaseCallName(*resolved);
+				auto [calleeName, callArgs] = lowerInternalCalleeAndArgs(*call, *resolved->target, plainName);
 				Json result = Json::object();
 				result["kind"] = "internal_call";
-				result["function"] = flattenedStaticBaseCallName(*resolved);
-				result["args"] = Json::array();
-				for (auto const& arg: call->arguments())
-					result["args"].emplace_back(exportExpr(*arg));
+				result["function"] = std::move(calleeName);
+				result["args"] = std::move(callArgs);
 				return result;
 			}
 
@@ -3533,6 +3922,42 @@ Json exportExpr(Expression const& _expr)
 	// Fallback for FunctionCall that doesn't match known patterns
 	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
 	{
+		// Indirect call through an internal-function VALUE (parameter/local):
+		// the callee is a plain identifier whose referencedDeclaration is a
+		// VariableDeclaration of internal FunctionType, NOT a
+		// FunctionDefinition (a direct call to a named function already
+		// matched the FunctionDefinition case earlier in this function and
+		// never reaches here). Before this check, such a call silently
+		// name-punted to a bare `internal_call` using the PARAMETER's own
+		// name (the generic fallback just below) — an accidental fail-open
+		// that would mis-bind to any real function sharing that name.
+		// Inside a specialized sibling's body the pointer resolves via
+		// activeFnPtrBindings (installed by exportFunction for the duration
+		// of that body's export); everywhere else it is genuinely
+		// unresolvable and must fail closed rather than guess.
+		if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
+		{
+			if (auto const* varDecl = dynamic_cast<VariableDeclaration const*>(callee->annotation().referencedDeclaration))
+			{
+				auto const* fnType = dynamic_cast<FunctionType const*>(varDecl->annotation().type);
+				if (fnType && fnType->kind() == FunctionType::Kind::Internal)
+				{
+					auto bindingIt = activeFnPtrBindings.find(varDecl);
+					if (bindingIt == activeFnPtrBindings.end())
+						throw UnsupportedSolCore(
+							"indirect call through an internal function value ('" + callee->name() +
+							"') cannot be resolved to a static target; not modeled.");
+					Json result = Json::object();
+					result["kind"] = "internal_call";
+					result["function"] = bindingIt->second->targetExportedName;
+					result["args"] = Json::array();
+					for (auto const& arg: call->arguments())
+						result["args"].emplace_back(exportExpr(*arg));
+					return result;
+				}
+			}
+		}
+
 		// Generic function call — export as internal_call with best-effort name
 		Json result = Json::object();
 		result["kind"] = "internal_call";
@@ -5365,17 +5790,20 @@ Json exportStmtDispatch(Statement const& _stmt)
 				// Internal function call as statement. Plain-identifier calls
 				// are VIRTUAL dispatch — name the slot winner, not the
 				// lexically referenced declaration (see virtualCallTargetName).
+				// Delegates to lowerInternalCalleeAndArgs — see the comment on
+				// the expression-position case in exportExpr.
 				auto const* funcDef = dynamic_cast<FunctionDefinition const*>(callee->annotation().referencedDeclaration);
 				if (funcDef)
 				{
+					std::string plainName = virtualCallTargetName(*funcDef);
+					FunctionDefinition const& resolvedImpl = resolveInternalCallImplementation(*funcDef);
+					auto [calleeName, callArgs] = lowerInternalCalleeAndArgs(*call, resolvedImpl, plainName);
 					Json result = Json::object();
 					result["kind"] = "expr";
 					Json callExpr = Json::object();
 					callExpr["kind"] = "internal_call";
-					callExpr["function"] = virtualCallTargetName(*funcDef);
-					callExpr["args"] = Json::array();
-					for (auto const& arg: call->arguments())
-						callExpr["args"].emplace_back(exportExpr(*arg));
+					callExpr["function"] = std::move(calleeName);
+					callExpr["args"] = std::move(callArgs);
 					result["value"] = callExpr;
 					return result;
 				}
@@ -5391,14 +5819,14 @@ Json exportStmtDispatch(Statement const& _stmt)
 				// name and emit a self-forward).
 				if (auto resolved = resolveStaticBaseCallTarget(*call, *memberAccess, activeExportContract))
 				{
+					std::string plainName = flattenedStaticBaseCallName(*resolved);
+					auto [calleeName, callArgs] = lowerInternalCalleeAndArgs(*call, *resolved->target, plainName);
 					Json result = Json::object();
 					result["kind"] = "expr";
 					Json callExpr = Json::object();
 					callExpr["kind"] = "internal_call";
-					callExpr["function"] = flattenedStaticBaseCallName(*resolved);
-					callExpr["args"] = Json::array();
-					for (auto const& arg: call->arguments())
-						callExpr["args"].emplace_back(exportExpr(*arg));
+					callExpr["function"] = std::move(calleeName);
+					callExpr["args"] = std::move(callArgs);
 					result["value"] = callExpr;
 					return result;
 				}
@@ -6590,7 +7018,13 @@ Json exportBody(FunctionDefinition const& _function)
 	return body;
 }
 
-Json exportFunction(FunctionDefinition const& _function, ContractDefinition const& _contract, bool _isInternal = false)
+/// `_spec`: when non-null, export a SPECIALIZED sibling of `_function`
+/// instead of its plain form (bounded defunctionalization — see the block
+/// preceding exportExpr's definition): the bound parameters are erased from
+/// the signature, the synthetic name bypasses `exportedFunctionName`, and
+/// `activeFnPtrBindings` is installed for the duration of the body export so
+/// every call through a bound parameter resolves to its static target.
+Json exportFunction(FunctionDefinition const& _function, ContractDefinition const& _contract, bool _isInternal = false, FnPtrSpecializationRequest const* _spec = nullptr)
 {
 	if (!_function.isOrdinary() || !_function.isImplemented())
 		throw UnsupportedSolCore("Only ordinary implemented functions are supported.");
@@ -6598,10 +7032,26 @@ Json exportFunction(FunctionDefinition const& _function, ContractDefinition cons
 		throw UnsupportedSolCore("Only public/external functions are supported.");
 	// Note: multiple return values are exported as a tuple return type.
 
+	std::set<VariableDeclaration const*> boundParams;
+	if (_spec)
+		for (FnPtrBinding const& binding: _spec->bindings)
+			boundParams.insert(binding.param);
+
 	Json result = Json::object();
-	result["name"] = exportedFunctionName(_function);
-	if (result["name"] != (_function.name().empty() ? "_unnamed" : _function.name()))
+	if (_spec)
+	{
+		// Bypasses exportedFunctionName: the same FunctionDefinition can have
+		// MULTIPLE specialized siblings (one per distinct binding tuple), so
+		// there is no single 1:1 name for it to memoize.
+		result["name"] = _spec->specializedName;
 		result["originalName"] = _function.name().empty() ? "_unnamed" : _function.name();
+	}
+	else
+	{
+		result["name"] = exportedFunctionName(_function);
+		if (result["name"] != (_function.name().empty() ? "_unnamed" : _function.name()))
+			result["originalName"] = _function.name().empty() ? "_unnamed" : _function.name();
+	}
 	if (_isInternal)
 		result["visibility"] = "internal";
 	if (!_function.modifiers().empty())
@@ -6609,6 +7059,11 @@ Json exportFunction(FunctionDefinition const& _function, ContractDefinition cons
 	result["params"] = Json::array();
 	for (auto const& parameter: _function.parameters())
 	{
+		if (_spec && boundParams.count(parameter.get()))
+			// Erased from the specialized signature — bound to a static
+			// target instead, resolved inside the body via
+			// activeFnPtrBindings.
+			continue;
 		try
 		{
 			result["params"].emplace_back(exportParam(*parameter));
@@ -6654,11 +7109,46 @@ Json exportFunction(FunctionDefinition const& _function, ContractDefinition cons
 		}
 		result["return"] = tupleType;
 	}
-	result["body"] = exportBody(_function);
+	{
+		// Install activeFnPtrBindings for exactly the duration of this
+		// body's export (RAII; exception-safe) so every call through a
+		// bound function-typed parameter resolves to its static target
+		// instead of hitting the indirect-call fail-closed path.
+		std::optional<FnPtrBindingScope> bindingScope;
+		if (_spec)
+			bindingScope.emplace(*_spec);
+		result["body"] = exportBody(_function);
+	}
 	// Layer 2 (SOL-PLAN-FIDELITY): independent AST write-set cross-check.
 	// Computed even when the body export above succeeded — it is a second
-	// opinion, not just a failure fallback.
+	// opinion, not just a failure fallback. NOTE: not (yet) binding-aware —
+	// an indirect call through a bound function-typed parameter still
+	// degrades to `unknown=true` here exactly as before specialization
+	// existed (see SOLCORE_FNPTR_DEFUNCTIONALIZATION_DESIGN §3.7: a
+	// binding-aware oracle is a precision improvement with NO observable
+	// effect on the current corpus, since every affected callee also has an
+	// independent local-storage-pointer parameter that already forces
+	// `unknown=true`; deferred rather than risking a mistake in this
+	// soundness-critical component for zero corpus-visible benefit today).
 	result["ast_write_oracle"] = astWriteOracleJson(_function, _contract);
+	if (_spec)
+	{
+		// Additive, informational provenance field — purely descriptive,
+		// never consumed for correctness. Bindings are already fully baked
+		// into the specialized body/signature above.
+		Json specInfo = Json::object();
+		specInfo["of"] = _spec->baseExportedName;
+		Json bindingsJson = Json::array();
+		for (FnPtrBinding const& binding: _spec->bindings)
+		{
+			Json b = Json::object();
+			b["param"] = binding.param->name().empty() ? ("arg" + std::to_string(binding.param->id())) : binding.param->name();
+			b["target"] = binding.targetExportedName;
+			bindingsJson.push_back(std::move(b));
+		}
+		specInfo["bindings"] = std::move(bindingsJson);
+		result["fnptr_specialization"] = std::move(specInfo);
+	}
 	return result;
 }
 
@@ -6882,6 +7372,12 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	namespacedMappingFields.clear();
 	exportedFunctionNames.clear();
 	unboundVirtualSlotNames.clear();
+	// Internal-function-used-as-a-value (bounded defunctionalization) state
+	// — see the block preceding exportExpr's definition.
+	fnPtrSpecializationsByName.clear();
+	fnPtrSpecializationQueue.clear();
+	activeFnPtrBindings.clear();
+	fnPtrCalleeAdmissibleMemo.clear();
 
 	std::vector<NamespacedStorageGetter> namespacedGetters;
 	// Scan all functions in the contract hierarchy for namespaced storage getters
@@ -6938,7 +7434,12 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	// 0.2.0: hardened body-export-failure marker ("unsupported_body" instead
 	// of a silently-valid no-op block) + per-function "ast_write_oracle"
 	// (independent AST write-set cross-check; see computeAstWriteOracle).
-	solcore["solcoreVersion"] = "0.2.0";
+	// 0.3.0: internal-function-used-as-a-value support via bounded
+	// defunctionalization (specialized `<name>__fnptr__<param>__<target>`
+	// internal_functions siblings; see the block preceding exportExpr) +
+	// closes the indirect-call-through-a-function-value name-punt fail-open
+	// in the generic FunctionCall fallback.
+	solcore["solcoreVersion"] = "0.3.0";
 	solcore["solidityVersion"] = VersionString;
 	solcore["featureFlags"] = featureFlags();
 	Json metadata = exporterMetadata(_contractName);
@@ -7548,6 +8049,42 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 				// Skip fallback function that causes unexpected errors during export
 			}
 		}
+	}
+
+	// --- Emit specialized siblings discovered while lowering the passes
+	// above (bounded defunctionalization — see the block preceding
+	// exportExpr's definition). Runs to a fixpoint: exporting a specialized
+	// sibling's body can itself enqueue further specializations (transitive
+	// forwarding, e.g. `f(op)` calling `g(op)`). Termination:
+	// fnPtrSpecializationsByName memoizes by name, and the
+	// (callee × binding-tuple) space is finite (drawn from the linearized
+	// hierarchy's own FunctionDefinitions), so a self-recursive
+	// `f(op){ ... f(op) ... }` re-derives the SAME specialized name on its
+	// own recursive call (memo hit) — ordinary self-recursion in the
+	// emitted body, not a new request.
+	//
+	// Deliberately NOT wrapped in try/catch per request (unlike every other
+	// pass above): signature emission cannot throw (param/return export
+	// already falls back to u256 on any failure) and body-export failures
+	// are absorbed by exportBody's own catch-all into "unsupported_body" —
+	// so every queued name is guaranteed to land in internal_functions and
+	// callers never dangle on a missing callee. If exportFunction were ever
+	// to throw here regardless (exporter drift), propagating it up and
+	// failing the WHOLE contract export loudly is the fail-closed choice —
+	// strictly safer than silently dropping a callee a caller's body
+	// already references by name.
+	while (!fnPtrSpecializationQueue.empty())
+	{
+		std::string specializedName = fnPtrSpecializationQueue.front();
+		fnPtrSpecializationQueue.pop_front();
+		if (exportedInternalNames.count(specializedName))
+			continue;
+		auto requestIt = fnPtrSpecializationsByName.find(specializedName);
+		if (requestIt == fnPtrSpecializationsByName.end())
+			continue; // Unreachable in practice: every queued name was just registered alongside its request.
+		FnPtrSpecializationRequest const& request = requestIt->second;
+		internalFunctions.emplace_back(exportFunction(*request.callee, contract, /*_isInternal=*/true, &request));
+		exportedInternalNames.insert(specializedName);
 	}
 
 	// Disambiguate overloaded function names.
