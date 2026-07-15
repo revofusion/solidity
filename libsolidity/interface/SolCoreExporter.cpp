@@ -294,6 +294,32 @@ void tagNarrowArithWidth(Json& _result, Type const* _operationType)
 		_result["bits"] = static_cast<int>(intType->numBits());
 }
 
+// --- Signed declared-width signal for the signed-integer primitives family
+// (SolCore design: "Signed integer comparison, shift, and division
+// primitives") ---
+//
+// Every SolCore value of declared type `intN` is represented at the value
+// level as the full 256-bit sign-extended two's-complement word
+// (`fromSigned` of its mathematical value). Comparisons and `>>` (SAR) are
+// width-independent under this representation (one Lean op serves
+// int8..int256), but division/modulo/checked-or-wrapping add/sub/mul/neg
+// must know the DECLARED width to bound/overflow-check/wrap correctly --
+// exactly the same "operation type is the only sound width source" argument
+// `tagNarrowArithWidth` documents above for unsigned narrow arithmetic.
+// `signedOperationBits` returns the operand width whenever `_type` is a
+// signed `IntegerType`, so callers can select the signed lowering and tag
+// its `"bits"` field; std::nullopt means "not a signed integer operation"
+// (caller keeps the unsigned/status-quo lowering).
+std::optional<unsigned> signedOperationBits(Type const* _type)
+{
+	if (!_type || _type->category() != Type::Category::Integer)
+		return std::nullopt;
+	auto const* intType = dynamic_cast<IntegerType const*>(_type);
+	if (intType && intType->isSigned())
+		return intType->numBits();
+	return std::nullopt;
+}
+
 std::string exportedFunctionName(FunctionDefinition const& _function);
 
 template <class F>
@@ -515,6 +541,14 @@ Json featureFlags()
 	// between genuine 256-bit arithmetic and mis-modeled narrow arithmetic,
 	// and consumers that need the distinction must treat them as stale.
 	flags["arithWidths"] = true;
+	// Signed integer comparison/shift/div/mod/add/sub/mul/neg/signextend
+	// vocabulary (i256_lt/le/gt/ge/sar/div/mod/add/sub/mul/neg,
+	// signextend). Distinct `i256_*`/`signextend` kinds, never a flag on
+	// the old `u256_*` kinds -- an old (pre-this-flag) frontend fails
+	// closed on the new kinds via its existing unknown-kind `Parse_error`
+	// path, so this flag is purely informational for consumers that want
+	// to detect artifacts carrying the new vocabulary.
+	flags["signedOps"] = true;
 	return flags;
 }
 
@@ -2533,11 +2567,19 @@ Json exportExpr(Expression const& _expr)
 								Json result = Json::object();
 								if (intType->isSigned())
 								{
+									// `i256` literals carry the canonical
+									// two's-complement WORD (digits-only,
+									// < 2^256), never a signed decimal --
+									// `IntegerType::min()`/`max()` already
+									// apply `s2u` for signed types (see
+									// Types.cpp), so use those instead of
+									// the raw signed `minValue()`/
+									// `maxValue()` bigints.
 									result["kind"] = "i256";
 									if (memberAccess->memberName() == "min")
-										result["value"] = intType->minValue().str();
+										result["value"] = intType->min().str();
 									else
-										result["value"] = intType->maxValue().str();
+										result["value"] = intType->max().str();
 								}
 								else
 								{
@@ -2813,15 +2855,17 @@ Json exportExpr(Expression const& _expr)
 		// shifted, so `commonType` doesn't reflect the signedness that
 		// matters for `>>`; the left operand's own type does.
 		//
-		// There is no signed counterpart of `u256_div`/`u256_mod`/`u256_lt`/
-		// `u256_le`/`u256_gt`/`u256_ge`/`u256_shr` that the OCaml frontend
-		// and Lean runtime can consume yet (seeing one of these `kind`s
-		// with a signed operand would previously produce a false, silently
-		// wrong preservation certificate downstream). Until that signed
-		// vocabulary exists end-to-end, fail closed here -- via the same
-		// `UnsupportedSolCore` -> `unsupported_body` mechanism used
-		// throughout this file -- instead of manufacturing a certificate
-		// over the wrong semantics.
+		// SolCore design "Signed integer comparison, shift, and division
+		// primitives" landed the signed counterparts
+		// (`i256_lt`/`le`/`gt`/`ge`/`div`/`mod`/`sar`, plus the
+		// declared-width `i256_add`/`sub`/`mul`/`neg` family and
+		// `signextend`) that the OCaml frontend and Lean runtime now
+		// consume end-to-end: every one of these operators routes to its
+		// signed counterpart when the operand type is a signed integer,
+		// closing the fail-open gap this comment used to describe. Signed
+		// `**` (`Token::Exp`) and narrow signed `<<` still have no
+		// faithful lowering and remain fail-closed (see their cases
+		// below).
 		auto isSignedIntegerType = [](Type const* _type) -> bool {
 			if (!_type || _type->category() != Type::Category::Integer)
 				return false;
@@ -2832,39 +2876,80 @@ Json exportExpr(Expression const& _expr)
 		switch (binary->getOperator())
 		{
 		case Token::Add:
-			result["kind"] = "u256_add";
-			markUncheckedContext(result);
-			tagNarrowArithWidth(result, binary->annotation().commonType);
+			if (auto bits = signedOperationBits(binary->annotation().commonType))
+			{
+				result["kind"] = "i256_add";
+				result["bits"] = static_cast<int>(*bits);
+				markUncheckedContext(result);
+			}
+			else
+			{
+				result["kind"] = "u256_add";
+				markUncheckedContext(result);
+				tagNarrowArithWidth(result, binary->annotation().commonType);
+			}
 			break;
 		case Token::Sub:
-			result["kind"] = "u256_sub";
-			markUncheckedContext(result);
-			tagNarrowArithWidth(result, binary->annotation().commonType);
+			if (auto bits = signedOperationBits(binary->annotation().commonType))
+			{
+				result["kind"] = "i256_sub";
+				result["bits"] = static_cast<int>(*bits);
+				markUncheckedContext(result);
+			}
+			else
+			{
+				result["kind"] = "u256_sub";
+				markUncheckedContext(result);
+				tagNarrowArithWidth(result, binary->annotation().commonType);
+			}
 			break;
 		case Token::Mul:
-			result["kind"] = "u256_mul";
-			markUncheckedContext(result);
-			tagNarrowArithWidth(result, binary->annotation().commonType);
+			if (auto bits = signedOperationBits(binary->annotation().commonType))
+			{
+				result["kind"] = "i256_mul";
+				result["bits"] = static_cast<int>(*bits);
+				markUncheckedContext(result);
+			}
+			else
+			{
+				result["kind"] = "u256_mul";
+				markUncheckedContext(result);
+				tagNarrowArithWidth(result, binary->annotation().commonType);
+			}
 			break;
 		case Token::Div:
-			if (isSignedIntegerType(binary->annotation().commonType))
-				throw UnsupportedSolCore(
-					"Signed division ('/' on a signed integer type) has no "
-					"faithful SolCore lowering yet; the unsigned u256_div "
-					"primitive would silently produce the wrong result "
-					"whenever an operand is negative.");
-			result["kind"] = "u256_div";
+			if (auto bits = signedOperationBits(binary->annotation().commonType))
+			{
+				result["kind"] = "i256_div";
+				result["bits"] = static_cast<int>(*bits);
+				// The unchecked flag matters here: SDIV(min, -1) reverts in
+				// checked context but wraps to `min` in `unchecked { }`.
+				markUncheckedContext(result);
+			}
+			else
+				result["kind"] = "u256_div";
 			break;
 		case Token::Mod:
-			if (isSignedIntegerType(binary->annotation().commonType))
-				throw UnsupportedSolCore(
-					"Signed modulo ('%' on a signed integer type) has no "
-					"faithful SolCore lowering yet; the unsigned u256_mod "
-					"primitive would silently produce the wrong result "
-					"whenever an operand is negative.");
-			result["kind"] = "u256_mod";
+			if (auto bits = signedOperationBits(binary->annotation().commonType))
+			{
+				result["kind"] = "i256_mod";
+				result["bits"] = static_cast<int>(*bits);
+				// SMOD has no overflow case (min tmod -1 = 0), so checked and
+				// unchecked coincide: emit one op, ignore `unchecked { }`.
+			}
+			else
+				result["kind"] = "u256_mod";
 			break;
 		case Token::Exp:
+			// Signed `**` has no faithful SolCore lowering yet (the base's
+			// sign interacts with the exponent in ways the unsigned
+			// u256_exp primitive does not model); zero corpus need as of
+			// this writing, so fail closed rather than silently keep the
+			// (wrong) unsigned lowering.
+			if (isSignedIntegerType(binary->annotation().commonType))
+				throw UnsupportedSolCore(
+					"Signed exponentiation ('**' on a signed integer type) "
+					"has no faithful SolCore lowering yet.");
 			result["kind"] = "u256_exp";
 			break;
 		case Token::Equal:
@@ -2874,40 +2959,16 @@ Json exportExpr(Expression const& _expr)
 			result["kind"] = "u256_ne";
 			break;
 		case Token::LessThan:
-			if (isSignedIntegerType(binary->annotation().commonType))
-				throw UnsupportedSolCore(
-					"Signed comparison ('<' on a signed integer type) has "
-					"no faithful SolCore lowering yet; the unsigned "
-					"u256_lt primitive silently flips the result whenever "
-					"an operand is negative.");
-			result["kind"] = "u256_lt";
+			result["kind"] = isSignedIntegerType(binary->annotation().commonType) ? "i256_lt" : "u256_lt";
 			break;
 		case Token::LessThanOrEqual:
-			if (isSignedIntegerType(binary->annotation().commonType))
-				throw UnsupportedSolCore(
-					"Signed comparison ('<=' on a signed integer type) has "
-					"no faithful SolCore lowering yet; the unsigned "
-					"u256_le primitive silently flips the result whenever "
-					"an operand is negative.");
-			result["kind"] = "u256_le";
+			result["kind"] = isSignedIntegerType(binary->annotation().commonType) ? "i256_le" : "u256_le";
 			break;
 		case Token::GreaterThan:
-			if (isSignedIntegerType(binary->annotation().commonType))
-				throw UnsupportedSolCore(
-					"Signed comparison ('>' on a signed integer type) has "
-					"no faithful SolCore lowering yet; the unsigned "
-					"u256_gt primitive silently flips the result whenever "
-					"an operand is negative.");
-			result["kind"] = "u256_gt";
+			result["kind"] = isSignedIntegerType(binary->annotation().commonType) ? "i256_gt" : "u256_gt";
 			break;
 		case Token::GreaterThanOrEqual:
-			if (isSignedIntegerType(binary->annotation().commonType))
-				throw UnsupportedSolCore(
-					"Signed comparison ('>=' on a signed integer type) has "
-					"no faithful SolCore lowering yet; the unsigned "
-					"u256_ge primitive silently flips the result whenever "
-					"an operand is negative.");
-			result["kind"] = "u256_ge";
+			result["kind"] = isSignedIntegerType(binary->annotation().commonType) ? "i256_ge" : "u256_ge";
 			break;
 		case Token::And:
 			result["kind"] = "bool_and";
@@ -2925,16 +2986,20 @@ Json exportExpr(Expression const& _expr)
 			result["kind"] = "u256_bitxor";
 			break;
 		case Token::SHL:
+			// Narrow signed `<<` would need truncate-then-signextend the
+			// current model lacks; fail closed. int256 `<<` (and every
+			// unsigned width, narrow or not -- a separate, pre-existing
+			// hole left as-is) stays the plain full-word u256_shl.
+			if (auto bits = signedOperationBits(binary->annotation().commonType))
+				if (*bits < 256)
+					throw UnsupportedSolCore(
+						"Narrow signed left shift ('<<' on a signed integer "
+						"type narrower than 256 bits) has no faithful "
+						"SolCore lowering yet.");
 			result["kind"] = "u256_shl";
 			break;
 		case Token::SAR:
-			if (isSignedIntegerType(binary->leftExpression().annotation().type))
-				throw UnsupportedSolCore(
-					"Signed right shift ('>>' on a signed integer type) "
-					"has no faithful SolCore lowering yet; the logical-"
-					"shift u256_shr primitive silently drops sign "
-					"extension for negative values.");
-			result["kind"] = "u256_shr";
+			result["kind"] = isSignedIntegerType(binary->leftExpression().annotation().type) ? "i256_sar" : "u256_shr";
 			break;
 		default:
 			throw UnsupportedSolCore("Unsupported binary operator in SolCore exporter.");
@@ -2980,14 +3045,50 @@ Json exportExpr(Expression const& _expr)
 			return exportHoistedUnaryMutation(*unary);
 		case Token::Sub:
 		{
-			result["kind"] = "u256_sub";
-			markUncheckedContext(result);
-			Json zero = Json::object();
-			zero["kind"] = "u256";
-			zero["value"] = "0";
-			result["lhs"] = zero;
-			result["rhs"] = exportExpr(unary->subExpression());
-			return result;
+			// Per >=0.8 typing, unary minus is only well-typed on signed
+			// integers or on a compile-time rational constant (which the
+			// type checker folds to a RationalNumberType, e.g. the whole
+			// `-59` in `int256 constant FOO = -59;`). The old `u256_sub(0,
+			// x)` lowering treated every site as full-word unsigned
+			// subtraction -- spuriously reverting the model for any
+			// positive x (0 - x underflows unsigned) even though the real
+			// EVM operation (signed two's-complement negation) never
+			// reverts except at INT_MIN. Route constant folds to a
+			// canonical `i256` literal and everything else to the
+			// declared-width `i256_neg` primitive; anything reaching
+			// neither branch is not a real >=0.8 program shape, so fail
+			// closed instead of re-deriving the old wrong lowering.
+			if (
+				unary->annotation().type &&
+				unary->annotation().type->category() == Type::Category::RationalNumber
+			)
+			{
+				auto const* rationalType = dynamic_cast<RationalNumberType const*>(unary->annotation().type);
+				if (rationalType && !rationalType->isFractional())
+				{
+					bigint const value = rationalType->value().numerator();
+					bigint const minS256 = -(bigint(1) << 255);
+					bigint const maxS256Exclusive = bigint(1) << 255;
+					if (value < minS256 || value >= maxS256Exclusive)
+						throw UnsupportedSolCore(
+							"Constant-folded unary minus produced a value "
+							"outside the int256 range.");
+					result["kind"] = "i256";
+					result["value"] = s2u(s256(value)).str();
+					return result;
+				}
+			}
+			if (auto bits = signedOperationBits(unary->annotation().type))
+			{
+				result["kind"] = "i256_neg";
+				result["bits"] = static_cast<int>(*bits);
+				markUncheckedContext(result);
+				result["operand"] = exportExpr(unary->subExpression());
+				return result;
+			}
+			throw UnsupportedSolCore(
+				"Unary minus on a non-constant, non-signed-integer operand "
+				"has no faithful SolCore lowering.");
 		}
 		default:
 			throw UnsupportedSolCore("Unsupported unary operator in SolCore exporter.");
@@ -3069,13 +3170,45 @@ Json exportExpr(Expression const& _expr)
 			{
 				auto const* targetInt = dynamic_cast<IntegerType const*>(targetType);
 				auto const* sourceInt = dynamic_cast<IntegerType const*>(sourceType);
-				if (targetInt && sourceInt && targetInt->numBits() < sourceInt->numBits())
+				if (targetInt && sourceInt)
 				{
-					Json result = Json::object();
-					result["kind"] = "truncate";
-					result["target_bits"] = static_cast<int>(targetInt->numBits());
-					result["value"] = innerJson;
-					return result;
+					// Signedness-aware conversion matrix (SolCore design:
+					// "Signed integer comparison, shift, and division
+					// primitives" §4.3). Every SolCore intN value is the
+					// full 256-bit SIGN-EXTENDED word (see
+					// `signedOperationBits`'s doc comment above), so a
+					// narrowing conversion TO a signed type needs
+					// `signextend`, never `truncate` -- the old
+					// width-only rule silently mod-truncated signed
+					// downcasts (e.g. `int128(value)`), which is wrong
+					// for any negative or >= 2^127 input. Solidity only
+					// allows an explicit int/uint conversion when the
+					// width matches OR the signedness matches (never
+					// both differing at once -- see
+					// `IntegerType::isExplicitlyConvertibleTo`), so this
+					// matrix is exhaustive: every remaining case (widening,
+					// same type, or a 256-bit sign-only conversion) is a
+					// pass-through under the invariant.
+					bool const narrowing = targetInt->numBits() < sourceInt->numBits();
+					bool const sameWidth = targetInt->numBits() == sourceInt->numBits();
+					bool const sameSign = targetInt->isSigned() == sourceInt->isSigned();
+					bool const target256 = targetInt->numBits() == 256;
+					if ((sameSign && narrowing) || (!sameSign && sameWidth && !target256))
+					{
+						Json result = Json::object();
+						if (targetInt->isSigned())
+						{
+							result["kind"] = "signextend";
+							result["bits"] = static_cast<int>(targetInt->numBits());
+						}
+						else
+						{
+							result["kind"] = "truncate";
+							result["target_bits"] = static_cast<int>(targetInt->numBits());
+						}
+						result["value"] = innerJson;
+						return result;
+					}
 				}
 			}
 			return innerJson;
@@ -3829,33 +3962,79 @@ Json expandModifiers(FunctionDefinition const& _function, Json _body)
 Json compoundAssignmentValue(Token _op, Type const* _lhsType, Json const& _current, Json const& _rhsJson)
 {
 	Json value = Json::object();
+	// Compound assignment operates at the assigned expression's own type
+	// (`a += b` is `a = a + b` at type(a)); the type checker guarantees `b`
+	// is implicitly convertible to it. This was previously the ONLY
+	// signedness check missing from the whole signed-arithmetic family
+	// (SolCore design §3-2): every signed `+=`/`-=`/`*=`/`/=`/`%=`/`>>=`
+	// exported as an unsigned op with no width tag at all -- fail-open, not
+	// fail-closed. `signedOperationBits` closes that gap the same way it
+	// closes it for the `BinaryOperation` switch above.
+	auto bits = signedOperationBits(_lhsType);
 	switch (_op)
 	{
 	case Token::Assign:
 		return _rhsJson;
 	case Token::AssignAdd:
-		value["kind"] = "u256_add";
-		markUncheckedContext(value);
-		// Compound assignment operates at the assigned expression's own
-		// type (`a += b` is `a = a + b` at type(a)); the type checker
-		// guarantees `b` is implicitly convertible to it.
-		tagNarrowArithWidth(value, _lhsType);
+		if (bits)
+		{
+			value["kind"] = "i256_add";
+			value["bits"] = static_cast<int>(*bits);
+			markUncheckedContext(value);
+		}
+		else
+		{
+			value["kind"] = "u256_add";
+			markUncheckedContext(value);
+			tagNarrowArithWidth(value, _lhsType);
+		}
 		break;
 	case Token::AssignSub:
-		value["kind"] = "u256_sub";
-		markUncheckedContext(value);
-		tagNarrowArithWidth(value, _lhsType);
+		if (bits)
+		{
+			value["kind"] = "i256_sub";
+			value["bits"] = static_cast<int>(*bits);
+			markUncheckedContext(value);
+		}
+		else
+		{
+			value["kind"] = "u256_sub";
+			markUncheckedContext(value);
+			tagNarrowArithWidth(value, _lhsType);
+		}
 		break;
 	case Token::AssignMul:
-		value["kind"] = "u256_mul";
-		markUncheckedContext(value);
-		tagNarrowArithWidth(value, _lhsType);
+		if (bits)
+		{
+			value["kind"] = "i256_mul";
+			value["bits"] = static_cast<int>(*bits);
+			markUncheckedContext(value);
+		}
+		else
+		{
+			value["kind"] = "u256_mul";
+			markUncheckedContext(value);
+			tagNarrowArithWidth(value, _lhsType);
+		}
 		break;
 	case Token::AssignDiv:
-		value["kind"] = "u256_div";
+		if (bits)
+		{
+			value["kind"] = "i256_div";
+			value["bits"] = static_cast<int>(*bits);
+			markUncheckedContext(value);
+		}
+		else
+			value["kind"] = "u256_div";
 		break;
 	case Token::AssignMod:
-		value["kind"] = "u256_mod";
+		if (bits)
+		{
+			value["kind"] = "i256_mod";
+			value["bits"] = static_cast<int>(*bits);
+		}
+		else
+			value["kind"] = "u256_mod";
 		break;
 	case Token::AssignBitAnd:
 		value["kind"] = "u256_bitand";
@@ -3867,10 +4046,13 @@ Json compoundAssignmentValue(Token _op, Type const* _lhsType, Json const& _curre
 		value["kind"] = "u256_bitxor";
 		break;
 	case Token::AssignShl:
+		if (bits && *bits < 256)
+			throw UnsupportedSolCore(
+				"Narrow signed '<<=' has no faithful SolCore lowering yet.");
 		value["kind"] = "u256_shl";
 		break;
 	case Token::AssignSar:
-		value["kind"] = "u256_shr";
+		value["kind"] = bits ? "i256_sar" : "u256_shr";
 		break;
 	default:
 		throw UnsupportedSolCore("Unsupported assignment operator in SolCore exporter.");
@@ -4403,17 +4585,40 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 Json mutationValue(Json const& _current, Token _op, Type const* _targetType)
 {
 	Json result = Json::object();
+	// `++`/`--` are the same "silently unsigned" bug class as compound
+	// assignment (SolCore design §3-2): they share none of
+	// `compoundAssignmentValue`'s logic (this is a sibling function, not a
+	// caller of it), so the signedness check has to be repeated here too.
+	auto bits = signedOperationBits(_targetType);
 	switch (_op)
 	{
 	case Token::Inc:
-		result["kind"] = "u256_add";
-		markUncheckedContext(result);
-		tagNarrowArithWidth(result, _targetType);
+		if (bits)
+		{
+			result["kind"] = "i256_add";
+			result["bits"] = static_cast<int>(*bits);
+			markUncheckedContext(result);
+		}
+		else
+		{
+			result["kind"] = "u256_add";
+			markUncheckedContext(result);
+			tagNarrowArithWidth(result, _targetType);
+		}
 		break;
 	case Token::Dec:
-		result["kind"] = "u256_sub";
-		markUncheckedContext(result);
-		tagNarrowArithWidth(result, _targetType);
+		if (bits)
+		{
+			result["kind"] = "i256_sub";
+			result["bits"] = static_cast<int>(*bits);
+			markUncheckedContext(result);
+		}
+		else
+		{
+			result["kind"] = "u256_sub";
+			markUncheckedContext(result);
+			tagNarrowArithWidth(result, _targetType);
+		}
 		break;
 	default:
 		throw UnsupportedSolCore("Expected ++ or -- unary mutation.");
