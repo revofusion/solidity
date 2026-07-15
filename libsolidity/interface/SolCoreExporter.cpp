@@ -827,6 +827,11 @@ Json featureFlags()
 	// path, so this flag is purely informational for consumers that want
 	// to detect artifacts carrying the new vocabulary.
 	flags["signedOps"] = true;
+	// msg.sig support: the exported CallEnv decl carries an 8th field,
+	// `msgSig` (u256, right-aligned 4-byte selector of the current call
+	// frame). Artifacts without this flag predate the field and have the
+	// pre-existing 6/7-field CallEnv shape.
+	flags["msgSig"] = true;
 	return flags;
 }
 
@@ -1824,6 +1829,8 @@ std::string runtimeFieldForMagicMember(std::string const& _base, std::string con
 			return "msgValue";
 		if (_member == "data")
 			return "calldata";
+		if (_member == "sig")
+			return "msgSig";
 	}
 	if (_base == "block")
 	{
@@ -9027,6 +9034,12 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 		calldataType["element"] = "u8";
 		callEnvFields.emplace_back(Json{{"name", "calldata"}, {"type", calldataType}});
 	}
+	// msg.sig: the 4-byte function selector of the current call frame,
+	// modeled as a right-aligned numeric u256 (same convention as
+	// `.selector` / `type(I).interfaceId`, NOT the left-shifted bytes4
+	// word). Must stay last (after calldata) to match the frontend's
+	// ordered-field canonical-CallEnv acceptance.
+	callEnvFields.emplace_back(Json{{"name", "msgSig"}, {"type", "u256"}});
 	typeDecls.emplace_back(runtimeTypeDecl("CallEnv", std::move(callEnvFields)));
 	Json worldStateFields = Json::array();
 	worldStateFields.emplace_back(Json{{"name", "contractBalance"}, {"type", "u256"}});
