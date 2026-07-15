@@ -3968,7 +3968,22 @@ Json exportExpr(Expression const& _expr)
 			if (auto const* funcDef = dynamic_cast<FunctionDefinition const*>(memberAccess->annotation().referencedDeclaration))
 				result["function"] = exportedFunctionName(*funcDef);
 			else
+			{
+				// Same fail-open class as the identifier-callee guard above,
+				// through a MEMBER access instead: a call through an
+				// internal-function-typed member (e.g. a function pointer
+				// stored in a struct field, `s.f(...)`) used to name-punt to
+				// the bare member name — silently mis-binding to any real
+				// internal function sharing that name. There is no static
+				// target to resolve here (member function pointers are never
+				// specialization-bound), so fail closed.
+				auto const* memberFnType = dynamic_cast<FunctionType const*>(memberAccess->annotation().type);
+				if (memberFnType && memberFnType->kind() == FunctionType::Kind::Internal)
+					throw UnsupportedSolCore(
+						"indirect call through an internal function value ('" + memberAccess->memberName() +
+						"', a member access) cannot be resolved to a static target; not modeled.");
 				result["function"] = memberAccess->memberName();
+			}
 		}
 		else
 			result["function"] = "unknown_call";
@@ -8084,8 +8099,19 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	{
 		std::string specializedName = fnPtrSpecializationQueue.front();
 		fnPtrSpecializationQueue.pop_front();
+		// Each name is enqueued exactly once (registerFnPtrSpecialization
+		// enqueues only on first registration) and nothing before this drain
+		// emits specializations — so a hit here can only mean a USER-DEFINED
+		// internal function is literally named like this specialization.
+		// Skipping emission would silently bind every rewritten call site to
+		// that unrelated same-named function (a silent mis-bind, the exact
+		// fail-open class this feature closes); merging is equally wrong.
+		// Fail the whole export loudly instead.
 		if (exportedInternalNames.count(specializedName))
-			continue;
+			throw UnsupportedSolCore(
+				"internal-function-value specialization name '" + specializedName +
+				"' collides with an already-exported internal function of the same name; "
+				"refusing to bind rewritten call sites to an unrelated definition.");
 		auto requestIt = fnPtrSpecializationsByName.find(specializedName);
 		if (requestIt == fnPtrSpecializationsByName.end())
 			continue; // Unreachable in practice: every queued name was just registered alongside its request.

@@ -2451,6 +2451,113 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_named_argument_call_fails_closed)
 		"a named-argument call binding a fn-ptr parameter must fail closed with the precise message");
 }
 
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_specialized_name_collision_fails_closed)
+{
+	// T9 (adversarial: a USER-DEFINED internal function is literally named
+	// like the synthesized specialization). Emitting the specialization
+	// under that name would merge two distinct definitions; SKIPPING it
+	// would silently bind bump()'s rewritten call site to the unrelated
+	// decoy (same arity!) — a silent mis-bind. The only sound outcome is a
+	// loud failure of the whole contract export: the throw is absorbed by
+	// the whole-contract unsupportedExport wrapper into a structured
+	// `{"unsupported": true, "reason": ...}` stub naming the collision.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract T9Collision {
+					function bump(uint256 x) external pure returns (uint256) {
+						return _apply(_add, x);
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x) private pure returns (uint256) {
+						return op(x);
+					}
+					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
+					// Decoy: exactly the name the specialization would get, same
+					// arity as the rewritten call site.
+					function _apply__fnptr__op___add(uint256 y) private pure returns (uint256) { return 666; }
+					function decoyKeepAlive(uint256 y) external pure returns (uint256) {
+						return _apply__fnptr__op___add(y);
+					}
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "T9Collision");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE_MESSAGE(
+		solcore.value("unsupported", false),
+		"a specialization-name collision with a user-defined function must fail the whole "
+		"contract export closed, never silently skip or merge the specialization");
+	std::string reason = solcore.value("reason", std::string{});
+	BOOST_CHECK_MESSAGE(
+		reason.find("specialization name") != std::string::npos &&
+			reason.find("collides") != std::string::npos,
+		"the structured rejection must name the colliding specialization; got: " + reason);
+	// Regression pin: no partial artifact — a mis-bound bump() must never be
+	// emitted alongside (or instead of) the refused specialization.
+	BOOST_CHECK(!solcore.contains("functions"));
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_struct_member_indirect_call_fails_closed)
+{
+	// T10 (adversarial: function pointer stored in a struct field, called
+	// through MEMBER access). The identifier-callee guard cannot see this
+	// shape; before the member-access guard, `s.f(x, 1)` name-punted to a
+	// bare internal_call "f" — mis-binding to the unrelated real internal
+	// function `f` (multiply) below. Both the store (`arm`) and the call
+	// (`callIt`) must fail closed.
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore"}),
+		SolidityCode({
+			{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract T10Member {
+					struct S { function(uint256, uint256) internal pure returns (uint256) f; }
+					S internal s;
+					uint256 public acc;
+					function _add(uint256 a, uint256 b) internal pure returns (uint256) { return a + b; }
+					function f(uint256 a, uint256 b) internal pure returns (uint256) { return a * b; }
+					function keepAlive(uint256 a) external pure returns (uint256) { return f(a, 2); }
+					function arm() external { s.f = _add; }
+					function callIt(uint256 x) external returns (uint256) { acc = s.f(x, 1); return acc; }
+				}
+			)"}
+		})
+	);
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "T10Member");
+	Json const& solcore = contractResult["solcore"];
+
+	Json const* callIt = findExportedFunction(solcore["functions"], "callIt");
+	BOOST_REQUIRE(callIt != nullptr);
+	BOOST_CHECK_EQUAL(callIt->at("body")["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_MESSAGE(
+		callIt->at("body")["error"].get<std::string>().find("member access") != std::string::npos,
+		"an indirect call through a struct-member function pointer must fail closed, "
+		"never name-punt to the bare member name");
+	// Regression pin: the old behavior emitted internal_call "f" here, which
+	// would have silently bound to the real (multiplying) internal `f`.
+	BOOST_CHECK_EQUAL(callIt->at("body").dump().find("\"function\":\"f\""), std::string::npos);
+
+	Json const* arm = findExportedFunction(solcore["functions"], "arm");
+	BOOST_REQUIRE(arm != nullptr);
+	BOOST_CHECK_EQUAL(arm->at("body")["kind"].get<std::string>(), "unsupported_body");
+}
+
 BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
 {
 	Json input = generateStandardJson(
