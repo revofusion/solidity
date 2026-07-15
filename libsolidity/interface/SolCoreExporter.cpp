@@ -20,6 +20,7 @@
 
 #include <libsolidity/ast/AST.h>
 #include <libsolidity/ast/ASTAnnotations.h>
+#include <libsolidity/analysis/ConstantEvaluator.h>
 #include <libsolidity/interface/Version.h>
 
 #include <liblangutil/Token.h>
@@ -476,6 +477,202 @@ struct NamespacedStorageScope
 };
 
 // --- End namespaced storage infrastructure ---
+
+// --- General local storage-reference-variable alias tracking (Phase 1a) ---
+//
+// Generalizes the ERC-7201 namespaced-alias mechanism above (which only
+// handles `X storage $ = _getXStorage();`, keyed by NAME, prefix-only, no
+// dynamic keys) to the general Solidity pattern `T storage x = <storage
+// lvalue>;` where `<storage lvalue>` may thread through mapping/array
+// indices and struct-field chains. See documentation/... design doc
+// "General Local Storage-Reference-Variable Alias Tracking" §3.
+//
+// Keyed by VariableDeclaration* (not name) to avoid the shadowing hazard the
+// legacy namespacedStorageAliases string map carries; that map's own
+// behavior is left completely untouched by this section.
+struct StorageRefStep
+{
+	enum class Kind { Field, MappingKey, ArrayIndex } kind;
+	std::string field;   ///< Kind::Field: struct member / flattened field name.
+	std::string keyTemp; ///< Kind::MappingKey / ArrayIndex: snapshot temp local name.
+};
+
+struct StorageRefTarget
+{
+	std::string root;                  ///< Storage field name the alias is rooted at.
+	std::vector<StorageRefStep> steps; ///< Access steps in order, outermost first.
+};
+
+/// Tracked, RESOLVED storage-ref aliases for the function currently being
+/// exported. Presence in this map means "safe to substitute at every use
+/// site in this function" — see the deviation note below for why this
+/// implementation does not additionally need a POISONED tri-state.
+///
+/// Deviation from the design doc's §3.1/§3.4: the design specifies a
+/// flow-sensitive analysis with an `optional<StorageRefTarget>` value
+/// (nullopt = "poisoned": bound then invalidated by a conditional/loop
+/// rebind) plus per-branch join rules and a loop pre-scan. This
+/// implementation instead performs one whole-function conservative
+/// pre-pass (StorageRefRebindScanner, below) that finds every storage-
+/// located local ever reassigned via a bare-identifier Assignment ANYWHERE
+/// in the function (straight-line, in a branch, or in a loop) and simply
+/// never registers such a variable as trackable at all. This is strictly
+/// MORE conservative than the design's flow-sensitive join/poison rules
+/// (it refuses tracking for some straight-line-safe rebind patterns the
+/// fuller design would accept), but it is sound by the same argument
+/// (§3.6's fallback policy: an untracked bind falls through to today's
+/// status-quo copy-`let` lowering, which is unchanged behavior) and is
+/// much simpler to implement and audit correctly. None of the concrete
+/// cited instances in the design rely on tracking through a rebind, so
+/// this narrowing does not affect the capability's headline cases.
+static thread_local std::map<VariableDeclaration const*, StorageRefTarget> storageRefAliasTargets;
+
+/// Whole-function pre-pass result: storage-located locals that are REBOUND
+/// (reassigned via a bare-identifier Assignment) somewhere in the function
+/// and must therefore never be registered in storageRefAliasTargets (see
+/// the deviation note above).
+static thread_local std::set<VariableDeclaration const*> storageRefNeverTrack;
+
+/// RAII: save/clear/restore storageRefAliasTargets and storageRefNeverTrack
+/// around one function's export, mirroring NamespacedStorageScope's idiom.
+struct StorageRefAliasScope
+{
+	std::map<VariableDeclaration const*, StorageRefTarget> savedTargets;
+	std::set<VariableDeclaration const*> savedNeverTrack;
+	StorageRefAliasScope()
+	{
+		savedTargets = storageRefAliasTargets;
+		savedNeverTrack = storageRefNeverTrack;
+		storageRefAliasTargets.clear();
+		storageRefNeverTrack.clear();
+	}
+	~StorageRefAliasScope()
+	{
+		storageRefAliasTargets = savedTargets;
+		storageRefNeverTrack = savedNeverTrack;
+	}
+};
+
+/// Pre-pass: find every storage-located local rebound via a bare-identifier
+/// Assignment anywhere in a function body. Run once per function BEFORE
+/// exportStmt walks it, so bind-site resolution (below) can consult the
+/// result and simply skip tracking for such variables.
+struct StorageRefRebindScanner: ASTConstVisitor
+{
+	std::set<VariableDeclaration const*> neverTrack;
+
+	void noteIfStorageRefRebind(Expression const& _target)
+	{
+		if (auto const* ident = dynamic_cast<Identifier const*>(&_target))
+			if (auto const* decl = dynamic_cast<VariableDeclaration const*>(ident->annotation().referencedDeclaration))
+				if (!decl->isStateVariable() && decl->referenceLocation() == VariableDeclaration::Location::Storage)
+					neverTrack.insert(decl);
+	}
+
+	bool visit(Assignment const& _assignment) override
+	{
+		// A bare-identifier LHS is the common case; a storage-ref local can
+		// ALSO be rebound as one component of a tuple-destructuring
+		// assignment (`(x, y) = (a[i], b[j]);`) — walk every component so
+		// that shape is not missed (missing it here would be a soundness
+		// gap: the pre-rebind target would keep being substituted at uses
+		// after the rebind).
+		if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_assignment.leftHandSide()))
+		{
+			for (auto const& component: tuple->components())
+				if (component)
+					noteIfStorageRefRebind(*component);
+		}
+		else
+			noteIfStorageRefRebind(_assignment.leftHandSide());
+		return true;
+	}
+};
+
+std::string storageRefKeyTempName(VariableDeclaration const& _decl, size_t _idx)
+{
+	return "__solcore_sref_" + std::to_string(static_cast<int64_t>(_decl.id())) + "_k" + std::to_string(_idx);
+}
+
+Json localExpr(std::string const& _name);
+
+/// Build the read-position JSON for a resolved alias target: reconstructs
+/// the storage_get/storage_map_get root plus every captured step, exactly
+/// matching the canonical inline nested-storage-read shape the exporter
+/// already produces for a direct (non-aliased) chain (design §3.3/§7.1).
+Json aliasReadJson(StorageRefTarget const& _target)
+{
+	Json current = Json::object();
+	size_t i = 0;
+	if (!_target.steps.empty() && _target.steps.front().kind == StorageRefStep::Kind::MappingKey)
+	{
+		current["kind"] = "storage_map_get";
+		current["field"] = _target.root;
+		current["key"] = localExpr(_target.steps.front().keyTemp);
+		i = 1;
+	}
+	else
+	{
+		current["kind"] = "storage_get";
+		current["field"] = _target.root;
+	}
+	for (; i < _target.steps.size(); ++i)
+	{
+		StorageRefStep const& step = _target.steps[i];
+		Json next = Json::object();
+		if (step.kind == StorageRefStep::Kind::Field)
+		{
+			next["kind"] = "field";
+			next["base"] = current;
+			next["field"] = step.field;
+		}
+		else
+		{
+			next["kind"] = "array_get";
+			next["base"] = current;
+			next["index"] = localExpr(step.keyTemp);
+		}
+		current = next;
+	}
+	return current;
+}
+
+/// True iff `_decl` is a tracked, resolved storage-ref alias in the
+/// function currently being exported.
+bool isTrackedStorageRefAlias(VariableDeclaration const* _decl)
+{
+	return _decl && storageRefAliasTargets.count(_decl) > 0;
+}
+
+/// True iff `_expr`, once exported via exportExpr, is guaranteed to
+/// re-project a REAL storage location (as opposed to a bind-time value
+/// copy). Used by the push/pop statement lowering (§3.3) to decide whether
+/// the rooted `array_push_expr`/`array_pop_expr` fallback is sound for a
+/// given base expression: Solidity only allows `.push()`/`.pop()` on
+/// storage-located dynamic arrays, so the only way this can be false is an
+/// UNTRACKED (unresolved) local storage-ref alias, which must keep the
+/// status-quo refusal rather than be treated as storage-rooted.
+bool isExprStorageRooted(Expression const& _expr)
+{
+	if (auto const* identifier = dynamic_cast<Identifier const*>(&_expr))
+	{
+		auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
+		if (!decl)
+			return false;
+		if (decl->isStateVariable())
+			return true;
+		if (namespacedStorageAliases.count(decl->name()))
+			return true;
+		return isTrackedStorageRefAlias(decl);
+	}
+	if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_expr))
+		return isExprStorageRooted(memberAccess->expression());
+	if (auto const* indexAccess = dynamic_cast<IndexAccess const*>(&_expr))
+		return isExprStorageRooted(indexAccess->baseExpression());
+	return false;
+}
+
+// --- End general storage-reference-variable alias tracking (data model) ---
 
 Json exporterMetadata(std::string const& _contractName)
 {
@@ -1565,6 +1762,139 @@ Json localExpr(std::string const& _name)
 	return result;
 }
 
+/// §3.2 bind-site resolution: walk a storage-located local's initializer
+/// expression and, if it takes one of the recognized shapes, produce the
+/// alias's StorageRefTarget plus the key-snapshot `let` statements that must
+/// be emitted (in order) at the bind site (design §3.2/§7.1: the key is
+/// evaluated ONCE, at bind time, matching Solidity's own "slot computed at
+/// declaration" semantics). Returns nullopt for any shape not covered
+/// (ternary/call-result/etc. — §3.6's fallback policy: the caller then falls
+/// through to today's status-quo copy-`let` lowering, unchanged).
+std::optional<std::pair<StorageRefTarget, std::vector<Json>>> resolveStorageRefInitializer(
+	Expression const& _init,
+	VariableDeclaration const& _bindDecl)
+{
+	std::vector<StorageRefStep> steps;
+	std::vector<Json> snapshots;
+	Expression const* current = &_init;
+
+	// Collect steps from the OUTERMOST access down to the root, then reverse.
+	while (true)
+	{
+		if (auto const* indexAccess = dynamic_cast<IndexAccess const*>(current))
+		{
+			if (!indexAccess->indexExpression())
+				return std::nullopt;
+			Type const* baseType = indexAccess->baseExpression().annotation().type;
+			if (!baseType)
+				return std::nullopt;
+			bool isArrayLike =
+				baseType->category() == Type::Category::Array ||
+				baseType->category() == Type::Category::FixedBytes;
+			bool isMapping = baseType->category() == Type::Category::Mapping;
+			if (!isArrayLike && !isMapping)
+				return std::nullopt;
+			std::string tempName = storageRefKeyTempName(_bindDecl, snapshots.size());
+			Json letStmt = Json::object();
+			letStmt["kind"] = "let";
+			letStmt["name"] = tempName;
+			Type const* keyType = indexAccess->indexExpression()->annotation().type;
+			auto simpleKeyType = keyType ? exportSimpleType(*keyType) : std::nullopt;
+			letStmt["type"] = simpleKeyType.has_value() ? *simpleKeyType : Json("u256");
+			letStmt["value"] = exportExpr(*indexAccess->indexExpression());
+			snapshots.emplace_back(letStmt);
+			steps.push_back({
+				isMapping ? StorageRefStep::Kind::MappingKey : StorageRefStep::Kind::ArrayIndex,
+				"",
+				tempName
+			});
+			current = &indexAccess->baseExpression();
+			continue;
+		}
+		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(current))
+		{
+			// Namespaced-alias / getter-call bases: root at the flattened
+			// prefix+member field instead of recursing further (mirrors the
+			// read-site handling at the namespaced-storage member access).
+			if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
+			{
+				auto nsIt = namespacedStorageAliases.find(baseIdent->name());
+				if (nsIt != namespacedStorageAliases.end())
+				{
+					std::reverse(steps.begin(), steps.end());
+					std::reverse(snapshots.begin(), snapshots.end());
+					return std::make_pair(
+						StorageRefTarget{nsIt->second + memberAccess->memberName(), std::move(steps)},
+						std::move(snapshots));
+				}
+			}
+			if (auto const* call = dynamic_cast<FunctionCall const*>(&memberAccess->expression()))
+				if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
+					if (auto const* prefix = namespacedGetterPrefix(*callee))
+					{
+						std::reverse(steps.begin(), steps.end());
+						std::reverse(snapshots.begin(), snapshots.end());
+						return std::make_pair(
+							StorageRefTarget{*prefix + memberAccess->memberName(), std::move(steps)},
+							std::move(snapshots));
+					}
+			steps.push_back({StorageRefStep::Kind::Field, memberAccess->memberName(), ""});
+			current = &memberAccess->expression();
+			continue;
+		}
+		break;
+	}
+
+	// Call results (including EIP-1967 `StorageSlot.getXSlot(...)` wrapper
+	// getters — see the oracle-side note next to
+	// `isKnownStorageSlotHelperOracle` in the write-set oracle below for why
+	// this deliberately does NOT get a body-side synthetic-field treatment):
+	// the pre-existing `FieldAccess(InternalCall{getXSlot,[slot]}, "value")`
+	// / `StructUpdate(InternalCall{getXSlot,[slot]}, "value", v)` recognizers
+	// in Base.ml/LeanSupport.ml (`slot_helper_record_info_of_name`,
+	// `foreign_storage_read_slot`/`foreign_storage_write_slot` against
+	// `world[thisAddress]`) already model this pattern soundly and more
+	// generally (no compile-time-constant restriction) than a synthetic
+	// named field could; routing an alias bind through this exporter's own
+	// alias-tracking would only produce a DIFFERENT, redundant body
+	// representation for a pattern that already has a correct one. Not
+	// resolving here is therefore intentional, not a gap: any local bound
+	// to a getXSlot(...) call result keeps today's status-quo copy-`let`
+	// lowering (§3.6 fallback policy), and no corpus contract in this
+	// export actually binds one to an intermediate local (every occurrence
+	// is the direct inline `StorageSlot.getXSlot(K).value` form, which
+	// Base.ml/LeanSupport.ml already handle without any alias involved).
+	if (dynamic_cast<FunctionCall const*>(current))
+		return std::nullopt;
+
+	if (auto const* identifier = dynamic_cast<Identifier const*>(current))
+	{
+		auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
+		if (!decl)
+			return std::nullopt;
+		std::reverse(steps.begin(), steps.end());
+		std::reverse(snapshots.begin(), snapshots.end());
+		if (decl->isStateVariable())
+			return std::make_pair(StorageRefTarget{decl->name(), std::move(steps)}, std::move(snapshots));
+		// Composition: aliasing another TRACKED, RESOLVED alias.
+		auto it = storageRefAliasTargets.find(decl);
+		if (it != storageRefAliasTargets.end())
+		{
+			StorageRefTarget composed = it->second;
+			for (auto& step: steps)
+				composed.steps.push_back(std::move(step));
+			return std::make_pair(std::move(composed), std::move(snapshots));
+		}
+		// Storage-pointer parameter, or an untracked/unresolvable alias:
+		// out of scope (Phase 2 territory) — fail closed (nullopt).
+		return std::nullopt;
+	}
+
+	// Ternary, call results (other than the P1c shape above), and any other
+	// expression shape: not resolvable (§0's explicit Phase-1 boundary).
+	return std::nullopt;
+}
+
 std::optional<Json> exportExternalContractCall(
 	FunctionCall const& _call,
 	MemberAccess const& _memberAccess,
@@ -2270,6 +2600,18 @@ Json exportExpr(Expression const& _expr)
 				result["kind"] = "storage_get";
 				result["field"] = decl->name();
 				return result;
+			}
+			// General storage-reference-variable alias tracking (Phase 1a
+			// §3.3): a tracked, resolved local storage-ref alias reads as a
+			// LIVE re-projection of current storage, not a bind-time value
+			// copy — this is what lets every downstream MemberAccess/
+			// IndexAccess wrapping this read (handled generically elsewhere
+			// in exportExpr) produce the same rooted shape a direct,
+			// non-aliased chain would.
+			{
+				auto aliasIt = storageRefAliasTargets.find(decl);
+				if (aliasIt != storageRefAliasTargets.end())
+					return aliasReadJson(aliasIt->second);
 			}
 			result["kind"] = "local";
 			result["name"] = decl->name().empty() ? identifier->name() : decl->name();
@@ -3958,7 +4300,11 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 				effectiveRhs = compoundValue(current, rhsJson);
 			}
 			// Extract base_path as a string list for the OCaml parser
-			if (auto const* baseIdent = dynamic_cast<Identifier const*>(&indexAccess->baseExpression()))
+			if (
+				auto const* baseIdent = dynamic_cast<Identifier const*>(&indexAccess->baseExpression());
+				baseIdent && !isTrackedStorageRefAlias(
+					dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration))
+			)
 			{
 				auto const* decl = dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration);
 				// For local (memory) arrays, export as an assign of the whole array
@@ -4116,7 +4462,19 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
 		{
 			auto const* decl = dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration);
-			if (decl && !decl->isStateVariable())
+			// A tracked, resolved storage-ref alias must NOT take the
+			// "local struct member write" branch below: that branch
+			// reassigns the LOCAL POINTER variable to a new struct value
+			// and discards it, silently dropping the real storage write
+			// (design §3.3's documented write-dropping bug for this exact
+			// shape). Falling through to the generic struct_update-as-expr
+			// path lets exportStructUpdate's own exportExpr(baseExpr) call
+			// substitute the alias's rooted read, producing a
+			// StorageGet/StorageMapGet-rooted Expr(StructUpdate(...)) the
+			// existing writeback pass (Base.ml's
+			// lower_nested_storage_array_set / the OCaml frontend) already
+			// re-roots into a real RMW storage write.
+			if (decl && !decl->isStateVariable() && !isTrackedStorageRefAlias(decl))
 			{
 				// Local struct member write: $.field = value
 				// Export as: assign $ = struct_update($, field, value)
@@ -4233,7 +4591,11 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 		{
 			if (!indexAccess->indexExpression())
 				throw UnsupportedSolCore("Array index assignment without index.");
-			if (auto const* baseIdent = dynamic_cast<Identifier const*>(&indexAccess->baseExpression()))
+			if (
+				auto const* baseIdent = dynamic_cast<Identifier const*>(&indexAccess->baseExpression());
+				baseIdent && !isTrackedStorageRefAlias(
+					dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration))
+			)
 			{
 				auto const* decl = dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration);
 				if (decl && !decl->isStateVariable())
@@ -4337,7 +4699,7 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 		if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
 		{
 			auto const* decl = dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration);
-			if (decl && !decl->isStateVariable())
+			if (decl && !decl->isStateVariable() && !isTrackedStorageRefAlias(decl))
 			{
 				Json result = Json::object();
 				result["kind"] = "assign";
@@ -5198,6 +5560,31 @@ Json exportStmtDispatch(Statement const& _stmt)
 		}
 		// --- End namespaced storage var decl ---
 
+		// --- General storage-reference-variable alias tracking (Phase 1a §3.2) ---
+		if (varDecl->declarations().size() == 1 && varDecl->declarations().front() && varDecl->initialValue())
+		{
+			VariableDeclaration const& decl = *varDecl->declarations().front();
+			if (
+				decl.referenceLocation() == VariableDeclaration::Location::Storage &&
+				!storageRefNeverTrack.count(&decl)
+			)
+			{
+				if (auto resolved = resolveStorageRefInitializer(*varDecl->initialValue(), decl))
+				{
+					storageRefAliasTargets[&decl] = resolved->first;
+					Json result = Json::object();
+					result["kind"] = "block";
+					result["statements"] = Json::array();
+					for (Json const& snapshotLet: resolved->second)
+						result["statements"].emplace_back(snapshotLet);
+					return result;
+				}
+				// Unresolved: fall through to the status-quo copy-`let` lowering
+				// below (§3.6 fallback policy — zero-regression guarantee).
+			}
+		}
+		// --- End general storage-reference-variable alias tracking ---
+
 		// Single variable declaration with initializer (common case)
 		if (varDecl->declarations().size() == 1 && varDecl->declarations().front() && varDecl->initialValue())
 		{
@@ -5408,6 +5795,46 @@ Json exportStmtDispatch(Statement const& _stmt)
 					Type const* baseType = memberAccess->expression().annotation().type;
 					if (baseType && baseType->category() == Type::Category::Array)
 					{
+						// General storage-reference-variable alias tracking
+						// (Phase 1a §3.3): push/pop through a tracked alias
+						// (or any other expression that is itself provably
+						// storage-rooted, e.g. an inline
+						// `draftQueues[a][b].push(v)` with no intermediate
+						// local at all) lowers to the rooted
+						// array_push_expr/array_pop_expr synthetic-ref-
+						// consumer names Summary.ml/EventLowering.ml already
+						// reserve, instead of the native base_path form
+						// (which only works for a WHOLE state-variable-named
+						// base). An UNTRACKED/unresolvable base keeps the
+						// pre-existing hard refusal (§3.6 zero-regression
+						// fallback policy).
+						bool baseIsPlainStateVarIdent = false;
+						if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
+						{
+							auto const* decl = dynamic_cast<VariableDeclaration const*>(baseIdent->annotation().referencedDeclaration);
+							baseIsPlainStateVarIdent = decl && decl->isStateVariable();
+						}
+						if (!baseIsPlainStateVarIdent && isExprStorageRooted(memberAccess->expression()))
+						{
+							Json result = Json::object();
+							result["kind"] = "expr";
+							Json callExpr = Json::object();
+							callExpr["kind"] = "internal_call";
+							callExpr["function"] =
+								memberAccess->memberName() == "push" ? "array_push_expr" : "array_pop_expr";
+							callExpr["args"] = Json::array();
+							callExpr["args"].emplace_back(exportExpr(memberAccess->expression()));
+							if (memberAccess->memberName() == "push")
+							{
+								if (!call->arguments().empty())
+									callExpr["args"].emplace_back(exportExpr(*call->arguments().front()));
+								else
+									callExpr["args"].emplace_back(u256Literal("0"));
+							}
+							result["value"] = callExpr;
+							return result;
+						}
+
 						// Extract base_path as a string list for the OCaml parser
 						Json basePath = Json::array();
 						if (auto const* baseIdent = dynamic_cast<Identifier const*>(&memberAccess->expression()))
@@ -5980,7 +6407,23 @@ bool isKnownOzStorageRefLibraryMutator(FunctionDefinition const& _funcDef)
 		((libName == "EnumerableMap" || libName == "EnumerableMapUpgradeable") &&
 			(fnName == "set" || fnName == "remove")) ||
 		((libName == "Checkpoints" || libName == "CheckpointsUpgradeable") &&
-			fnName == "push");
+			fnName == "push") ||
+		// General local storage-reference-variable alias tracking, Phase 1b
+		// (design §4): mirrors EXACTLY the hidden storage-mutator helper
+		// names Summary.ml's `hidden_mutator_writes_in_expr` already
+		// records on the OCaml/body-model side (the `"popFront" | "pushBack"
+		// | "clear" (* DoubleEndedQueue *) | "increment" | "reset" (* OZ
+		// Counters.Counter *)` arm) — deliberately not extended to
+		// `decrement`/`pushFront`, which that arm does NOT record, to keep
+		// this oracle-side attribution and the body-model's own write set
+		// in lockstep (adding a name here Summary.ml lacks would let the
+		// oracle claim a write the model doesn't also declare, which is
+		// harmless for FIDELITY-001's direction but would misrepresent
+		// which helpers are actually bounded-mutator-recognized).
+		((libName == "Counters" || libName == "CountersUpgradeable") &&
+			(fnName == "increment" || fnName == "reset")) ||
+		((libName == "DoubleEndedQueue" || libName == "DoubleEndedQueueUpgradeable") &&
+			(fnName == "pushBack" || fnName == "popFront" || fnName == "clear"));
 	if (!matches)
 		return false;
 	// Defensive shape check: every known signature for these entry points
@@ -6128,6 +6571,106 @@ MemberAccess const* innermostMemberAccessOntoBase(Expression const& _target, Ide
 
 // --- End ERC-7201 namespaced-storage extension ---
 
+// --- EIP-1967 / OpenZeppelin StorageSlot getXSlot(...) write-oracle
+// extension (Phase 1c of the general storage-reference-alias-tracking
+// design; see the exporter's body-side note in `resolveStorageRefInitializer`
+// for the full rationale) ---
+//
+// `StorageSlot.getAddressSlot(slot).value = x;` (and its Boolean/Bytes32/
+// Uint256/Int256/String/Bytes twins) is ALREADY modeled soundly and
+// generally by the OCaml frontend, independently of this exporter: Base.ml's
+// `slot_helper_record_info_of_name` recognizes the exact pre-existing JSON
+// shape this exporter emits for it today (`StructUpdate` whose base is an
+// opaque `internal_call` to one of these getters) and lowers the write via
+// `foreign_storage_write_slot(world, thisAddress, slot, value)` — a raw,
+// per-(address,slot) write against the shared WorldState, for ANY slot
+// expression (not just a compile-time constant). This is strictly MORE
+// general than a synthetic named Storage field could be, so — unlike the
+// general local storage-reference-variable alias mechanism above — this
+// pattern deliberately gets NO body-side treatment from this exporter at
+// all; the body export is already correct as-is.
+//
+// The only real gap is that this independent write-set oracle has no way to
+// know that, so `recordWriteToBase` below (called with a target that peels,
+// through `.value`, to a call result rather than a plain Identifier) hits
+// its normal fail-closed `unknown = true` default — demoting every
+// function that legitimately uses this pattern (e.g.
+// TransparentUpgradeableProxy's `_setAdmin`/`_setImplementation`/
+// `_changeAdmin`/`_upgradeTo`) via SOL-PLAN-FIDELITY-002, even though the
+// model is already sound. This bounded structural recognizer — independent
+// of, and deliberately NOT sharing state with, Base.ml's OCaml-side
+// name-based `is_storage_slot_helper_name` — lets `recordWriteToBase`
+// instead recognize the write as "known to be soundly modeled elsewhere,
+// and not a write to any NAMED field this export declares", so it
+// contributes NOTHING to `writes` (there is no field to name) and does NOT
+// set `unknown`. A `delegatecall`-containing wrapper (`_upgradeToAndCall*`)
+// still hits the untouched `Kind::DelegateCall ⇒ unknown` arm elsewhere in
+// this collector — correct and unaffected by this extension.
+bool isKnownStorageSlotHelperOracle(FunctionDefinition const& _function)
+{
+	if (!_function.isOrdinary())
+		return false;
+	if (_function.visibility() == Visibility::Public || _function.visibility() == Visibility::External)
+		return false;
+	if (_function.parameters().size() != 1)
+		return false;
+	VariableDeclaration const& param = *_function.parameters().front();
+	if (param.referenceLocation() == VariableDeclaration::Location::Storage)
+		return false;
+	Type const* paramType = param.type();
+	if (!paramType || paramType->category() != Type::Category::FixedBytes)
+		return false;
+	if (auto const* fixedBytesType = dynamic_cast<FixedBytesType const*>(paramType))
+		if (fixedBytesType->numBytes() != 32)
+			return false;
+
+	if (_function.returnParameters().size() != 1)
+		return false;
+	VariableDeclaration const& retParam = *_function.returnParameters().front();
+	if (retParam.referenceLocation() != VariableDeclaration::Location::Storage)
+		return false;
+	auto const* userDefined = dynamic_cast<UserDefinedTypeName const*>(&retParam.typeName());
+	if (!userDefined)
+		return false;
+	auto const* structDef = dynamic_cast<StructDefinition const*>(
+		userDefined->pathNode().annotation().referencedDeclaration);
+	if (!structDef || structDef->members().size() != 1)
+		return false;
+	if (structDef->members().front()->name() != "value")
+		return false;
+
+	if (!_function.isImplemented())
+		return false;
+	Block const& body = _function.body();
+	if (body.statements().size() != 1)
+		return false;
+	auto const* asmStmt = dynamic_cast<InlineAssembly const*>(body.statements().front().get());
+	if (!asmStmt)
+		return false;
+	yul::Block const& root = asmStmt->operations().root();
+	if (root.statements.size() != 1)
+		return false;
+	auto const* yulAssignment = std::get_if<yul::Assignment>(&root.statements.front());
+	if (!yulAssignment || yulAssignment->variableNames.size() != 1 || !yulAssignment->value)
+		return false;
+	auto const& externalReferences = asmStmt->annotation().externalReferences;
+	yul::Identifier const& lhsIdent = yulAssignment->variableNames.front();
+	auto lhsIt = externalReferences.find(&lhsIdent);
+	if (lhsIt == externalReferences.end() || lhsIt->second.suffix != "slot")
+		return false;
+	if (lhsIt->second.declaration != &retParam)
+		return false;
+	auto const* rhsIdent = std::get_if<yul::Identifier>(yulAssignment->value.get());
+	if (!rhsIdent)
+		return false;
+	auto rhsIt = externalReferences.find(rhsIdent);
+	if (rhsIt == externalReferences.end() || !rhsIt->second.suffix.empty())
+		return false;
+	return rhsIt->second.declaration == &param;
+}
+
+// --- End EIP-1967 / StorageSlot write-oracle extension ---
+
 struct WriteOracleCollector: ASTConstVisitor
 {
 	std::set<std::string> writes;
@@ -6144,6 +6687,81 @@ struct WriteOracleCollector: ASTConstVisitor
 	// shape.
 	std::map<VariableDeclaration const*, std::string> namespacedAliasPrefixes;
 
+	// General local storage-reference-variable alias tracking, Phase 1b
+	// (design §4): local storage-pointer variables (within THIS function
+	// body) mapped to their MAY-write root-field candidate set. `nullopt`
+	// means "bound but not resolvable" (still distinct from "untracked":
+	// an untracked/absent entry and a nullopt entry both fail closed at
+	// `recordWriteToBase`, but only a present nullopt entry can be
+	// PRECISELY merged on a later rebind — see visit(Assignment) below).
+	// This is intentionally its own, separate, flow-INSENSITIVE
+	// root-granularity resolver — NOT the same code as the flow-sensitive,
+	// full-target-shape body-side resolver (`resolveStorageRefInitializer`
+	// near the top of this file); see that function's/§7.5's independence
+	// requirement.
+	std::map<VariableDeclaration const*, std::optional<std::set<std::string>>> aliasRootCandidates;
+
+	std::optional<std::set<std::string>> resolveOracleStorageRefRoots(Expression const& _expr)
+	{
+		if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_expr))
+		{
+			// A parenthesized single-element grouping is a legitimate
+			// pass-through; an actual multi-element tuple is not a storage
+			// reference shape at all.
+			if (tuple->components().size() == 1 && tuple->components().front())
+				return resolveOracleStorageRefRoots(*tuple->components().front());
+			return std::nullopt;
+		}
+		if (auto const* cond = dynamic_cast<Conditional const*>(&_expr))
+		{
+			auto trueRoots = resolveOracleStorageRefRoots(cond->trueExpression());
+			auto falseRoots = resolveOracleStorageRefRoots(cond->falseExpression());
+			if (!trueRoots.has_value() || !falseRoots.has_value())
+				return std::nullopt;
+			std::set<std::string> merged = *trueRoots;
+			merged.insert(falseRoots->begin(), falseRoots->end());
+			return merged;
+		}
+		if (auto const* indexAccess = dynamic_cast<IndexAccess const*>(&_expr))
+			return resolveOracleStorageRefRoots(indexAccess->baseExpression());
+		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_expr))
+			return resolveOracleStorageRefRoots(memberAccess->expression());
+		if (auto const* identifier = dynamic_cast<Identifier const*>(&_expr))
+		{
+			auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
+			if (!decl)
+				return std::nullopt;
+			if (decl->isStateVariable())
+				return std::set<std::string>{decl->name()};
+			auto it = aliasRootCandidates.find(decl);
+			if (it != aliasRootCandidates.end())
+				return it->second;
+			return std::nullopt;
+		}
+		if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
+		{
+			if (FunctionDefinition const* target = resolveWriteOracleCallTarget(call->expression(), mostDerivedContract))
+			{
+				StructDefinition const* structDef = nullptr;
+				if (isKnownNamespacedStorageGetter(*target, &structDef))
+				{
+					// Root-granularity oracle: attribute to the MAY-set of
+					// every field the namespaced struct could touch (the
+					// exporter's own body-side substitution is exact about
+					// which one; this independent oracle only needs a
+					// sound over-approximation).
+					std::string prefix = derivePrefix(structDef->name());
+					std::set<std::string> roots;
+					for (auto const& member: structDef->members())
+						roots.insert(prefix + member->name());
+					return roots;
+				}
+			}
+			return std::nullopt;
+		}
+		return std::nullopt;
+	}
+
 	void recordWriteToBase(Expression const& _target)
 	{
 		if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_target))
@@ -6153,6 +6771,20 @@ struct WriteOracleCollector: ASTConstVisitor
 					recordWriteToBase(*component);
 			return;
 		}
+
+		// EIP-1967 / StorageSlot `getXSlot(slot).value = ...`: see
+		// isKnownStorageSlotHelperOracle's doc comment above. Already
+		// soundly modeled by the OCaml frontend against
+		// world[thisAddress] — not a write to any NAMED field this export
+		// declares, so it must contribute nothing to `writes` and must NOT
+		// set `unknown`.
+		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_target))
+			if (memberAccess->memberName() == "value")
+				if (auto const* call = dynamic_cast<FunctionCall const*>(&memberAccess->expression()))
+					if (FunctionDefinition const* target =
+							resolveWriteOracleCallTarget(call->expression(), mostDerivedContract))
+						if (isKnownStorageSlotHelperOracle(*target))
+							return;
 
 		Identifier const* base = peelToBaseIdentifierForWriteOracle(_target);
 		if (!base)
@@ -6195,6 +6827,18 @@ struct WriteOracleCollector: ASTConstVisitor
 				// `.field` access through it — not a shape this
 				// recognizer covers. Fall through to fail-closed below.
 			}
+			// General local storage-reference-variable alias tracking
+			// (Phase 1b §4): a resolved candidate root set attributes the
+			// write to every candidate (sound MAY-write over-
+			// approximation at root granularity); an unresolvable
+			// (present-but-nullopt) or altogether untracked entry keeps
+			// the pre-existing fail-closed default.
+			auto rootIt = aliasRootCandidates.find(varDecl);
+			if (rootIt != aliasRootCandidates.end() && rootIt->second.has_value())
+			{
+				writes.insert(rootIt->second->begin(), rootIt->second->end());
+				return;
+			}
 			// Every other local storage-pointer variable: without alias
 			// analysis we cannot statically tell which state variable it
 			// points at. Fail closed rather than guessing.
@@ -6220,21 +6864,56 @@ struct WriteOracleCollector: ASTConstVisitor
 			_stmt.initialValue()
 		)
 		{
+			VariableDeclaration const* decl = _stmt.declarations().front().get();
+			bool handledAsNamespaced = false;
 			if (auto const* call = dynamic_cast<FunctionCall const*>(_stmt.initialValue()))
 			{
 				if (FunctionDefinition const* target = resolveWriteOracleCallTarget(call->expression(), mostDerivedContract))
 				{
 					StructDefinition const* structDef = nullptr;
 					if (isKnownNamespacedStorageGetter(*target, &structDef))
-						namespacedAliasPrefixes[_stmt.declarations().front().get()] = derivePrefix(structDef->name());
+					{
+						namespacedAliasPrefixes[decl] = derivePrefix(structDef->name());
+						handledAsNamespaced = true;
+					}
 				}
 			}
+			// General local storage-reference-variable alias tracking
+			// (Phase 1b §4): only when NOT already handled by the
+			// (stricter, pre-existing) namespaced-getter recognizer above.
+			if (!handledAsNamespaced)
+				aliasRootCandidates[decl] = resolveOracleStorageRefRoots(*_stmt.initialValue());
 		}
 		return true;
 	}
 
 	bool visit(Assignment const& _assignment) override
 	{
+		// Pointer REBIND (`x = <storage lvalue>;` where `x` is itself a
+		// storage-located local), not a storage write: merge candidate
+		// roots instead of falling through to recordWriteToBase, which
+		// would otherwise treat the pointer variable itself as the whole
+		// write target and fail closed (design §4's documented precision
+		// improvement over that pre-existing behavior — see
+		// recordWriteToBase's local-storage-pointer arm).
+		if (auto const* identifier = dynamic_cast<Identifier const*>(&_assignment.leftHandSide()))
+		{
+			if (auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration))
+			{
+				if (!decl->isStateVariable() && decl->referenceLocation() == VariableDeclaration::Location::Storage)
+				{
+					auto newRoots = resolveOracleStorageRefRoots(_assignment.rightHandSide());
+					auto it = aliasRootCandidates.find(decl);
+					if (it == aliasRootCandidates.end())
+						aliasRootCandidates[decl] = newRoots;
+					else if (!newRoots.has_value() || !it->second.has_value())
+						it->second = std::nullopt;
+					else
+						it->second->insert(newRoots->begin(), newRoots->end());
+					return true;
+				}
+			}
+		}
 		recordWriteToBase(_assignment.leftHandSide());
 		return true;
 	}
@@ -6460,6 +7139,16 @@ Json exportBody(FunctionDefinition const& _function)
 	// (the getter prefix map persists across functions)
 	auto savedAliases = namespacedStorageAliases;
 	namespacedStorageAliases.clear();
+
+	// General storage-reference-variable alias tracking (Phase 1a): fresh
+	// per-function state, plus the whole-function rebind pre-pass (see the
+	// deviation note on storageRefAliasTargets above).
+	StorageRefAliasScope storageRefAliasScope;
+	{
+		StorageRefRebindScanner rebindScanner;
+		_function.body().accept(rebindScanner);
+		storageRefNeverTrack = rebindScanner.neverTrack;
+	}
 
 	Json body;
 	try
