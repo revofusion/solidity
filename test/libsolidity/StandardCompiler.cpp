@@ -2011,7 +2011,10 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_direct_literal_argument_is_specialized
 	Json contractResult = getContractResult(result, "fileA", "FnPtrRepro");
 	BOOST_REQUIRE(contractResult["solcore"].is_object());
 	Json const& solcore = contractResult["solcore"];
-	BOOST_CHECK_EQUAL(solcore["solcoreVersion"].get<std::string>(), "0.3.0");
+	// solcoreVersion is deliberately left unbumped by this feature (see the
+	// comment on its assignment in exportContract) so it stays a reliable
+	// "nothing else in this artifact changed" signal for the corpus diff.
+	BOOST_CHECK_EQUAL(solcore["solcoreVersion"].get<std::string>(), "0.2.0");
 
 	Json const* bump = findExportedFunction(solcore["functions"], "bump");
 	Json const* drop = findExportedFunction(solcore["functions"], "drop");

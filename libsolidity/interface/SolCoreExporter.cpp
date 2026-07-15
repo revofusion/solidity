@@ -7434,12 +7434,19 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	// 0.2.0: hardened body-export-failure marker ("unsupported_body" instead
 	// of a silently-valid no-op block) + per-function "ast_write_oracle"
 	// (independent AST write-set cross-check; see computeAstWriteOracle).
-	// 0.3.0: internal-function-used-as-a-value support via bounded
-	// defunctionalization (specialized `<name>__fnptr__<param>__<target>`
-	// internal_functions siblings; see the block preceding exportExpr) +
-	// closes the indirect-call-through-a-function-value name-punt fail-open
-	// in the generic FunctionCall fallback.
-	solcore["solcoreVersion"] = "0.3.0";
+	//
+	// Deliberately NOT bumped for internal-function-used-as-a-value support
+	// (bounded defunctionalization; see the block preceding exportExpr's
+	// definition): no OCaml-side consumer reads this field (verified by
+	// grep), and bumping a single global version string here would touch
+	// EVERY artifact's bytes on next regeneration -- destroying the far more
+	// valuable "byte-identical for every contract with no function-typed
+	// parameters" signal a corpus-wide diff otherwise gives for free. The
+	// feature is already self-describing in the artifact: new
+	// `<name>__fnptr__<param>__<target>` internal_functions entries, fewer
+	// "used as a value" unsupported_body markers, and (only on functions
+	// that use it) the additive "fnptr_specialization" provenance field.
+	solcore["solcoreVersion"] = "0.2.0";
 	solcore["solidityVersion"] = VersionString;
 	solcore["featureFlags"] = featureFlags();
 	Json metadata = exporterMetadata(_contractName);
