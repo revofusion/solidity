@@ -712,6 +712,14 @@ Json featureFlags()
 	// between genuine 256-bit arithmetic and mis-modeled narrow arithmetic,
 	// and consumers that need the distinction must treat them as stale.
 	flags["arithWidths"] = true;
+	// General local storage-reference-variable alias tracking (design
+	// §3.5): artifacts with this flag substitute live rooted storage
+	// reads/writes for resolved `T storage x = <storage lvalue>;` aliases
+	// (and lower alias push/pop to array_push_expr/array_pop_expr);
+	// artifacts without it predate the mechanism and model such aliases
+	// as bind-time value copies rescued only by the write oracle's
+	// fail-closed `unknown`.
+	flags["storageRefAliases"] = true;
 	return flags;
 }
 
@@ -4403,6 +4411,32 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 			catch (...)
 			{
 				// If nested mapping export also fails, fall back to generic array_set_expr
+				//
+				// [storage-ref-alias review fix] A COMPOUND assignment
+				// (`m[k] += v` etc.) reaching this catch must expand to the
+				// read-modify-write value, exactly like the two try-paths
+				// above do via compoundValue. Before this fix the catch
+				// passed the raw `rhsJson` through, silently turning
+				// `base[k] += v` into `base[k] = v` — concretely observed
+				// on StRSRP1._transfer's `eraStakes[to] += amount` once the
+				// general storage-ref alias substitution made this path
+				// reachable for alias-based mapping writes (an alias base
+				// identifier resolves to a rooted storage_map_get read, so
+				// exportStorageMapLValue throws and both try-paths above
+				// fail, landing here). A compound op with no index
+				// expression cannot be expanded — fail closed instead of
+				// mis-lowering.
+				Json effectiveRhs = rhsJson;
+				if (_op != Token::Assign)
+				{
+					if (!indexAccess->indexExpression())
+						throw UnsupportedSolCore("Compound index assignment without index expression.");
+					Json current = Json::object();
+					current["kind"] = "array_get";
+					current["base"] = exportExpr(indexAccess->baseExpression());
+					current["index"] = exportExpr(*indexAccess->indexExpression());
+					effectiveRhs = compoundValue(current, rhsJson);
+				}
 				Json result = Json::object();
 				result["kind"] = "expr";
 				Json callExpr = Json::object();
@@ -4412,7 +4446,7 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 				callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
 				if (indexAccess->indexExpression())
 					callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
-				callExpr["args"].emplace_back(rhsJson);
+				callExpr["args"].emplace_back(effectiveRhs);
 				result["value"] = callExpr;
 				return result;
 			}
@@ -6690,38 +6724,41 @@ struct WriteOracleCollector: ASTConstVisitor
 	// General local storage-reference-variable alias tracking, Phase 1b
 	// (design §4): local storage-pointer variables (within THIS function
 	// body) mapped to their MAY-write root-field candidate set. `nullopt`
-	// means "bound but not resolvable" (still distinct from "untracked":
-	// an untracked/absent entry and a nullopt entry both fail closed at
-	// `recordWriteToBase`, but only a present nullopt entry can be
-	// PRECISELY merged on a later rebind — see visit(Assignment) below).
-	// This is intentionally its own, separate, flow-INSENSITIVE
-	// root-granularity resolver — NOT the same code as the flow-sensitive,
-	// full-target-shape body-side resolver (`resolveStorageRefInitializer`
-	// near the top of this file); see that function's/§7.5's independence
-	// requirement.
+	// means "bound but not resolvable"; both an untracked/absent entry
+	// and a nullopt entry fail closed at `recordWriteToBase`. Entries are
+	// registered ONLY at declaration sites (visit(VariableDeclaration-
+	// Statement) below) — never grown at assignments: a rebound variable
+	// makes the whole function `unknown` via recordWriteToBase instead
+	// (see visit(Assignment) below and the envelope invariant note on
+	// resolveOracleStorageRefRoots). This is intentionally its own,
+	// separate, flow-INSENSITIVE root-granularity resolver — NOT the same
+	// code as the flow-sensitive, full-target-shape body-side resolver
+	// (`resolveStorageRefInitializer` near the top of this file); see
+	// that function's/§7.5's independence requirement.
 	std::map<VariableDeclaration const*, std::optional<std::set<std::string>>> aliasRootCandidates;
 
 	std::optional<std::set<std::string>> resolveOracleStorageRefRoots(Expression const& _expr)
 	{
-		if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_expr))
-		{
-			// A parenthesized single-element grouping is a legitimate
-			// pass-through; an actual multi-element tuple is not a storage
-			// reference shape at all.
-			if (tuple->components().size() == 1 && tuple->components().front())
-				return resolveOracleStorageRefRoots(*tuple->components().front());
-			return std::nullopt;
-		}
-		if (auto const* cond = dynamic_cast<Conditional const*>(&_expr))
-		{
-			auto trueRoots = resolveOracleStorageRefRoots(cond->trueExpression());
-			auto falseRoots = resolveOracleStorageRefRoots(cond->falseExpression());
-			if (!trueRoots.has_value() || !falseRoots.has_value())
-				return std::nullopt;
-			std::set<std::string> merged = *trueRoots;
-			merged.insert(falseRoots->begin(), falseRoots->end());
-			return merged;
-		}
+		// [storage-ref-alias review fix] SOUNDNESS INVARIANT: this
+		// resolver's acceptance envelope must be NO WIDER than the
+		// body-side resolver's (resolveStorageRefInitializer near the top
+		// of this file). The FIDELITY-001 cross-check between the two
+		// layers is only ROOT-granular (`oracle.writes ⊆
+		// transitive_touched_fields`), so any alias this oracle resolves
+		// that the body export does NOT substitute leaves the body's
+		// status-quo copy-lowering in place — a silently DROPPED storage
+		// write — and the drop is masked from FIDELITY-001 whenever the
+		// same root is also touched by some other, real modeled write
+		// (e.g. `m[i].a = 1; S storage p = <body-unresolvable>; p.a = 2;`
+		// was accepted with `p.a = 2` missing from the model). For that
+		// reason this function deliberately does NOT peel parenthesized
+		// TupleExpressions and does NOT union Conditional (ternary) arms:
+		// the body-side resolver resolves neither shape, so both must
+		// stay nullopt here (⇒ recordWriteToBase keeps its pre-existing
+		// fail-closed `unknown = true` for writes through such binds,
+		// which is exactly the pre-alias-tracking refusal). Widening this
+		// resolver is only sound together with a matching body-side
+		// widening.
 		if (auto const* indexAccess = dynamic_cast<IndexAccess const*>(&_expr))
 			return resolveOracleStorageRefRoots(indexAccess->baseExpression());
 		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_expr))
@@ -6836,6 +6873,25 @@ struct WriteOracleCollector: ASTConstVisitor
 			auto rootIt = aliasRootCandidates.find(varDecl);
 			if (rootIt != aliasRootCandidates.end() && rootIt->second.has_value())
 			{
+				// [storage-ref-alias review fix] A bare-identifier target
+				// (nothing peeled: the "write" IS the pointer variable) is
+				// a pointer REBIND, not a storage write. The body-side
+				// export never tracks a rebound variable (its whole-
+				// function StorageRefRebindScanner pre-pass), so its
+				// writes stay copy-lowered/dropped — attributing them
+				// here would mask the drop from FIDELITY-001 whenever the
+				// candidate root is also touched by a real write. Poison
+				// the entry AND fail the whole function closed
+				// (`unknown = true` dominates any earlier-in-AST-order
+				// attribution through this variable, so this is order-
+				// insensitive) — exactly the pre-alias-tracking refusal
+				// behavior for functions that reassign storage pointers.
+				if (static_cast<Expression const*>(base) == &_target)
+				{
+					rootIt->second = std::nullopt;
+					unknown = true;
+					return;
+				}
 				writes.insert(rootIt->second->begin(), rootIt->second->end());
 				return;
 			}
@@ -6889,31 +6945,23 @@ struct WriteOracleCollector: ASTConstVisitor
 
 	bool visit(Assignment const& _assignment) override
 	{
-		// Pointer REBIND (`x = <storage lvalue>;` where `x` is itself a
-		// storage-located local), not a storage write: merge candidate
-		// roots instead of falling through to recordWriteToBase, which
-		// would otherwise treat the pointer variable itself as the whole
-		// write target and fail closed (design §4's documented precision
-		// improvement over that pre-existing behavior — see
-		// recordWriteToBase's local-storage-pointer arm).
-		if (auto const* identifier = dynamic_cast<Identifier const*>(&_assignment.leftHandSide()))
-		{
-			if (auto const* decl = dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration))
-			{
-				if (!decl->isStateVariable() && decl->referenceLocation() == VariableDeclaration::Location::Storage)
-				{
-					auto newRoots = resolveOracleStorageRefRoots(_assignment.rightHandSide());
-					auto it = aliasRootCandidates.find(decl);
-					if (it == aliasRootCandidates.end())
-						aliasRootCandidates[decl] = newRoots;
-					else if (!newRoots.has_value() || !it->second.has_value())
-						it->second = std::nullopt;
-					else
-						it->second->insert(newRoots->begin(), newRoots->end());
-					return true;
-				}
-			}
-		}
+		// [storage-ref-alias review fix] NO special-casing of storage-
+		// pointer REBINDS (`x = <storage lvalue>;` where `x` is a
+		// storage-located local or parameter) here: a rebind assignment
+		// must keep falling through to recordWriteToBase, whose
+		// local-storage-pointer arm fails closed (`unknown = true`) —
+		// the exact pre-alias-tracking behavior. The body-side export
+		// NEVER tracks a rebound variable (StorageRefRebindScanner's
+		// whole-function pre-pass), so its writes stay copy-lowered
+		// (dropped from the model); an earlier revision of this
+		// collector "precisely" merged candidate roots on rebind
+		// instead, which attributed those dropped writes to real roots
+		// and let the function pass both FIDELITY gates whenever the
+		// root was also touched by a genuine write (root-granularity
+		// masking) — including through storage-pointer PARAMETERS,
+		// which the design explicitly keeps fail-closed (Phase-2
+		// scope). See resolveOracleStorageRefRoots' envelope invariant
+		// note above.
 		recordWriteToBase(_assignment.leftHandSide());
 		return true;
 	}
@@ -7143,10 +7191,27 @@ Json exportBody(FunctionDefinition const& _function)
 	// General storage-reference-variable alias tracking (Phase 1a): fresh
 	// per-function state, plus the whole-function rebind pre-pass (see the
 	// deviation note on storageRefAliasTargets above).
+	//
+	// [storage-ref-alias review fix] The pre-pass must cover every AST
+	// body that will be exported under THIS alias scope — that is the
+	// function body AND every resolved modifier body (expandModifiers
+	// below exports modifier bodies with the same storageRefAliasTargets
+	// state active). Scanning only the function body left a modifier that
+	// rebinds a storage-ref local un-scanned: the bind would be tracked,
+	// the rebind exported as a plain local assign, and every subsequent
+	// use substituted with the STALE pre-rebind target (writes to the
+	// wrong storage slot).
 	StorageRefAliasScope storageRefAliasScope;
 	{
 		StorageRefRebindScanner rebindScanner;
 		_function.body().accept(rebindScanner);
+		for (auto const& modifierInvocation: _function.modifiers())
+		{
+			ModifierDefinition const* modifierDefinition =
+				resolveModifierDefinition(_function, *modifierInvocation);
+			if (modifierDefinition && modifierDefinition->isImplemented())
+				modifierDefinition->body().accept(rebindScanner);
+		}
 		storageRefNeverTrack = rebindScanner.neverTrack;
 	}
 
