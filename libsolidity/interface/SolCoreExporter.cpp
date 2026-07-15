@@ -20,7 +20,6 @@
 
 #include <libsolidity/ast/AST.h>
 #include <libsolidity/ast/ASTAnnotations.h>
-#include <libsolidity/analysis/ConstantEvaluator.h>
 #include <libsolidity/interface/Version.h>
 
 #include <liblangutil/Token.h>
