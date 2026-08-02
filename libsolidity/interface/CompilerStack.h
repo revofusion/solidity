@@ -223,6 +223,14 @@ public:
 	/// Must be set before parsing.
 	void setViaIR(bool _viaIR);
 
+	/// @returns whether the Yul IR pipeline is selected. Read by the SolCore
+	/// exporter to record which codegen produced an artifact
+	/// (`codegen: "legacy" | "via-ir"`): solc's two pipelines genuinely
+	/// diverge on intra-statement evaluation order (e.g. binary operands:
+	/// legacy RIGHT-first, via-IR LEFT-first), so a downstream consumer that
+	/// commits to one pipeline's order must know which one compiled the unit.
+	bool viaIR() const { return m_viaIR; }
+
 	/// Sets the pipeline to use the SSA CFG code generator instead of OptimizedEVMCodeTransform.
 	/// Must be set before compilation.
 	void setViaSSACFG(bool _viaSSACFG);

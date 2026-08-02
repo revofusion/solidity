@@ -20,18 +20,18 @@
  * Unit tests for interface/StandardCompiler.h.
  */
 
-#include <string>
-#include <boost/test/unit_test.hpp>
-#include <boost/test/data/test_case.hpp>
 #include <boost/algorithm/string/replace.hpp>
+#include <boost/test/data/test_case.hpp>
+#include <boost/test/unit_test.hpp>
 #include <liblangutil/EVMVersion.h>
 #include <libsolidity/interface/OptimiserSettings.h>
 #include <libsolidity/interface/StandardCompiler.h>
 #include <libsolidity/interface/Version.h>
-#include <libsolutil/JSON.h>
 #include <libsolutil/CommonData.h>
-#include <test/Metadata.h>
+#include <libsolutil/JSON.h>
+#include <string>
 #include <test/Common.h>
+#include <test/Metadata.h>
 
 #include <algorithm>
 #include <set>
@@ -55,8 +55,7 @@ Error::Severity str2Severity(std::string const& _cat)
 		{"warning", Error::Severity::Warning},
 		{"Warning", Error::Severity::Warning},
 		{"error", Error::Severity::Error},
-		{"Error", Error::Severity::Error}
-	};
+		{"Error", Error::Severity::Error}};
 	return cats.at(_cat);
 }
 
@@ -96,11 +95,8 @@ bool containsAtMostWarnings(Json const& _compilerResult)
 
 Json getContractResult(Json const& _compilerResult, std::string const& _file, std::string const& _name)
 {
-	if (!_compilerResult.contains("contracts") ||
-		!_compilerResult["contracts"].is_object() ||
-		!_compilerResult["contracts"][_file].is_object() ||
-		!_compilerResult["contracts"][_file][_name].is_object()
-	)
+	if (!_compilerResult.contains("contracts") || !_compilerResult["contracts"].is_object()
+		|| !_compilerResult["contracts"][_file].is_object() || !_compilerResult["contracts"][_file][_name].is_object())
 		return Json();
 	return _compilerResult["contracts"][_file][_name];
 }
@@ -131,7 +127,8 @@ void checkLinkReferencesSchema(Json const& _contractResult)
 	}
 }
 
-void expectLinkReferences(Json const& _contractResult, std::map<std::string, std::set<std::string>> const& _expectedLinkReferences)
+void expectLinkReferences(
+	Json const& _contractResult, std::map<std::string, std::set<std::string>> const& _expectedLinkReferences)
 {
 	checkLinkReferencesSchema(_contractResult);
 
@@ -156,7 +153,8 @@ Json compile(std::string _input)
 	return ret;
 }
 
-Json createLanguageAndSourcesSection(std::string const& _language, std::map<std::string, Json> const& _sources, bool _contentNode = true)
+Json createLanguageAndSourcesSection(
+	std::string const& _language, std::map<std::string, Json> const& _sources, bool _contentNode = true)
 {
 	Json result = Json::object();
 	result["language"] = _language;
@@ -176,8 +174,9 @@ class Code
 {
 public:
 	virtual ~Code() = default;
-	explicit Code(std::map<std::string, Json> _code = {}) : m_code(std::move(_code)) {}
+	explicit Code(std::map<std::string, Json> _code = {}): m_code(std::move(_code)) {}
 	[[nodiscard]] virtual Json json() const = 0;
+
 protected:
 	std::map<std::string, Json> m_code;
 };
@@ -185,32 +184,26 @@ protected:
 class SolidityCode: public Code
 {
 public:
-	explicit SolidityCode(std::map<std::string, Json> _code = {
-		{"fileA", "pragma solidity >=0.0; contract C { function f() public pure {} }"}
-	}) : Code(std::move(_code)) {}
-	[[nodiscard]] Json json() const override
+	explicit SolidityCode(
+		std::map<std::string, Json> _code
+		= {{"fileA", "pragma solidity >=0.0; contract C { function f() public pure {} }"}})
+		: Code(std::move(_code))
 	{
-		return createLanguageAndSourcesSection("Solidity", m_code);
 	}
+	[[nodiscard]] Json json() const override { return createLanguageAndSourcesSection("Solidity", m_code); }
 };
 
 class YulCode: public Code
 {
 public:
-	explicit YulCode(std::map<std::string, Json> _code = {
-		{"fileA", "{}"}
-	}) : Code(std::move(_code)) {}
-	[[nodiscard]] Json json() const override
-	{
-		return createLanguageAndSourcesSection("Yul", m_code);
-	}
+	explicit YulCode(std::map<std::string, Json> _code = {{"fileA", "{}"}}): Code(std::move(_code)) {}
+	[[nodiscard]] Json json() const override { return createLanguageAndSourcesSection("Yul", m_code); }
 };
 
 class EvmAssemblyCode: public Code
 {
 public:
-	explicit EvmAssemblyCode(std::map<std::string, Json> _code = {
-		{"fileA", Json::parse(R"(
+	explicit EvmAssemblyCode(std::map<std::string, Json> _code = {{"fileA", Json::parse(R"(
 			{
 				"assemblyJson": {
 					".code": [
@@ -227,19 +220,17 @@ public:
 					]
 				}
 			}
-			)")}
-	}) : Code(std::move(_code)) {}
-	[[nodiscard]] Json json() const override
+			)")}})
+		: Code(std::move(_code))
 	{
-		return createLanguageAndSourcesSection("EVMAssembly", m_code, false);
 	}
+	[[nodiscard]] Json json() const override { return createLanguageAndSourcesSection("EVMAssembly", m_code, false); }
 };
 
 class SolidityAstCode: public Code
 {
 public:
-	explicit SolidityAstCode(std::map<std::string, Json> _code = {
-		{"fileA", Json::parse(R"(
+	explicit SolidityAstCode(std::map<std::string, Json> _code = {{"fileA", Json::parse(R"(
 		{
 			"ast": {
 				"absolutePath": "empty_contract.sol",
@@ -275,15 +266,19 @@ public:
 			},
 			"id": 0
 		}
-		)")}
-	}) : Code(std::move(_code)) {}
-	[[nodiscard]] Json json() const override
+		)")}})
+		: Code(std::move(_code))
 	{
-		return createLanguageAndSourcesSection("SolidityAST", m_code);
 	}
+	[[nodiscard]] Json json() const override { return createLanguageAndSourcesSection("SolidityAST", m_code); }
 };
 
-Json generateStandardJson(bool _viaIr, Json const& _debugInfoSelection, Json const& _outputSelection, Code const& _code = SolidityCode(), bool _advancedOutputSelection = false)
+Json generateStandardJson(
+	bool _viaIr,
+	Json const& _debugInfoSelection,
+	Json const& _outputSelection,
+	Code const& _code = SolidityCode(),
+	bool _advancedOutputSelection = false)
 {
 	Json result = _code.json();
 	result["settings"] = Json::object();
@@ -297,7 +292,12 @@ Json generateStandardJson(bool _viaIr, Json const& _debugInfoSelection, Json con
 	return result;
 }
 
-Json generateExperimentalStandardJson(bool _viaIR, Json const& _debugInfoSelection, Json const& _outputSelection, Code const& _code = SolidityCode(), bool _advancedOutputSelection = false)
+Json generateExperimentalStandardJson(
+	bool _viaIR,
+	Json const& _debugInfoSelection,
+	Json const& _outputSelection,
+	Code const& _code = SolidityCode(),
+	bool _advancedOutputSelection = false)
 {
 	Json result = generateStandardJson(_viaIR, _debugInfoSelection, _outputSelection, _code, _advancedOutputSelection);
 	result["settings"]["experimental"] = true;
@@ -321,9 +321,16 @@ BOOST_AUTO_TEST_CASE(assume_object_input)
 
 	/// Use the string interface of StandardCompiler to trigger these
 	result = compile("");
-	BOOST_CHECK(containsError(result, "JSONError", "parse error at line 1, column 1: attempting to parse an empty input; check that your input string or stream contains the expected JSON"));
+	BOOST_CHECK(containsError(
+		result,
+		"JSONError",
+		"parse error at line 1, column 1: attempting to parse an empty input; check that your input string or stream "
+		"contains the expected JSON"));
 	result = compile("invalid");
-	BOOST_CHECK(containsError(result, "JSONError", "parse error at line 1, column 1: syntax error while parsing value - invalid literal; last read: 'i'"));
+	BOOST_CHECK(containsError(
+		result,
+		"JSONError",
+		"parse error at line 1, column 1: syntax error while parsing value - invalid literal; last read: 'i'"));
 	result = compile("\"invalid\"");
 	BOOST_CHECK(containsError(result, "JSONError", "Input is not a JSON object."));
 	result = compile("{}");
@@ -340,7 +347,10 @@ BOOST_AUTO_TEST_CASE(invalid_language)
 	}
 	)";
 	Json result = compile(input);
-	BOOST_CHECK(containsError(result, "JSONError", "Only \"Solidity\", \"Yul\", \"SolidityAST\" or \"EVMAssembly\" is supported as a language."));
+	BOOST_CHECK(containsError(
+		result,
+		"JSONError",
+		"Only \"Solidity\", \"Yul\", \"SolidityAST\" or \"EVMAssembly\" is supported as a language."));
 }
 
 BOOST_AUTO_TEST_CASE(valid_language)
@@ -416,7 +426,10 @@ BOOST_AUTO_TEST_CASE(unexpected_trailing_test)
 	}
 	)";
 	Json result = compile(input);
-	BOOST_CHECK(containsError(result, "JSONError", "parse error at line 10, column 2: syntax error while parsing value - unexpected '}'; expected end of input"));
+	BOOST_CHECK(containsError(
+		result,
+		"JSONError",
+		"parse error at line 10, column 2: syntax error while parsing value - unexpected '}'; expected end of input"));
 }
 
 BOOST_AUTO_TEST_CASE(smoke_test)
@@ -536,21 +549,21 @@ BOOST_AUTO_TEST_CASE(basic_compilation)
 	BOOST_CHECK(contract["evm"]["bytecode"]["object"].is_string());
 	BOOST_CHECK_EQUAL(
 		solidity::test::bytecodeSansMetadata(contract["evm"]["bytecode"]["object"].get<std::string>()),
-		std::string("6080604052348015600e575f5ffd5b5060") +
-		(VersionIsRelease ? "3e" : util::toHex(bytes{uint8_t(60 + VersionStringStrict.size())})) +
-		"80601a5f395ff3fe60806040525f5ffdfe"
-	);
+		std::string("6080604052348015600e575f5ffd5b5060")
+			+ (VersionIsRelease ? "3e" : util::toHex(bytes{uint8_t(60 + VersionStringStrict.size())}))
+			+ "80601a5f395ff3fe60806040525f5ffdfe");
 	BOOST_CHECK(contract["evm"]["assembly"].is_string());
-	BOOST_CHECK(contract["evm"]["assembly"].get<std::string>().find(
-		"    /* \"fileA\":0:14  contract A { } */\n  mstore(0x40, 0x80)\n  "
-		"callvalue\n  dup1\n  "
-		"iszero\n  tag_1\n  jumpi\n  "
-		"revert(0x00, 0x00)\n"
-		"tag_1:\n  pop\n  dataSize(sub_0)\n  dup1\n  "
-		"dataOffset(sub_0)\n  0x00\n  codecopy\n  0x00\n  return\nstop\n\nsub_0: assembly {\n        "
-		"/* \"fileA\":0:14  contract A { } */\n      mstore(0x40, 0x80)\n      "
-		"revert(0x00, 0x00)\n\n    auxdata: 0xa26469706673582212"
-	) == 0);
+	BOOST_CHECK(
+		contract["evm"]["assembly"].get<std::string>().find(
+			"    /* \"fileA\":0:14  contract A { } */\n  mstore(0x40, 0x80)\n  "
+			"callvalue\n  dup1\n  "
+			"iszero\n  tag_1\n  jumpi\n  "
+			"revert(0x00, 0x00)\n"
+			"tag_1:\n  pop\n  dataSize(sub_0)\n  dup1\n  "
+			"dataOffset(sub_0)\n  0x00\n  codecopy\n  0x00\n  return\nstop\n\nsub_0: assembly {\n        "
+			"/* \"fileA\":0:14  contract A { } */\n      mstore(0x40, 0x80)\n      "
+			"revert(0x00, 0x00)\n\n    auxdata: 0xa26469706673582212")
+		== 0);
 	BOOST_CHECK(contract["evm"]["gasEstimates"].is_object());
 	BOOST_CHECK_EQUAL(contract["evm"]["gasEstimates"].size(), 1);
 	BOOST_CHECK(contract["evm"]["gasEstimates"]["creation"].is_object());
@@ -559,10 +572,9 @@ BOOST_AUTO_TEST_CASE(basic_compilation)
 	BOOST_CHECK(contract["evm"]["gasEstimates"]["creation"]["executionCost"].is_string());
 	BOOST_CHECK(contract["evm"]["gasEstimates"]["creation"]["totalCost"].is_string());
 	BOOST_CHECK_EQUAL(
-		u256(contract["evm"]["gasEstimates"]["creation"]["codeDepositCost"].get<std::string>()) +
-		u256(contract["evm"]["gasEstimates"]["creation"]["executionCost"].get<std::string>()),
-		u256(contract["evm"]["gasEstimates"]["creation"]["totalCost"].get<std::string>())
-	);
+		u256(contract["evm"]["gasEstimates"]["creation"]["codeDepositCost"].get<std::string>())
+			+ u256(contract["evm"]["gasEstimates"]["creation"]["executionCost"].get<std::string>()),
+		u256(contract["evm"]["gasEstimates"]["creation"]["totalCost"].get<std::string>()));
 	// Lets take the top level `.code` section (the "deployer code"), that should expose most of the features of
 	// the assembly JSON. What we want to check here is Operation, Push, PushTag, PushSub, PushSubSize and Tag.
 	BOOST_CHECK(contract["evm"]["legacyAssembly"].is_object());
@@ -583,14 +595,15 @@ BOOST_AUTO_TEST_CASE(basic_compilation)
 		"{\"begin\":0,\"end\":14,\"name\":\"tag\",\"source\":0,\"value\":\"1\"},"
 		"{\"begin\":0,\"end\":14,\"name\":\"JUMPDEST\",\"source\":0},"
 		"{\"begin\":0,\"end\":14,\"name\":\"POP\",\"source\":0},"
-		"{\"begin\":0,\"end\":14,\"name\":\"PUSH #[$]\",\"source\":0,\"value\":\"0000000000000000000000000000000000000000000000000000000000000000\"},"
+		"{\"begin\":0,\"end\":14,\"name\":\"PUSH "
+		"#[$]\",\"source\":0,\"value\":\"0000000000000000000000000000000000000000000000000000000000000000\"},"
 		"{\"begin\":0,\"end\":14,\"name\":\"DUP1\",\"source\":0},"
-		"{\"begin\":0,\"end\":14,\"name\":\"PUSH [$]\",\"source\":0,\"value\":\"0000000000000000000000000000000000000000000000000000000000000000\"},"
+		"{\"begin\":0,\"end\":14,\"name\":\"PUSH "
+		"[$]\",\"source\":0,\"value\":\"0000000000000000000000000000000000000000000000000000000000000000\"},"
 		"{\"begin\":0,\"end\":14,\"name\":\"PUSH\",\"source\":0,\"value\":\"0\"},"
 		"{\"begin\":0,\"end\":14,\"name\":\"CODECOPY\",\"source\":0},"
 		"{\"begin\":0,\"end\":14,\"name\":\"PUSH\",\"source\":0,\"value\":\"0\"},"
-		"{\"begin\":0,\"end\":14,\"name\":\"RETURN\",\"source\":0}]"
-	);
+		"{\"begin\":0,\"end\":14,\"name\":\"RETURN\",\"source\":0}]");
 	BOOST_CHECK(contract["metadata"].is_string());
 	BOOST_CHECK(solidity::test::isValidMetadata(contract["metadata"].get<std::string>()));
 	BOOST_CHECK(result["sources"].is_object());
@@ -598,12 +611,13 @@ BOOST_AUTO_TEST_CASE(basic_compilation)
 	BOOST_CHECK(result["sources"]["fileA"]["ast"].is_object());
 	BOOST_CHECK_EQUAL(
 		util::jsonCompactPrint(result["sources"]["fileA"]["ast"]),
-		"{\"absolutePath\":\"fileA\",\"exportedSymbols\":{\"A\":[1]},\"id\":2,\"nodeType\":\"SourceUnit\",\"nodes\":[{\"abstract\":false,"
+		"{\"absolutePath\":\"fileA\",\"exportedSymbols\":{\"A\":[1]},\"id\":2,\"nodeType\":\"SourceUnit\",\"nodes\":[{"
+		"\"abstract\":false,"
 		"\"baseContracts\":[],\"canonicalName\":\"A\",\"contractDependencies\":[],"
 		"\"contractKind\":\"contract\",\"fullyImplemented\":true,\"id\":1,"
-		"\"linearizedBaseContracts\":[1],\"name\":\"A\",\"nameLocation\":\"9:1:0\",\"nodeType\":\"ContractDefinition\",\"nodes\":[],\"scope\":2,"
-		"\"src\":\"0:14:0\",\"usedErrors\":[],\"usedEvents\":[]}],\"src\":\"0:14:0\"}"
-	);
+		"\"linearizedBaseContracts\":[1],\"name\":\"A\",\"nameLocation\":\"9:1:0\",\"nodeType\":\"ContractDefinition\","
+		"\"nodes\":[],\"scope\":2,"
+		"\"src\":\"0:14:0\",\"usedErrors\":[],\"usedEvents\":[]}],\"src\":\"0:14:0\"}");
 }
 
 BOOST_AUTO_TEST_CASE(compilation_error)
@@ -638,10 +652,12 @@ BOOST_AUTO_TEST_CASE(compilation_error)
 		{
 			BOOST_CHECK_EQUAL(
 				util::jsonCompactPrint(error),
-				"{\"component\":\"general\",\"errorCode\":\"2314\",\"formattedMessage\":\"ParserError: Expected identifier but got '}'\\n"
-				" --> fileA:1:23:\\n  |\\n1 | contract A { function }\\n  |                       ^\\n\\n\",\"message\":\"Expected identifier but got '}'\","
-				"\"severity\":\"error\",\"sourceLocation\":{\"end\":23,\"file\":\"fileA\",\"start\":22},\"type\":\"ParserError\"}"
-			);
+				"{\"component\":\"general\",\"errorCode\":\"2314\",\"formattedMessage\":\"ParserError: Expected "
+				"identifier but got '}'\\n"
+				" --> fileA:1:23:\\n  |\\n1 | contract A { function }\\n  |                       "
+				"^\\n\\n\",\"message\":\"Expected identifier but got '}'\","
+				"\"severity\":\"error\",\"sourceLocation\":{\"end\":23,\"file\":\"fileA\",\"start\":22},\"type\":"
+				"\"ParserError\"}");
 		}
 	}
 }
@@ -788,7 +804,9 @@ BOOST_AUTO_TEST_CASE(output_selection_dependent_contract)
 	Json contract = getContractResult(result, "fileA", "A");
 	BOOST_CHECK(contract.is_object());
 	BOOST_CHECK(contract["abi"].is_array());
-	BOOST_CHECK_EQUAL(util::jsonCompactPrint(contract["abi"]), "[{\"inputs\":[],\"name\":\"f\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}]");
+	BOOST_CHECK_EQUAL(
+		util::jsonCompactPrint(contract["abi"]),
+		"[{\"inputs\":[],\"name\":\"f\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}]");
 }
 
 BOOST_AUTO_TEST_CASE(output_selection_dependent_contract_with_import)
@@ -820,7 +838,9 @@ BOOST_AUTO_TEST_CASE(output_selection_dependent_contract_with_import)
 	Json contract = getContractResult(result, "fileA", "A");
 	BOOST_CHECK(contract.is_object());
 	BOOST_CHECK(contract["abi"].is_array());
-	BOOST_CHECK_EQUAL(util::jsonCompactPrint(contract["abi"]), "[{\"inputs\":[],\"name\":\"f\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}]");
+	BOOST_CHECK_EQUAL(
+		util::jsonCompactPrint(contract["abi"]),
+		"[{\"inputs\":[],\"name\":\"f\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}]");
 }
 
 BOOST_AUTO_TEST_CASE(filename_with_colon)
@@ -846,7 +866,10 @@ BOOST_AUTO_TEST_CASE(filename_with_colon)
 	)";
 	Json result = compile(input);
 	BOOST_CHECK(containsAtMostWarnings(result));
-	Json contract = getContractResult(result, "https://github.com/argotorg/solidity/blob/develop/test/compilationTests/gnosis/Tokens/StandardToken.sol", "A");
+	Json contract = getContractResult(
+		result,
+		"https://github.com/argotorg/solidity/blob/develop/test/compilationTests/gnosis/Tokens/StandardToken.sol",
+		"A");
 	BOOST_CHECK(contract.is_object());
 	BOOST_CHECK(contract["abi"].is_array());
 	BOOST_CHECK_EQUAL(util::jsonCompactPrint(contract["abi"]), "[]");
@@ -943,7 +966,8 @@ BOOST_AUTO_TEST_CASE(libraries_invalid_hex)
 	}
 	)";
 	Json result = compile(input);
-	BOOST_CHECK(containsError(result, "JSONError", "Invalid library address (\"0x4200000000000000000000000000000000000xx1\") supplied."));
+	BOOST_CHECK(containsError(
+		result, "JSONError", "Invalid library address (\"0x4200000000000000000000000000000000000xx1\") supplied."));
 }
 
 BOOST_AUTO_TEST_CASE(libraries_invalid_length)
@@ -1168,7 +1192,8 @@ BOOST_AUTO_TEST_CASE(evm_version)
 				"language": "Solidity",
 				"sources": { "fileA": { "content": "contract A { }" } },
 				"settings": {
-					)" + _version + R"(
+					)"
+			   + _version + R"(
 					"outputSelection": {
 						"fileA": {
 							"A": [ "metadata" ]
@@ -1182,11 +1207,17 @@ BOOST_AUTO_TEST_CASE(evm_version)
 	for (auto const& version: EVMVersion::allVersions())
 	{
 		result = compile(inputForVersion(fmt::format("\"evmVersion\": \"{}\",", version.name())));
-		BOOST_CHECK(result["contracts"]["fileA"]["A"]["metadata"].get<std::string>().find(fmt::format("\"evmVersion\":\"{}\"", version.name())) != std::string::npos);
+		BOOST_CHECK(
+			result["contracts"]["fileA"]["A"]["metadata"].get<std::string>().find(
+				fmt::format("\"evmVersion\":\"{}\"", version.name()))
+			!= std::string::npos);
 	}
 	// test default
 	result = compile(inputForVersion(""));
-	BOOST_CHECK(result["contracts"]["fileA"]["A"]["metadata"].get<std::string>().find(fmt::format("\"evmVersion\":\"{}\"", EVMVersion::current().name())) != std::string::npos);
+	BOOST_CHECK(
+		result["contracts"]["fileA"]["A"]["metadata"].get<std::string>().find(
+			fmt::format("\"evmVersion\":\"{}\"", EVMVersion::current().name()))
+		!= std::string::npos);
 	// test invalid
 	result = compile(inputForVersion("\"evmVersion\": \"invalid\","));
 	BOOST_CHECK(result["errors"][0]["message"].get<std::string>() == "Invalid EVM version requested.");
@@ -1344,15 +1375,14 @@ BOOST_AUTO_TEST_CASE(optimizer_settings_details_different)
 	BOOST_CHECK(optimizer["details"]["peephole"].get<bool>() == true);
 	BOOST_CHECK(optimizer["details"]["yul"].get<bool>() == true);
 	BOOST_CHECK(optimizer["details"]["yulDetails"].is_object());
-//	BOOST_CHECK(
-//		util::convertContainer<std::set<std::string>>(optimizer["details"]["yulDetails"].getMemberNames()) ==
-//		(std::set<std::string>{"stackAllocation", "optimizerSteps"})
-//	);
+	//	BOOST_CHECK(
+	//		util::convertContainer<std::set<std::string>>(optimizer["details"]["yulDetails"].getMemberNames()) ==
+	//		(std::set<std::string>{"stackAllocation", "optimizerSteps"})
+	//	);
 	BOOST_CHECK(optimizer["details"]["yulDetails"]["stackAllocation"].get<bool>() == true);
 	BOOST_CHECK(
-		optimizer["details"]["yulDetails"]["optimizerSteps"].get<std::string>() ==
-		OptimiserSettings::DefaultYulOptimiserSteps + ":"s + OptimiserSettings::DefaultYulOptimiserCleanupSteps
- 	);
+		optimizer["details"]["yulDetails"]["optimizerSteps"].get<std::string>()
+		== OptimiserSettings::DefaultYulOptimiserSteps + ":"s + OptimiserSettings::DefaultYulOptimiserCleanupSteps);
 	BOOST_CHECK_EQUAL(optimizer["details"].size(), 10);
 	BOOST_CHECK(optimizer["runs"].get<unsigned>() == 600);
 }
@@ -1524,8 +1554,7 @@ BOOST_AUTO_TEST_CASE(use_stack_optimization)
 	std::string optimiserSteps = OptimiserSettings::DefaultYulOptimiserSteps;
 	optimiserSteps.erase(
 		remove_if(optimiserSteps.begin(), optimiserSteps.end(), [](char ch) { return ch == 'p'; }),
-		optimiserSteps.end()
-	);
+		optimiserSteps.end());
 	parsedInput["settings"]["optimizer"]["details"]["yulDetails"]["stackAllocation"] = false;
 	parsedInput["settings"]["optimizer"]["details"]["yulDetails"]["optimizerSteps"] = optimiserSteps;
 
@@ -1533,7 +1562,8 @@ BOOST_AUTO_TEST_CASE(use_stack_optimization)
 	BOOST_REQUIRE(result["errors"].is_array());
 	BOOST_CHECK(result["errors"][0]["severity"] == "error");
 	BOOST_REQUIRE(result["errors"][0]["message"].is_string());
-	BOOST_CHECK(result["errors"][0]["message"].get<std::string>().find("When compiling inline assembly") != std::string::npos);
+	BOOST_CHECK(
+		result["errors"][0]["message"].get<std::string>().find("When compiling inline assembly") != std::string::npos);
 	BOOST_CHECK(result["errors"][0]["type"] == "CompilerError");
 }
 
@@ -1575,7 +1605,6 @@ BOOST_AUTO_TEST_CASE(standard_output_selection_wildcard)
 	BOOST_REQUIRE(result["sources"].is_object());
 	BOOST_REQUIRE(result["sources"].size() == 1);
 	BOOST_REQUIRE(result["sources"]["A"].is_object());
-
 }
 
 BOOST_AUTO_TEST_CASE(standard_output_selection_wildcard_colon_source)
@@ -1721,7 +1750,8 @@ BOOST_AUTO_TEST_CASE(stopAfter_invalid_value)
 	}
 	)";
 	Json result = compile(input);
-	BOOST_CHECK(containsError(result, "JSONError", "Invalid value for \"settings.stopAfter\". Only valid value is \"parsing\"."));
+	BOOST_CHECK(containsError(
+		result, "JSONError", "Invalid value for \"settings.stopAfter\". Only valid value is \"parsing\"."));
 }
 
 BOOST_AUTO_TEST_CASE(stopAfter_invalid_type)
@@ -1763,7 +1793,8 @@ BOOST_AUTO_TEST_CASE(stopAfter_bin_conflict)
 	}
 	)";
 	Json result = compile(input);
-	BOOST_CHECK(containsError(result, "JSONError", "Requested output selection conflicts with \"settings.stopAfter\"."));
+	BOOST_CHECK(
+		containsError(result, "JSONError", "Requested output selection conflicts with \"settings.stopAfter\"."));
 }
 
 BOOST_AUTO_TEST_CASE(stopAfter_ast_output)
@@ -1824,7 +1855,8 @@ BOOST_AUTO_TEST_CASE(dependency_tracking_of_abstract_contract)
 	BOOST_REQUIRE(result["contracts"]["BlockRewardAuRaCoins.sol"]["BlockRewardAuRaCoins"].is_object());
 	BOOST_REQUIRE(result["contracts"]["BlockRewardAuRaCoins.sol"]["BlockRewardAuRaCoins"]["evm"].is_object());
 	BOOST_REQUIRE(result["contracts"]["BlockRewardAuRaCoins.sol"]["BlockRewardAuRaCoins"]["ir"].is_string());
-	BOOST_REQUIRE(result["contracts"]["BlockRewardAuRaCoins.sol"]["BlockRewardAuRaCoins"]["evm"]["bytecode"].is_object());
+	BOOST_REQUIRE(
+		result["contracts"]["BlockRewardAuRaCoins.sol"]["BlockRewardAuRaCoins"]["evm"]["bytecode"].is_object());
 	BOOST_REQUIRE(result["sources"].is_object());
 	BOOST_REQUIRE(result["sources"].size() == 2);
 }
@@ -1880,12 +1912,8 @@ BOOST_AUTO_TEST_CASE(dependency_tracking_of_abstract_contract_yul)
 
 BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore", "solcoreOrigins"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input
+		= generateStandardJson(false, Json(), Json::array({"solcore", "solcoreOrigins"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.0;
 				contract C {
 					mapping(address => uint256) balances;
@@ -1900,9 +1928,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
 						return balances[a] == balances[b];
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -1913,7 +1939,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
 	BOOST_REQUIRE(contractResult["solcoreOrigins"].is_object());
 
 	Json const& solcore = contractResult["solcore"];
-	BOOST_CHECK_EQUAL(solcore["schemaVersion"].get<std::string>(), "0.1.0");
+	BOOST_CHECK_EQUAL(solcore["schemaVersion"].get<std::string>(), "0.2.0");
 	BOOST_CHECK_EQUAL(solcore["compilerVersion"].get<std::string>(), VersionString);
 	BOOST_CHECK_EQUAL(solcore["crate_name"].get<std::string>(), "C");
 	BOOST_CHECK_EQUAL(solcore["exporterFamily"].get<std::string>(), "solcore-solidity-0.8");
@@ -1942,16 +1968,756 @@ BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
 	BOOST_CHECK_EQUAL(sameBalance["name"].get<std::string>(), "sameBalance");
 	BOOST_CHECK_EQUAL(sameBalance["return"].get<std::string>(), "bool");
 	BOOST_CHECK_EQUAL(sameBalance["body"]["statements"][0]["kind"].get<std::string>(), "return");
-	BOOST_CHECK_EQUAL(
-		sameBalance["body"]["statements"][0]["value"]["kind"].get<std::string>(),
-		"u256_eq"
-	);
+	BOOST_CHECK_EQUAL(sameBalance["body"]["statements"][0]["value"]["kind"].get<std::string>(), "u256_eq");
 
 	Json const& origins = contractResult["solcoreOrigins"];
 	BOOST_CHECK_EQUAL(origins["schemaVersion"].get<std::string>(), "0.1.0");
 	BOOST_REQUIRE(origins["entries"].is_array());
 	BOOST_REQUIRE(origins["entries"].size() == 4);
 	BOOST_CHECK_EQUAL(origins["entries"][0]["originId"].get<std::string>(), "state:balances");
+}
+
+// Regression coverage for the stack-scoped enum-qualification index in
+// SolCoreExporter (enumNameNeedsQualification): qualification must trigger
+// exactly when a DIFFERENT enum definition shares the bare name anywhere in
+// the compiler stack — including enums in sources the exporting contract
+// never imports — and must not trigger for globally unique names. The
+// exporter answers this from an index built once per stack; a per-occurrence
+// rescan (the old O(enums x sources x nodes) behaviour) must yield the same
+// strings, so these assertions pin the semantics independently of the cache.
+BOOST_AUTO_TEST_CASE(solcore_export_enum_qualification_across_sources)
+{
+	Json input
+		= generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.0;
+				enum Status { Idle, Busy }
+				contract UsesA {
+					Status public s;
+				}
+			)"}, {"fileB", R"(
+				pragma solidity >=0.0;
+				enum Status { X, Y, Z }
+				contract UsesB {
+					Status public s;
+				}
+			)"}, {"fileC", R"(
+				pragma solidity >=0.0;
+				enum Solo { Only }
+				contract UsesC {
+					Solo public s;
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	auto fieldType = [&](std::string const& _file, std::string const& _contract) -> std::string
+	{
+		Json contractResult = getContractResult(result, _file, _contract);
+		BOOST_REQUIRE(contractResult.is_object());
+		Json const& solcore = contractResult["solcore"];
+		BOOST_REQUIRE(solcore["type_decls"].is_array());
+		BOOST_REQUIRE(solcore["type_decls"][0]["fields"].is_array());
+		BOOST_REQUIRE(solcore["type_decls"][0]["fields"].size() == 1);
+		Json const& type = solcore["type_decls"][0]["fields"][0]["type"];
+		BOOST_REQUIRE(type.is_object());
+		BOOST_CHECK_EQUAL(type["kind"].get<std::string>(), "enum");
+		return type["name"].get<std::string>();
+	};
+
+	// Both "Status" definitions collide on the bare name: each exported field
+	// type must carry the qualified identity "<source>:Status#<id>" of ITS OWN
+	// definition — not the bare name, and not the other source's identity.
+	std::string const typeA = fieldType("fileA", "UsesA");
+	std::string const typeB = fieldType("fileB", "UsesB");
+	BOOST_CHECK(typeA.find("fileA:Status#") == 0);
+	BOOST_CHECK(typeB.find("fileB:Status#") == 0);
+	BOOST_CHECK(typeA != typeB);
+
+	// Globally unique enum name: never qualified.
+	BOOST_CHECK_EQUAL(fieldType("fileC", "UsesC"), "Solo");
+}
+
+// Regression coverage for the stack-scoped foreign-contract summary cache in
+// SolCoreExporter: the foreign_contracts array is a pure function of the
+// compiler stack, so every contract exported in one run must observe the
+// IDENTICAL array. A cache keyed too broadly (across stacks), too narrowly
+// (rebuilt per contract), or dropped entries re-deriving differently per
+// contract all violate this equality.
+BOOST_AUTO_TEST_CASE(solcore_export_foreign_contracts_identical_across_contracts)
+{
+	Json input
+		= generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.0;
+				library Lib {
+					function twice(uint256 x) internal pure returns (uint256) { return x * 2; }
+				}
+				contract Alpha {
+					uint256 public total;
+					function add(uint256 x) external { total += Lib.twice(x); }
+				}
+				contract Beta {
+					mapping(address => uint256) balances;
+					function credit(address to, uint256 amount) external { balances[to] += amount; }
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json alphaResult = getContractResult(result, "fileA", "Alpha");
+	Json betaResult = getContractResult(result, "fileA", "Beta");
+	BOOST_REQUIRE(alphaResult.is_object());
+	BOOST_REQUIRE(betaResult.is_object());
+	Json const& alphaForeign = alphaResult["solcore"]["foreign_contracts"];
+	Json const& betaForeign = betaResult["solcore"]["foreign_contracts"];
+	BOOST_REQUIRE(alphaForeign.is_array());
+	BOOST_REQUIRE(betaForeign.is_array());
+	BOOST_CHECK(alphaForeign == betaForeign);
+
+	// The shared array summarizes the stack's contracts (by fully-qualified
+	// id); every contract in the input must be represented.
+	std::set<std::string> ids;
+	for (Json const& entry: alphaForeign)
+		if (entry.is_object() && entry.contains("id"))
+			ids.insert(entry["id"].get<std::string>());
+	BOOST_CHECK(ids.count("fileA:Alpha") == 1);
+	BOOST_CHECK(ids.count("fileA:Beta") == 1);
+	BOOST_CHECK(ids.count("fileA:Lib") == 1);
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_emit_binds_declaration_parameter_types)
+{
+	Json input
+		= generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Events.sol", R"(
+				pragma solidity >=0.0;
+				contract C {
+					event Transfer(address indexed from, uint256 amount);
+					event Signal(uint8 indexed code, bytes4 tag);
+					event Signal(address indexed who, bytes32 digest);
+					event Hidden(uint192 amount) anonymous;
+
+					function fire(address from, uint256 amount) external {
+						emit Transfer(from, amount);
+					}
+
+					function fireSmall(uint8 code, bytes4 tag) external {
+						emit Signal(code, tag);
+					}
+
+					function fireAddress(address who, bytes32 digest) external {
+						emit Signal(who, digest);
+					}
+
+					function fireHidden(uint192 amount) external {
+						emit Hidden(amount);
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "Events.sol", "C");
+	BOOST_REQUIRE(contractResult.is_object());
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+	Json const& statements = solcore["functions"][0]["body"]["statements"];
+	BOOST_REQUIRE(statements.is_array());
+	BOOST_REQUIRE(statements.size() >= 1);
+	Json const& emit = statements[0];
+	BOOST_CHECK_EQUAL(emit["kind"].get<std::string>(), "emit");
+	BOOST_CHECK_EQUAL(emit["event"].get<std::string>(), "Transfer");
+	BOOST_REQUIRE(emit["argTypes"].is_array());
+	BOOST_REQUIRE(emit["argTypes"].size() == 2);
+	BOOST_CHECK_EQUAL(emit["argTypes"][0].get<std::string>(), "address");
+	BOOST_CHECK_EQUAL(emit["argTypes"][1].get<std::string>(), "u256");
+
+	auto findFunction = [&solcore](std::string const& _name) -> Json const*
+	{
+		for (Json const& function: solcore["functions"])
+			if (function.value("name", ""s) == _name)
+				return &function;
+		return nullptr;
+	};
+	auto findEvent = [&solcore](std::string const& _signature) -> Json const*
+	{
+		for (Json const& event: solcore["events"])
+			if (event.value("signature", ""s) == _signature)
+				return &event;
+		return nullptr;
+	};
+	auto emitted = [&](std::string const& _function) -> Json const*
+	{
+		Json const* function = findFunction(_function);
+		if (!function)
+			return nullptr;
+		Json const& bodyStatements = function->at("body").at("statements");
+		if (!bodyStatements.is_array() || bodyStatements.empty())
+			return nullptr;
+		return &bodyStatements[0];
+	};
+
+	Json const* transferDecl = findEvent("Transfer(address,uint256)");
+	Json const* smallDecl = findEvent("Signal(uint8,bytes4)");
+	Json const* addressDecl = findEvent("Signal(address,bytes32)");
+	Json const* hiddenDecl = findEvent("Hidden(uint192)");
+	BOOST_REQUIRE(transferDecl != nullptr);
+	BOOST_REQUIRE(smallDecl != nullptr);
+	BOOST_REQUIRE(addressDecl != nullptr);
+	BOOST_REQUIRE(hiddenDecl != nullptr);
+	BOOST_CHECK_NE(smallDecl->at("name").get<std::string>(), addressDecl->at("name").get<std::string>());
+	BOOST_CHECK(hiddenDecl->at("anonymous").get<bool>());
+
+	std::set<std::string> declarationIds;
+	for (Json const* declaration: {transferDecl, smallDecl, addressDecl, hiddenDecl})
+	{
+		BOOST_REQUIRE((*declaration)["declarationId"].is_string());
+		std::string declarationId = (*declaration)["declarationId"].get<std::string>();
+		BOOST_CHECK(!declarationId.empty());
+		BOOST_CHECK_EQUAL(declarationId.find_first_not_of("0123456789"), std::string::npos);
+		BOOST_CHECK(declarationIds.insert(declarationId).second);
+		BOOST_REQUIRE((*declaration)["sourceLocation"].is_object());
+		BOOST_CHECK_EQUAL((*declaration)["sourceLocation"]["file"].get<std::string>(), "Events.sol");
+		for (Json const& parameter: (*declaration)["params"])
+		{
+			BOOST_REQUIRE(parameter["abi"].is_object());
+			BOOST_REQUIRE(parameter["abi"]["name"].is_string());
+			BOOST_REQUIRE(parameter["abi"]["type"].is_string());
+			BOOST_REQUIRE(parameter["abi"]["internalType"].is_string());
+			BOOST_REQUIRE(parameter["abi"]["components"].is_array());
+		}
+	}
+	BOOST_CHECK_EQUAL((*smallDecl)["params"][0]["abi"]["type"].get<std::string>(), "uint8");
+	BOOST_CHECK_EQUAL((*smallDecl)["params"][1]["abi"]["type"].get<std::string>(), "bytes4");
+	BOOST_CHECK_EQUAL((*addressDecl)["params"][0]["abi"]["type"].get<std::string>(), "address");
+	BOOST_CHECK_EQUAL((*addressDecl)["params"][1]["abi"]["type"].get<std::string>(), "bytes32");
+	BOOST_CHECK_EQUAL((*hiddenDecl)["params"][0]["abi"]["type"].get<std::string>(), "uint192");
+
+	Json const* transferEmit = emitted("fire");
+	Json const* smallEmit = emitted("fireSmall");
+	Json const* addressEmit = emitted("fireAddress");
+	Json const* hiddenEmit = emitted("fireHidden");
+	BOOST_REQUIRE(transferEmit != nullptr);
+	BOOST_REQUIRE(smallEmit != nullptr);
+	BOOST_REQUIRE(addressEmit != nullptr);
+	BOOST_REQUIRE(hiddenEmit != nullptr);
+	BOOST_CHECK_EQUAL(
+		transferEmit->at("eventDeclarationId").get<std::string>(),
+		transferDecl->at("declarationId").get<std::string>());
+	BOOST_CHECK_EQUAL(
+		smallEmit->at("eventDeclarationId").get<std::string>(),
+		smallDecl->at("declarationId").get<std::string>());
+	BOOST_CHECK_EQUAL(
+		addressEmit->at("eventDeclarationId").get<std::string>(),
+		addressDecl->at("declarationId").get<std::string>());
+	BOOST_CHECK_EQUAL(
+		hiddenEmit->at("eventDeclarationId").get<std::string>(),
+		hiddenDecl->at("declarationId").get<std::string>());
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_recursive_abi_and_call_modes)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Abi.sol", R"(
+				pragma solidity >=0.8.20;
+
+				interface ITarget {
+					struct Inner {
+						bytes4 tag;
+						uint192 amount;
+					}
+					struct Outer {
+						Inner inner;
+						Inner[2] pair;
+						uint8[] flags;
+						bytes blob;
+						string text;
+						bytes32 digest;
+					}
+
+					function inspect(Outer calldata value, bytes4 marker)
+						external view returns (bytes4);
+					function mutate(Outer calldata value)
+						external returns (bytes32);
+				}
+
+				contract Caller {
+					function inspect(ITarget.Outer calldata, bytes4 marker)
+						external pure returns (bytes4)
+					{
+						return marker;
+					}
+
+					function invokeRead(
+						ITarget target,
+						ITarget.Outer calldata value,
+						bytes4 marker
+					) external view returns (bytes4) {
+						return target.inspect(value, marker);
+					}
+
+					function invokeWrite(ITarget target, ITarget.Outer calldata value)
+						external returns (bytes32)
+					{
+						return target.mutate(value);
+					}
+
+					function invokeSelf(ITarget.Outer calldata value, bytes4 marker)
+						external view returns (bytes4)
+					{
+						return this.inspect(value, marker);
+					}
+
+					function invokeViewPointer(
+						function (uint8) external view returns (bytes4) fn,
+						uint8 value
+					) external view returns (bytes4) {
+						return fn(value);
+					}
+
+					function invokeStatePointer(
+						function (uint8) external returns (bytes4) fn,
+						uint8 value
+					) external returns (bytes4) {
+						return fn(value);
+					}
+
+					function rawStatic(address target, bytes calldata payload) external {
+						target.staticcall(payload);
+					}
+
+					function rawCall(address target, bytes calldata payload) external {
+						target.call(payload);
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json const& solcore = getContractResult(result, "Abi.sol", "Caller")["solcore"];
+	BOOST_REQUIRE(solcore.is_object());
+
+	auto findBy = [](Json const& _entries, std::string const& _field, std::string const& _value) -> Json const*
+	{
+		for (Json const& entry: _entries)
+			if (entry.value(_field, ""s) == _value)
+				return &entry;
+		return nullptr;
+	};
+	auto component = [](Json const& _descriptor, std::string const& _name) -> Json const*
+	{
+		for (Json const& entry: _descriptor["components"])
+			if (entry.value("name", ""s) == _name)
+				return &entry;
+		return nullptr;
+	};
+
+	Json const* invokeRead = findBy(solcore["functions"], "name", "invokeRead");
+	Json const* invokeWrite = findBy(solcore["functions"], "name", "invokeWrite");
+	Json const* invokeSelf = findBy(solcore["functions"], "name", "invokeSelf");
+	Json const* invokeViewPointer = findBy(solcore["functions"], "name", "invokeViewPointer");
+	Json const* invokeStatePointer = findBy(solcore["functions"], "name", "invokeStatePointer");
+	Json const* rawStatic = findBy(solcore["functions"], "name", "rawStatic");
+	Json const* rawCall = findBy(solcore["functions"], "name", "rawCall");
+	BOOST_REQUIRE(invokeRead != nullptr);
+	BOOST_REQUIRE(invokeWrite != nullptr);
+	BOOST_REQUIRE(invokeSelf != nullptr);
+	BOOST_REQUIRE(invokeViewPointer != nullptr);
+	BOOST_REQUIRE(invokeStatePointer != nullptr);
+	BOOST_REQUIRE(rawStatic != nullptr);
+	BOOST_REQUIRE(rawCall != nullptr);
+
+	Json const& outer = invokeRead->at("params")[1]["abi"];
+	BOOST_CHECK_EQUAL(outer["name"].get<std::string>(), "value");
+	BOOST_CHECK_EQUAL(outer["type"].get<std::string>(), "tuple");
+	BOOST_CHECK_EQUAL(outer["internalType"].get<std::string>(), "struct ITarget.Outer");
+	BOOST_REQUIRE(outer["components"].is_array());
+	BOOST_REQUIRE_EQUAL(outer["components"].size(), 6u);
+
+	Json const* inner = component(outer, "inner");
+	Json const* pair = component(outer, "pair");
+	Json const* flags = component(outer, "flags");
+	Json const* blob = component(outer, "blob");
+	Json const* text = component(outer, "text");
+	Json const* digest = component(outer, "digest");
+	BOOST_REQUIRE(inner != nullptr);
+	BOOST_REQUIRE(pair != nullptr);
+	BOOST_REQUIRE(flags != nullptr);
+	BOOST_REQUIRE(blob != nullptr);
+	BOOST_REQUIRE(text != nullptr);
+	BOOST_REQUIRE(digest != nullptr);
+	BOOST_CHECK_EQUAL(inner->at("type").get<std::string>(), "tuple");
+	BOOST_CHECK_EQUAL(pair->at("type").get<std::string>(), "tuple[2]");
+	BOOST_REQUIRE_EQUAL(inner->at("components").size(), 2u);
+	BOOST_REQUIRE_EQUAL(pair->at("components").size(), 2u);
+	BOOST_CHECK_EQUAL(inner->at("components")[0]["type"].get<std::string>(), "bytes4");
+	BOOST_CHECK_EQUAL(inner->at("components")[1]["type"].get<std::string>(), "uint192");
+	BOOST_CHECK_EQUAL(flags->at("type").get<std::string>(), "uint8[]");
+	BOOST_CHECK_EQUAL(blob->at("type").get<std::string>(), "bytes");
+	BOOST_CHECK_EQUAL(text->at("type").get<std::string>(), "string");
+	BOOST_CHECK_EQUAL(digest->at("type").get<std::string>(), "bytes32");
+	for (Json const& descriptor: outer["components"])
+	{
+		BOOST_REQUIRE(descriptor["name"].is_string());
+		BOOST_REQUIRE(descriptor["type"].is_string());
+		BOOST_REQUIRE(descriptor["internalType"].is_string());
+		BOOST_REQUIRE(descriptor["components"].is_array());
+	}
+	BOOST_REQUIRE(invokeRead->at("returnAbi").is_array());
+	BOOST_REQUIRE_EQUAL(invokeRead->at("returnAbi").size(), 1u);
+	BOOST_CHECK_EQUAL(invokeRead->at("returnAbi")[0]["type"].get<std::string>(), "bytes4");
+	BOOST_CHECK_EQUAL(invokeWrite->at("returnAbi")[0]["type"].get<std::string>(), "bytes32");
+
+	Json const* callerDispatch = findBy(solcore["dispatch_entries"], "abiFunction", "invokeRead");
+	BOOST_REQUIRE(callerDispatch != nullptr);
+	BOOST_REQUIRE_EQUAL(callerDispatch->at("paramsAbi").size(), 3u);
+	BOOST_CHECK_EQUAL(callerDispatch->at("paramsAbi")[1]["type"].get<std::string>(), "tuple");
+	BOOST_CHECK_EQUAL(callerDispatch->at("returnsAbi")[0]["type"].get<std::string>(), "bytes4");
+
+	Json const* targetSummary = findBy(solcore["foreign_contracts"], "id", "Abi.sol:ITarget");
+	BOOST_REQUIRE(targetSummary != nullptr);
+	Json const* targetMethod = findBy(targetSummary->at("methods"), "name", "inspect");
+	Json const* targetDispatch = findBy(targetSummary->at("dispatch_entries"), "abiFunction", "inspect");
+	Json const* mutateMethod = findBy(targetSummary->at("methods"), "name", "mutate");
+	Json const* mutateDispatch = findBy(targetSummary->at("dispatch_entries"), "abiFunction", "mutate");
+	BOOST_REQUIRE(targetMethod != nullptr);
+	BOOST_REQUIRE(targetDispatch != nullptr);
+	BOOST_REQUIRE(mutateMethod != nullptr);
+	BOOST_REQUIRE(mutateDispatch != nullptr);
+	BOOST_REQUIRE_EQUAL(targetMethod->at("paramsAbi").size(), 2u);
+	BOOST_CHECK_EQUAL(targetMethod->at("paramsAbi")[0]["type"].get<std::string>(), "tuple");
+	BOOST_CHECK_EQUAL(targetMethod->at("returnsAbi")[0]["type"].get<std::string>(), "bytes4");
+	BOOST_CHECK(targetMethod->at("paramsAbi") == targetDispatch->at("paramsAbi"));
+	BOOST_CHECK(targetMethod->at("returnsAbi") == targetDispatch->at("returnsAbi"));
+	BOOST_CHECK_EQUAL(mutateMethod->at("returnsAbi")[0]["type"].get<std::string>(), "bytes32");
+	BOOST_CHECK(mutateMethod->at("paramsAbi") == mutateDispatch->at("paramsAbi"));
+	BOOST_CHECK(mutateMethod->at("returnsAbi") == mutateDispatch->at("returnsAbi"));
+
+	Json const& readCall = invokeRead->at("body")["statements"][0]["value"];
+	Json const& writeCall = invokeWrite->at("body")["statements"][0]["value"];
+	Json const& selfCall = invokeSelf->at("body")["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(readCall["callMode"].get<std::string>(), "staticcall");
+	BOOST_CHECK_EQUAL(writeCall["callMode"].get<std::string>(), "call");
+	BOOST_CHECK_EQUAL(selfCall["callMode"].get<std::string>(), "same_unit");
+	Json const& viewPointerCall = invokeViewPointer->at("body")["statements"][0]["value"];
+	Json const& statePointerCall = invokeStatePointer->at("body")["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(viewPointerCall["kind"].get<std::string>(), "extfn_call");
+	BOOST_CHECK_EQUAL(viewPointerCall["callMode"].get<std::string>(), "staticcall");
+	BOOST_CHECK_EQUAL(statePointerCall["callMode"].get<std::string>(), "call");
+	BOOST_CHECK_EQUAL(invokeViewPointer->at("params")[0]["abi"]["type"].get<std::string>(), "function");
+	BOOST_REQUIRE(readCall["knownTarget"].is_object());
+	BOOST_CHECK_EQUAL(readCall["knownTarget"]["paramsAbi"][0]["type"].get<std::string>(), "tuple");
+	BOOST_CHECK_EQUAL(readCall["knownTarget"]["returnsAbi"][0]["type"].get<std::string>(), "bytes4");
+	BOOST_CHECK(readCall["knownTarget"]["paramsAbi"] == targetMethod->at("paramsAbi"));
+	BOOST_CHECK(readCall["knownTarget"]["returnsAbi"] == targetMethod->at("returnsAbi"));
+	BOOST_REQUIRE(writeCall["knownTarget"].is_object());
+	BOOST_CHECK_EQUAL(writeCall["knownTarget"]["returnsAbi"][0]["type"].get<std::string>(), "bytes32");
+
+	Json const& rawStaticCall = rawStatic->at("body")["statements"][0]["value"];
+	Json const& rawOrdinaryCall = rawCall->at("body")["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(rawStaticCall["kind"].get<std::string>(), "low_level_call");
+	BOOST_CHECK_EQUAL(rawStaticCall["callKind"].get<std::string>(), "staticcall");
+	BOOST_CHECK_EQUAL(rawOrdinaryCall["callKind"].get<std::string>(), "call");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_library_enum_wire_abi_and_selector_dialect)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"LibraryEnums.sol", R"(
+				pragma solidity >=0.8.20;
+
+				library EnumOverloads {
+					enum EnumA { Zero, One }
+					enum EnumB { Zero, One }
+
+					function pick(EnumA value) public pure returns (EnumA) {
+						return value;
+					}
+
+					function pick(EnumB value) public pure returns (EnumB) {
+						return value;
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json const& solcore = getContractResult(result, "LibraryEnums.sol", "EnumOverloads")["solcore"];
+	BOOST_REQUIRE(solcore.is_object());
+
+	auto findBySignature = [](Json const& _entries, std::string const& _signature) -> Json const*
+	{
+		for (Json const& entry: _entries)
+			if (entry.value("signature", ""s) == _signature)
+				return &entry;
+		return nullptr;
+	};
+	Json const* librarySummary = nullptr;
+	for (Json const& summary: solcore["foreign_contracts"])
+		if (summary.value("id", ""s) == "LibraryEnums.sol:EnumOverloads")
+		{
+			librarySummary = &summary;
+			break;
+		}
+	BOOST_REQUIRE(librarySummary != nullptr);
+	BOOST_CHECK_EQUAL(librarySummary->at("kind").get<std::string>(), "library");
+
+	std::set<std::string> selectors;
+	for (auto const& [signature, internalType]: std::vector<std::pair<std::string, std::string>>{
+			 {"pick(EnumOverloads.EnumA)", "enum EnumOverloads.EnumA"},
+			 {"pick(EnumOverloads.EnumB)", "enum EnumOverloads.EnumB"}})
+	{
+		Json const* method = findBySignature(librarySummary->at("methods"), signature);
+		Json const* foreignDispatch = findBySignature(librarySummary->at("dispatch_entries"), signature);
+		Json const* localDispatch = findBySignature(solcore["dispatch_entries"], signature);
+		BOOST_REQUIRE(method != nullptr);
+		BOOST_REQUIRE(foreignDispatch != nullptr);
+		BOOST_REQUIRE(localDispatch != nullptr);
+		BOOST_REQUIRE_EQUAL(method->at("paramsAbi").size(), 1u);
+		BOOST_REQUIRE_EQUAL(method->at("returnsAbi").size(), 1u);
+		BOOST_CHECK_EQUAL(method->at("paramsAbi")[0]["type"].get<std::string>(), "uint8");
+		BOOST_CHECK_EQUAL(method->at("paramsAbi")[0]["internalType"].get<std::string>(), internalType);
+		BOOST_CHECK_EQUAL(method->at("returnsAbi")[0]["type"].get<std::string>(), "uint8");
+		BOOST_CHECK_EQUAL(method->at("returnsAbi")[0]["internalType"].get<std::string>(), internalType);
+		BOOST_CHECK(method->at("paramsAbi") == foreignDispatch->at("paramsAbi"));
+		BOOST_CHECK(method->at("returnsAbi") == foreignDispatch->at("returnsAbi"));
+		BOOST_CHECK(method->at("paramsAbi") == localDispatch->at("paramsAbi"));
+		BOOST_CHECK(method->at("returnsAbi") == localDispatch->at("returnsAbi"));
+		selectors.insert(method->at("selector").get<std::string>());
+	}
+	BOOST_CHECK_EQUAL(selectors.size(), 2u);
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_synthesized_names_are_deterministic)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Determinism.sol", R"(
+				pragma solidity >=0.0;
+				contract C {
+					uint256 order;
+
+					function record(uint256 digit) internal returns (uint256) {
+						order = order * 10 + digit;
+						return digit;
+					}
+
+					function add(uint256 left, uint256 right) internal pure returns (uint256) {
+						return left + right;
+					}
+
+					function run() external returns (uint256) {
+						return add(record(1), record(2));
+					}
+				}
+			)"}}));
+
+	Json first = compile(input.dump());
+	Json second = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(first));
+	BOOST_REQUIRE(containsAtMostWarnings(second));
+
+	Json firstSolCore = getContractResult(first, "Determinism.sol", "C")["solcore"];
+	Json secondSolCore = getContractResult(second, "Determinism.sol", "C")["solcore"];
+	BOOST_REQUIRE(firstSolCore.is_object());
+	BOOST_REQUIRE(secondSolCore.is_object());
+	BOOST_CHECK_EQUAL(firstSolCore.dump(), secondSolCore.dump());
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_inline_assembly_producer_interface)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Assembly.sol", R"(
+				pragma solidity >=0.8.28;
+				contract C {
+					uint128 first;
+					uint128 packed;
+
+					function probe(uint256 input) external returns (uint256 output) {
+						uint256 local = input;
+						assembly {
+							function touch(p) -> r {
+								r := mload(p)
+								mstore(add(p, 0x20), r)
+								r := add(r, caller())
+							}
+
+							let slot := packed.slot
+							let offset := packed.offset
+							local := add(local, add(sload(slot), offset))
+							sstore(slot, local)
+							tstore(0, tload(0))
+
+							let size := returndatasize()
+							returndatacopy(0, 0, size)
+							log1(0, 0x20, local)
+							pop(call(gas(), caller(), 0, 0, 0, 0, 0))
+
+							switch calldatasize()
+							case 0 { revert(0, 0) }
+							default {
+								for { let i := 0 } lt(i, 1) { i := add(i, 1) } {
+									if iszero(local) { revert(0, 0) }
+								}
+							}
+
+							output := touch(0)
+						}
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json const& solcore = getContractResult(result, "Assembly.sol", "C")["solcore"];
+	BOOST_REQUIRE(solcore["functions"].is_array());
+	BOOST_REQUIRE_EQUAL(solcore["functions"].size(), 1u);
+
+	Json const& statements = solcore["functions"][0]["body"]["statements"];
+	BOOST_REQUIRE(statements.is_array());
+	Json const* assembly = nullptr;
+	for (Json const& statement: statements)
+		if (statement.value("kind", ""s) == "inline_assembly")
+			assembly = &statement;
+	BOOST_REQUIRE(assembly != nullptr);
+
+	// The existing syntax tree remains present and keeps dialect-resolved call
+	// names; the interface is additional producer authority, not a replacement.
+	BOOST_REQUIRE((*assembly)["body"].is_object());
+	BOOST_CHECK_EQUAL((*assembly)["body"]["kind"].get<std::string>(), "yul_block");
+	std::string const body = (*assembly)["body"].dump();
+	BOOST_CHECK_NE(body.find("\"kind\":\"yul_fundef\""), std::string::npos);
+	BOOST_CHECK_NE(body.find("\"function\":\"mload\""), std::string::npos);
+
+	Json const& interface = (*assembly)["interface"];
+	BOOST_REQUIRE(interface.is_object());
+	BOOST_REQUIRE(interface["memoryReads"].is_boolean());
+	BOOST_REQUIRE(interface["memoryWrites"].is_boolean());
+	BOOST_CHECK(interface["memoryReads"].get<bool>());
+	BOOST_CHECK(interface["memoryWrites"].get<bool>());
+
+	Json const expectedEnvironment
+		= Json::array({"calldatasize", "caller", "gas"});
+	Json const expectedEffects = Json::array({
+		"call",
+		"log",
+		"returndata_copy",
+		"returndata_read",
+		"storage_read",
+		"storage_write",
+		"termination",
+		"transient_read",
+		"transient_write"
+	});
+	Json const expectedOperations = Json::array({
+		"add",
+		"call",
+		"calldatasize",
+		"caller",
+		"gas",
+		"iszero",
+		"log1",
+		"lt",
+		"mload",
+		"mstore",
+		"pop",
+		"revert",
+		"returndatacopy",
+		"returndatasize",
+		"sload",
+		"sstore",
+		"tload",
+		"touch",
+		"tstore"
+	});
+	BOOST_CHECK_EQUAL(interface["environmentReads"].dump(), expectedEnvironment.dump());
+	BOOST_CHECK_EQUAL(interface["effects"].dump(), expectedEffects.dump());
+	BOOST_CHECK_EQUAL(interface["operations"].dump(), expectedOperations.dump());
+
+	Json const& locals = interface["locals"];
+	BOOST_REQUIRE(locals.is_array());
+	BOOST_REQUIRE_EQUAL(locals.size(), 4u);
+	std::set<std::string> localKeys;
+	std::string previousKey;
+	bool firstRow = true;
+	bool sawLocal = false;
+	bool sawPackedSlot = false;
+	bool sawPackedOffset = false;
+	bool sawOutput = false;
+	for (Json const& row: locals)
+	{
+		BOOST_REQUIRE(row["declarationId"].is_string());
+		BOOST_REQUIRE(row["name"].is_string());
+		BOOST_REQUIRE(row["suffix"].is_string());
+		BOOST_REQUIRE(row["access"].is_string());
+		BOOST_CHECK(row["type"].is_string() || row["type"].is_object());
+		std::string const key
+			= row["declarationId"].get<std::string>() + "\x1f"
+			  + row["name"].get<std::string>() + "\x1f"
+			  + row["suffix"].get<std::string>();
+		if (!firstRow)
+			BOOST_CHECK(previousKey < key);
+		firstRow = false;
+		previousKey = key;
+		BOOST_CHECK(localKeys.insert(key).second);
+
+		std::string const name = row["name"].get<std::string>();
+		std::string const suffix = row["suffix"].get<std::string>();
+		std::string const access = row["access"].get<std::string>();
+		if (name == "local" && suffix == "none" && access == "read_write")
+			sawLocal = true;
+		if (name == "packed" && suffix == "slot" && access == "read")
+			sawPackedSlot = true;
+		if (name == "packed" && suffix == "offset" && access == "read")
+			sawPackedOffset = true;
+		if (name == "output" && suffix == "none" && access == "write")
+			sawOutput = true;
+	}
+	BOOST_CHECK(sawLocal);
+	BOOST_CHECK(sawPackedSlot);
+	BOOST_CHECK(sawPackedOffset);
+	BOOST_CHECK(sawOutput);
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_inline_assembly_rejects_unrepresentable_alias_and_operation)
+{
+	Json aliasInput = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Alias.sol", R"(
+				pragma solidity >=0.8.28;
+				contract BadAlias {
+					function bad(bytes calldata data) external pure returns (uint256 output) {
+						assembly { output := data.length }
+					}
+				}
+			)"}}));
+	Json aliasResult = compile(aliasInput.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(aliasResult));
+	Json const& aliasSolcore = getContractResult(aliasResult, "Alias.sol", "BadAlias")["solcore"];
+	BOOST_REQUIRE(aliasSolcore["functions"].is_array());
+	BOOST_REQUIRE_EQUAL(aliasSolcore["functions"].size(), 1u);
+	Json const& aliasBody = aliasSolcore["functions"][0]["body"];
+	BOOST_CHECK_EQUAL(aliasBody["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_NE(
+		aliasBody["error"].get<std::string>().find("unsupported suffix '.length'"),
+		std::string::npos);
+
+	Json operationInput = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Operation.sol", R"(
+				pragma solidity >=0.8.28;
+				contract BadOperation {
+					function bad() external pure {
+						assembly { not_an_opcode() }
+					}
+				}
+			)"}}));
+	Json operationResult = compile(operationInput.dump());
+	BOOST_REQUIRE(operationResult["errors"].is_array());
+	bool rejectedOperation = false;
+	for (Json const& error: operationResult["errors"])
+	{
+		std::string const message = error.value("message", ""s);
+		rejectedOperation = rejectedOperation
+							|| (
+								error.value("severity", ""s) == "error"
+								&& message.find("not_an_opcode") != std::string::npos
+								&& message.find("not found") != std::string::npos
+							);
+	}
+	BOOST_CHECK(rejectedOperation);
 }
 
 // --- Internal function used as a value: bounded defunctionalization tests ---
@@ -1969,20 +2735,88 @@ Json const* findExportedFunction(Json const& _functionArray, std::string const& 
 	return nullptr;
 }
 
+BOOST_AUTO_TEST_CASE(solcore_export_using_for_receiver_and_library_identity)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+
+				library ReceiverLibrary {
+					function internalPlus(uint256 self, uint256 delta)
+						internal pure returns (uint256)
+					{
+						return self + delta;
+					}
+
+					function publicPlus(uint256 self, uint256 delta)
+						public pure returns (uint256)
+					{
+						return self + delta;
+					}
+
+					function externalPlus(uint256 self, uint256 delta)
+						external pure returns (uint256)
+					{
+						return self + delta;
+					}
+				}
+
+				contract C {
+					using ReceiverLibrary for uint256;
+
+					function expressionPath(uint256 x) external pure returns (uint256) {
+						return x.internalPlus(7) + x.publicPlus(9);
+					}
+
+					function statementPath(uint256 x) external pure {
+						x.internalPlus(11);
+						x.publicPlus(13);
+						x.externalPlus(15);
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json const contractResult = getContractResult(result, "fileA", "C");
+	Json const& solcore = contractResult["solcore"];
+
+	auto checkAttachedCall = [](Json const& _call, std::string const& _function, std::string const& _delta)
+	{
+		BOOST_REQUIRE(_call.is_object());
+		BOOST_CHECK_EQUAL(_call.at("kind").get<std::string>(), "internal_call");
+		BOOST_CHECK_EQUAL(_call.at("function").get<std::string>(), _function);
+		BOOST_CHECK_EQUAL(_call.at("contractId").get<std::string>(), "fileA:ReceiverLibrary");
+		Json const& args = _call.at("args");
+		BOOST_REQUIRE(args.is_array());
+		BOOST_REQUIRE_EQUAL(args.size(), 2);
+		BOOST_CHECK_EQUAL(args[0].at("kind").get<std::string>(), "local");
+		BOOST_CHECK_EQUAL(args[0].at("name").get<std::string>(), "x");
+		BOOST_CHECK_EQUAL(args[1].at("kind").get<std::string>(), "u256");
+		BOOST_CHECK_EQUAL(args[1].at("value").get<std::string>(), _delta);
+	};
+
+	Json const* expressionPath = findExportedFunction(solcore["functions"], "expressionPath");
+	BOOST_REQUIRE(expressionPath);
+	Json const& sum = expressionPath->at("body").at("statements")[0].at("value");
+	BOOST_CHECK_EQUAL(sum.at("kind").get<std::string>(), "u256_add");
+	checkAttachedCall(sum.at("lhs"), "internalPlus", "7");
+	checkAttachedCall(sum.at("rhs"), "publicPlus", "9");
+
+	Json const* statementPath = findExportedFunction(solcore["functions"], "statementPath");
+	BOOST_REQUIRE(statementPath);
+	Json const& statements = statementPath->at("body").at("statements");
+	BOOST_REQUIRE_GE(statements.size(), 3);
+	checkAttachedCall(statements[0].at("value"), "internalPlus", "11");
+	checkAttachedCall(statements[1].at("value"), "publicPlus", "13");
+	checkAttachedCall(statements[2].at("value"), "externalPlus", "15");
+}
+
 BOOST_AUTO_TEST_CASE(solcore_export_fnptr_direct_literal_argument_is_specialized)
 {
-	// T1 (positive/singleton): a receiver taking an internal-function-typed
-	// parameter, called from two sites with two different direct-literal
-	// targets. Both call sites must get REAL bodies calling distinct
-	// specialized siblings with the function-typed parameter erased; the
-	// GENERIC (unspecialized) receiver must keep failing closed at the now
-	// precise indirect-call message (not the old "used as a value" one).
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	// T1 (positive/singleton): direct function-reference arguments keep the
+	// specialization fast path, while the exported generic receiver now uses
+	// the closed-table function-value model rather than an unsupported body.
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract FnPtrRepro {
 					function bump(uint256 x) external pure returns (uint256) {
@@ -2001,9 +2835,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_direct_literal_argument_is_specialized
 						return a - 1;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2042,22 +2874,23 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_direct_literal_argument_is_specialized
 	BOOST_REQUIRE(addSibling->at("params").is_array());
 	BOOST_CHECK_EQUAL(addSibling->at("params").size(), 1u);
 	BOOST_CHECK_EQUAL(addSibling->at("params")[0]["name"].get<std::string>(), "x");
-	BOOST_CHECK_EQUAL(
-		addSibling->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_add");
-	BOOST_CHECK_EQUAL(
-		subSibling->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_subtract");
+	BOOST_CHECK_EQUAL(addSibling->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_add");
+	BOOST_CHECK_EQUAL(subSibling->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_subtract");
 	BOOST_CHECK_EQUAL(addSibling->at("fnptr_specialization")["of"].get<std::string>(), "_apply");
 	BOOST_REQUIRE(addSibling->at("ast_write_oracle").is_object());
 
-	// The GENERIC (unspecialized) _apply is still exported (append-only
-	// artifact policy) but now fails closed at the NEW precise indirect-call
-	// message rather than the old blanket "used as a value" one.
+	// The generic receiver remains structurally valid: calls through its
+	// function-typed parameter use the generated table/dispatcher contract,
+	// never a name-based internal_call fallback.
 	Json const* genericApply = findExportedFunction(solcore["internal_functions"], "_apply");
 	BOOST_REQUIRE(genericApply != nullptr);
-	BOOST_CHECK_EQUAL(genericApply->at("body")["kind"].get<std::string>(), "unsupported_body");
-	BOOST_CHECK_MESSAGE(
-		genericApply->at("body")["error"].get<std::string>().find("indirect call through an internal function value") != std::string::npos,
-		"the generic _apply must fail at the new precise indirect-call message, not the old blanket one");
+	Json const& genericCall = genericApply->at("body")["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(genericCall["kind"].get<std::string>(), "internal_fn_call");
+	BOOST_CHECK_EQUAL(genericCall["fn"]["kind"].get<std::string>(), "local");
+	BOOST_CHECK_EQUAL(genericCall["fn"]["name"].get<std::string>(), "op");
+	BOOST_REQUIRE_EQUAL(solcore["internal_fn_tables"].size(), 1u);
+	BOOST_CHECK_EQUAL(
+		genericCall["table"].get<std::string>(), solcore["internal_fn_tables"][0]["id"].get<std::string>());
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_fnptr_virtual_argument_binds_derived_override)
@@ -2068,12 +2901,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_virtual_argument_binds_derived_overrid
 	// contract), not the lexically-referenced base declaration — mirrors
 	// virtualCallTargetName's existing rule and solc's own codegen
 	// (FunctionDefinition::resolveVirtual at pointer-creation time).
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract FnPtrVirtualBase {
 					function run(uint256 x) external pure returns (uint256) {
@@ -2091,9 +2919,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_virtual_argument_binds_derived_overrid
 						return a + 100;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2132,18 +2958,12 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_virtual_argument_binds_derived_overrid
 		hookFn->at("name").get<std::string>());
 }
 
-BOOST_AUTO_TEST_CASE(solcore_export_fnptr_conditional_argument_fails_closed)
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_conditional_argument_uses_closed_table)
 {
-	// T3 (adversarial: conditionally-selected target). A ternary between two
-	// function literals is not a single statically-known target — must fail
-	// closed with the new precise message, and must NOT emit any
-	// `__fnptr__` sibling.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	// T3: a conditional function value cannot use singleton specialization,
+	// so both arms must mint candidates in one closed table and the call must
+	// route through the generic receiver.
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract T3Conditional {
 					function pick(bool c, uint256 x) external pure returns (uint256) {
@@ -2155,9 +2975,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_conditional_argument_fails_closed)
 					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
 					function _subtract(uint256 a) private pure returns (uint256) { return a - 1; }
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2167,29 +2985,29 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_conditional_argument_fails_closed)
 
 	Json const* pick = findExportedFunction(solcore["functions"], "pick");
 	BOOST_REQUIRE(pick != nullptr);
-	BOOST_CHECK_EQUAL(pick->at("body")["kind"].get<std::string>(), "unsupported_body");
-	BOOST_CHECK_MESSAGE(
-		pick->at("body")["error"].get<std::string>().find("not a direct internal function reference") != std::string::npos,
-		"a conditionally-selected fn-ptr argument must fail closed with the precise message");
-
-	for (auto const& fn: solcore["internal_functions"])
-		BOOST_CHECK_MESSAGE(
-			fn["name"].get<std::string>().find("__fnptr__") == std::string::npos,
-			"no specialized sibling may be emitted for a conditional argument");
+	Json const& call = pick->at("body")["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(call["kind"].get<std::string>(), "internal_call");
+	BOOST_CHECK_EQUAL(call["function"].get<std::string>(), "_apply");
+	BOOST_REQUIRE_EQUAL(call["args"].size(), 2u);
+	Json const& selected = call["args"][0];
+	BOOST_CHECK_EQUAL(selected["kind"].get<std::string>(), "conditional");
+	BOOST_CHECK_EQUAL(selected["true_value"]["kind"].get<std::string>(), "internal_fn_ref");
+	BOOST_CHECK_EQUAL(selected["true_value"]["function"].get<std::string>(), "_add");
+	BOOST_CHECK_EQUAL(selected["false_value"]["kind"].get<std::string>(), "internal_fn_ref");
+	BOOST_CHECK_EQUAL(selected["false_value"]["function"].get<std::string>(), "_subtract");
+	BOOST_CHECK_NE(selected["true_value"]["tag"].get<std::string>(), selected["false_value"]["tag"].get<std::string>());
+	BOOST_REQUIRE_EQUAL(solcore["internal_fn_tables"].size(), 1u);
+	BOOST_REQUIRE_EQUAL(solcore["internal_fn_tables"][0]["candidates"].size(), 2u);
+	BOOST_CHECK_EQUAL(
+		selected["true_value"]["table"].get<std::string>(), solcore["internal_fn_tables"][0]["id"].get<std::string>());
 }
 
-BOOST_AUTO_TEST_CASE(solcore_export_fnptr_reassigned_parameter_fails_closed)
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_reassigned_parameter_uses_value_model)
 {
-	// T4 (adversarial: reassignment). The callee reassigns its own
-	// function-typed parameter before calling it — the singleton-target
-	// claim is FALSE for this callee, so specialization must refuse
-	// (admissibility check), not silently bind to the call-site argument.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	// T4: reassignment invalidates singleton specialization, but the value
+	// model must preserve both the incoming and reassigned targets and call
+	// through the local parameter after the assignment.
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract T4Reassign {
 					function bump(uint256 x) external pure returns (uint256) {
@@ -2202,9 +3020,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_reassigned_parameter_fails_closed)
 					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
 					function _subtract(uint256 a) private pure returns (uint256) { return a - 1; }
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2214,26 +3030,28 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_reassigned_parameter_fails_closed)
 
 	Json const* bump = findExportedFunction(solcore["functions"], "bump");
 	BOOST_REQUIRE(bump != nullptr);
-	BOOST_CHECK_EQUAL(bump->at("body")["kind"].get<std::string>(), "unsupported_body");
-	BOOST_CHECK_MESSAGE(
-		bump->at("body")["error"].get<std::string>().find("reassigned") != std::string::npos,
-		"a callee that reassigns its fn-typed parameter must refuse via the admissibility check");
+	Json const& bumpCall = bump->at("body")["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(bumpCall["args"][0]["kind"].get<std::string>(), "internal_fn_ref");
+	BOOST_CHECK_EQUAL(bumpCall["args"][0]["function"].get<std::string>(), "_add");
+	Json const* apply = findExportedFunction(solcore["internal_functions"], "_apply");
+	BOOST_REQUIRE(apply != nullptr);
+	Json const& applyStatements = apply->at("body")["statements"];
+	BOOST_REQUIRE_EQUAL(applyStatements.size(), 2u);
+	BOOST_CHECK_EQUAL(applyStatements[0]["kind"].get<std::string>(), "assign");
+	BOOST_CHECK_EQUAL(applyStatements[0]["name"].get<std::string>(), "op");
+	BOOST_CHECK_EQUAL(applyStatements[0]["value"]["kind"].get<std::string>(), "internal_fn_ref");
+	BOOST_CHECK_EQUAL(applyStatements[0]["value"]["function"].get<std::string>(), "_subtract");
+	BOOST_CHECK_EQUAL(applyStatements[1]["value"]["kind"].get<std::string>(), "internal_fn_call");
+	BOOST_CHECK_EQUAL(applyStatements[1]["value"]["fn"]["name"].get<std::string>(), "op");
+	BOOST_REQUIRE_EQUAL(solcore["internal_fn_tables"][0]["candidates"].size(), 2u);
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_fnptr_indirect_call_never_binds_to_same_named_function)
 {
-	// T5 (adversarial: name-collision regression — pins the exportExpr:3535
-	// fallback fix). The contract ALSO defines a real internal function
-	// literally named `op` (the fn-ptr parameter's name). The GENERIC
-	// (unspecialized) _apply is always exported alongside its specialized
-	// siblings; its own `op(x)` indirect call must fail closed, never
-	// silently bind to the unrelated same-named function.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	// T5: the contract also defines a real internal function named `op`.
+	// The generic receiver's `op(x)` must remain an internal_fn_call through
+	// the parameter value, never a name-based internal_call to that function.
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract T5Collision {
 					function bump(uint256 x) external pure returns (uint256) {
@@ -2245,9 +3063,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_indirect_call_never_binds_to_same_name
 					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
 					function op(uint256 y) private pure returns (uint256) { return y + 999; }
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2257,10 +3073,11 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_indirect_call_never_binds_to_same_name
 
 	Json const* genericApply = findExportedFunction(solcore["internal_functions"], "_apply");
 	BOOST_REQUIRE(genericApply != nullptr);
-	BOOST_CHECK_EQUAL(genericApply->at("body")["kind"].get<std::string>(), "unsupported_body");
-	BOOST_CHECK_MESSAGE(
-		genericApply->at("body")["error"].get<std::string>().find("cannot be resolved to a static target") != std::string::npos,
-		"the generic _apply's op(x) must fail closed, not silently bind to the unrelated op() function");
+	Json const& genericCall = genericApply->at("body")["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(genericCall["kind"].get<std::string>(), "internal_fn_call");
+	BOOST_CHECK_EQUAL(genericCall["fn"]["kind"].get<std::string>(), "local");
+	BOOST_CHECK_EQUAL(genericCall["fn"]["name"].get<std::string>(), "op");
+	BOOST_CHECK(!genericCall.contains("function"));
 
 	// bump() must still get a real specialized body calling _add, never the
 	// unrelated same-named `op` function.
@@ -2272,8 +3089,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_indirect_call_never_binds_to_same_name
 	std::string bumpCallee = bump->at("body")["statements"][0]["value"]["function"].get<std::string>();
 	Json const* sibling = findExportedFunction(solcore["internal_functions"], bumpCallee);
 	BOOST_REQUIRE(sibling != nullptr);
-	BOOST_CHECK_EQUAL(
-		sibling->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_add");
+	BOOST_CHECK_EQUAL(sibling->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_add");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_fnptr_transitive_forwarding_and_self_recursion)
@@ -2284,12 +3100,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_transitive_forwarding_and_self_recursi
 	// specialization memo (re-deriving the SAME specialized name on its own
 	// recursive call) rather than looping forever or leaving a dangling
 	// generic call.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract T6Transitive {
 					function bump(uint256 x) external pure returns (uint256) {
@@ -2313,9 +3124,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_transitive_forwarding_and_self_recursi
 					}
 					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2334,8 +3143,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_transitive_forwarding_and_self_recursi
 		std::string gCallee = fFn->at("body")["statements"][0]["value"]["function"].get<std::string>();
 		Json const* gFn = findExportedFunction(solcore["internal_functions"], gCallee);
 		BOOST_REQUIRE_MESSAGE(gFn != nullptr, "the transitively-forwarded _g specialization must be emitted");
-		BOOST_CHECK_EQUAL(
-			gFn->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_add");
+		BOOST_CHECK_EQUAL(gFn->at("body")["statements"][0]["value"]["function"].get<std::string>(), "_add");
 	}
 
 	{
@@ -2371,12 +3179,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_statement_position_indirect_call_fails
 	// fallback via exportStmt's ultimate `exportExpr(expr)` fallback rather
 	// than exportStmt's own dedicated internal-call branch — confirms that
 	// single fallback fix covers both the expression and statement paths.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract T7Stmt {
 					function bump(uint256 x) external pure {
@@ -2387,9 +3190,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_statement_position_indirect_call_fails
 					}
 					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2412,17 +3213,12 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_statement_position_indirect_call_fails
 	BOOST_CHECK_NE(siblingFn->at("body").dump().find("\"function\":\"_add\""), std::string::npos);
 }
 
-BOOST_AUTO_TEST_CASE(solcore_export_fnptr_named_argument_call_fails_closed)
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_named_argument_call_uses_value_model)
 {
-	// T8 (adversarial: named-argument call). Positional binding is required;
-	// a named-argument call site must refuse rather than guess which named
-	// argument lands on the function-typed parameter.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	// T8: named arguments bypass positional specialization, so the exporter
+	// must preserve the resolved parameter order and mint the function value
+	// for the generic receiver.
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract T8Named {
 					function bump(uint256 x) external pure returns (uint256) {
@@ -2433,9 +3229,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_named_argument_call_fails_closed)
 					}
 					function _add(uint256 a) private pure returns (uint256) { return a + 1; }
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2445,10 +3239,16 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_named_argument_call_fails_closed)
 
 	Json const* bump = findExportedFunction(solcore["functions"], "bump");
 	BOOST_REQUIRE(bump != nullptr);
-	BOOST_CHECK_EQUAL(bump->at("body")["kind"].get<std::string>(), "unsupported_body");
-	BOOST_CHECK_MESSAGE(
-		bump->at("body")["error"].get<std::string>().find("named-argument call") != std::string::npos,
-		"a named-argument call binding a fn-ptr parameter must fail closed with the precise message");
+	Json const& call = bump->at("body")["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(call["kind"].get<std::string>(), "internal_call");
+	BOOST_CHECK_EQUAL(call["function"].get<std::string>(), "_apply");
+	BOOST_REQUIRE_EQUAL(call["args"].size(), 2u);
+	BOOST_CHECK_EQUAL(call["args"][0]["kind"].get<std::string>(), "internal_fn_ref");
+	BOOST_CHECK_EQUAL(call["args"][0]["function"].get<std::string>(), "_add");
+	BOOST_CHECK_EQUAL(call["args"][1]["kind"].get<std::string>(), "local");
+	BOOST_CHECK_EQUAL(call["args"][1]["name"].get<std::string>(), "x");
+	BOOST_REQUIRE_EQUAL(solcore["internal_fn_tables"][0]["candidates"].size(), 1u);
+	BOOST_CHECK_EQUAL(solcore["internal_fn_tables"][0]["candidates"][0]["function"].get<std::string>(), "_add");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_fnptr_specialized_name_collision_fails_closed)
@@ -2461,12 +3261,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_specialized_name_collision_fails_close
 	// loud failure of the whole contract export: the throw is absorbed by
 	// the whole-contract unsupportedExport wrapper into a structured
 	// `{"unsupported": true, "reason": ...}` stub naming the collision.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract T9Collision {
 					function bump(uint256 x) external pure returns (uint256) {
@@ -2483,9 +3278,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_specialized_name_collision_fails_close
 						return _apply__fnptr__op___add(y);
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2499,28 +3292,19 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_specialized_name_collision_fails_close
 		"contract export closed, never silently skip or merge the specialization");
 	std::string reason = solcore.value("reason", std::string{});
 	BOOST_CHECK_MESSAGE(
-		reason.find("specialization name") != std::string::npos &&
-			reason.find("collides") != std::string::npos,
+		reason.find("specialization name") != std::string::npos && reason.find("collides") != std::string::npos,
 		"the structured rejection must name the colliding specialization; got: " + reason);
 	// Regression pin: no partial artifact — a mis-bound bump() must never be
 	// emitted alongside (or instead of) the refused specialization.
 	BOOST_CHECK(!solcore.contains("functions"));
 }
 
-BOOST_AUTO_TEST_CASE(solcore_export_fnptr_struct_member_indirect_call_fails_closed)
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_struct_member_indirect_call_uses_closed_table)
 {
-	// T10 (adversarial: function pointer stored in a struct field, called
-	// through MEMBER access). The identifier-callee guard cannot see this
-	// shape; before the member-access guard, `s.f(x, 1)` name-punted to a
-	// bare internal_call "f" — mis-binding to the unrelated real internal
-	// function `f` (multiply) below. Both the store (`arm`) and the call
-	// (`callIt`) must fail closed.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	// T10: a function pointer stored in a struct field must round-trip as an
+	// internal_fn_ref and dispatch through the field value, never name-punt
+	// to the unrelated real internal function `f` below.
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract T10Member {
 					struct S { function(uint256, uint256) internal pure returns (uint256) f; }
@@ -2532,9 +3316,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_struct_member_indirect_call_fails_clos
 					function arm() external { s.f = _add; }
 					function callIt(uint256 x) external returns (uint256) { acc = s.f(x, 1); return acc; }
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2544,18 +3326,115 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_struct_member_indirect_call_fails_clos
 
 	Json const* callIt = findExportedFunction(solcore["functions"], "callIt");
 	BOOST_REQUIRE(callIt != nullptr);
-	BOOST_CHECK_EQUAL(callIt->at("body")["kind"].get<std::string>(), "unsupported_body");
-	BOOST_CHECK_MESSAGE(
-		callIt->at("body")["error"].get<std::string>().find("member access") != std::string::npos,
-		"an indirect call through a struct-member function pointer must fail closed, "
-		"never name-punt to the bare member name");
-	// Regression pin: the old behavior emitted internal_call "f" here, which
-	// would have silently bound to the real (multiplying) internal `f`.
-	BOOST_CHECK_EQUAL(callIt->at("body").dump().find("\"function\":\"f\""), std::string::npos);
+	Json const& assignmentBlock = callIt->at("body")["statements"][0];
+	BOOST_CHECK_EQUAL(assignmentBlock["kind"].get<std::string>(), "block");
+	Json const& capturedRhs = assignmentBlock["statements"][0];
+	BOOST_CHECK_EQUAL(capturedRhs["kind"].get<std::string>(), "let");
+	Json const& call = capturedRhs["value"];
+	BOOST_CHECK_EQUAL(call["kind"].get<std::string>(), "internal_fn_call");
+	BOOST_CHECK_EQUAL(call["fn"]["kind"].get<std::string>(), "field");
+	BOOST_CHECK_EQUAL(call["fn"]["field"].get<std::string>(), "f");
+	BOOST_CHECK(!call.contains("function"));
 
 	Json const* arm = findExportedFunction(solcore["functions"], "arm");
 	BOOST_REQUIRE(arm != nullptr);
-	BOOST_CHECK_EQUAL(arm->at("body")["kind"].get<std::string>(), "unsupported_body");
+	Json const& storedRef = arm->at("body")["statements"][0]["value"]["value"];
+	BOOST_CHECK_EQUAL(storedRef["kind"].get<std::string>(), "internal_fn_ref");
+	BOOST_CHECK_EQUAL(storedRef["function"].get<std::string>(), "_add");
+	BOOST_REQUIRE_EQUAL(solcore["internal_fn_tables"][0]["candidates"].size(), 1u);
+	BOOST_CHECK_EQUAL(call["table"].get<std::string>(), solcore["internal_fn_tables"][0]["id"].get<std::string>());
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_ignores_unrelated_inline_assembly)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract FnPtrWithUnrelatedAssembly {
+					function bump(uint256 x) external pure returns (uint256) {
+						return _apply(_add, x);
+					}
+					function rawIncrement(uint256 x) external pure returns (uint256) {
+						assembly { x := add(x, 1) }
+						return x;
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x)
+						private pure returns (uint256)
+					{
+						return op(x);
+					}
+					function _add(uint256 x) private pure returns (uint256) { return x + 1; }
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "FnPtrWithUnrelatedAssembly");
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE(solcore.is_object());
+	BOOST_CHECK(!solcore.value("unsupported", false));
+	BOOST_REQUIRE(findExportedFunction(solcore["functions"], "bump") != nullptr);
+	BOOST_REQUIRE_EQUAL(solcore["internal_fn_tables"].size(), 1u);
+	Json const* rawIncrement = findExportedFunction(solcore["functions"], "rawIncrement");
+	BOOST_REQUIRE(rawIncrement != nullptr);
+	BOOST_CHECK_NE(rawIncrement->at("body").dump().find("\"kind\":\"inline_assembly\""), std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_inline_assembly_mutation_fails_closed)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract FnPtrAssemblyMutation {
+					function bump(uint256 x) external pure returns (uint256) {
+						return _apply(_add, x);
+					}
+					function _apply(function(uint256) internal pure returns (uint256) op, uint256 x)
+						private pure returns (uint256)
+					{
+						assembly { op := 1 }
+						return op(x);
+					}
+					function _add(uint256 x) private pure returns (uint256) { return x + 1; }
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "FnPtrAssemblyMutation");
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE(solcore.is_object());
+	BOOST_REQUIRE(solcore.value("unsupported", false));
+	BOOST_CHECK_NE(
+		solcore.value("reason", std::string{}).find("outside its closed candidate table"),
+		std::string::npos);
+	BOOST_CHECK(!solcore.contains("functions"));
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_raw_storage_assembly_fails_closed)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract FnPtrRawStorageMutation {
+					struct Holder {
+						function(uint256) internal pure returns (uint256) op;
+					}
+					Holder private holder;
+					function arm() external { holder.op = _add; }
+					function callIt(uint256 x) external returns (uint256) { return holder.op(x); }
+					function corruptRawSlot() external { assembly { sstore(0, 0) } }
+					function _add(uint256 x) private pure returns (uint256) { return x + 1; }
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "FnPtrRawStorageMutation");
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE(solcore.is_object());
+	BOOST_REQUIRE(solcore.value("unsupported", false));
+	BOOST_CHECK_NE(
+		solcore.value("reason", std::string{}).find("outside its closed candidate table"),
+		std::string::npos);
+	BOOST_CHECK(!solcore.contains("functions"));
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
@@ -2564,8 +3443,8 @@ BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
 		false,
 		Json(),
 		Json::array({"solcore"}),
-		SolidityCode({
-			{"@openzeppelin/contracts/utils/structs/Checkpoints.sol", R"(
+		SolidityCode(
+			{{"@openzeppelin/contracts/utils/structs/Checkpoints.sol", R"(
 				pragma solidity >=0.8.20;
 				library Checkpoints {
 					struct Trace256 {
@@ -2601,7 +3480,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
 					}
 				}
 			)"},
-			{"@openzeppelin/contracts/utils/Checkpoints.sol", R"(
+			 {"@openzeppelin/contracts/utils/Checkpoints.sol", R"(
 				pragma solidity >=0.8.20;
 				library Checkpoints {
 					struct History {
@@ -2613,7 +3492,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
 					}
 				}
 			)"},
-			{"counterfeit/Checkpoints.sol", R"(
+			 {"counterfeit/Checkpoints.sol", R"(
 				pragma solidity >=0.8.20;
 				library Checkpoints {
 					struct Trace224 {
@@ -2625,7 +3504,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
 					}
 				}
 			)"},
-			{"fileA", R"(
+			 {"fileA", R"(
 				pragma solidity >=0.8.20;
 				import {Checkpoints} from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 				import {Checkpoints as LegacyCheckpoints} from "@openzeppelin/contracts/utils/Checkpoints.sol";
@@ -2677,9 +3556,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
 						return counterfeit.upperLookup(key);
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2693,27 +3570,17 @@ BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
 	{
 		for (Json const& function: solcore["functions"])
 		{
-			if (
-				!function.contains("name") ||
-				!function["name"].is_string() ||
-				function["name"].get<std::string>() != _functionName
-			)
+			if (!function.contains("name") || !function["name"].is_string()
+				|| function["name"].get<std::string>() != _functionName)
 				continue;
 
 			Json const& statements = function["body"]["statements"];
-			if (
-				statements.size() == 1 &&
-				statements[0].contains("value") &&
-				statements[0]["value"].is_object()
-			)
+			if (statements.size() == 1 && statements[0].contains("value") && statements[0]["value"].is_object())
 				return &statements[0]["value"];
 		}
 		return nullptr;
 	};
-	auto checkQuery = [&queryCall](
-		std::string const& _functionName,
-		std::string const& _contractId
-	)
+	auto checkQuery = [&queryCall](std::string const& _functionName, std::string const& _contractId)
 	{
 		Json const* call = queryCall(_functionName);
 		BOOST_REQUIRE(call);
@@ -2738,26 +3605,15 @@ BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)
 	Json const* counterfeitCall = queryCall("fake");
 	BOOST_REQUIRE(counterfeitCall);
 	BOOST_REQUIRE(counterfeitCall->contains("contractId"));
-	BOOST_CHECK_EQUAL(
-		counterfeitCall->at("contractId").get<std::string>(),
-		"counterfeit/Checkpoints.sol:Checkpoints"
-	);
+	BOOST_CHECK_EQUAL(counterfeitCall->at("contractId").get<std::string>(), "counterfeit/Checkpoints.sol:Checkpoints");
 	BOOST_CHECK(!counterfeitCall->contains("runtimeKind"));
 }
 
-BOOST_AUTO_TEST_CASE(solcore_export_is_version_tagged_when_unsupported)
+BOOST_AUTO_TEST_CASE(solcore_export_transient_state_is_version_tagged)
 {
-	// A `transient`-location state variable is deliberately fail-closed at
-	// contract level (exporting it as ordinary persistent storage would be a
-	// false model), so it exercises the whole-contract unsupportedExport
-	// path.  (The original fixture used `cond && cond`, but boolean
-	// conjunction has long since gained faithful `bool_and` lowering.)
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	// Transient state has its own ExecState carrier and wire operations; it
+	// must never be collapsed into persistent storage.
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.28;
 				contract C {
 					uint256 transient temp;
@@ -2766,21 +3622,28 @@ BOOST_AUTO_TEST_CASE(solcore_export_is_version_tagged_when_unsupported)
 						return temp;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
 
 	Json contractResult = getContractResult(result, "fileA", "C");
 	BOOST_REQUIRE(contractResult["solcore"].is_object());
-	BOOST_CHECK(contractResult["solcore"]["unsupported"].get<bool>());
-	// The structured rejection must say precisely why, not just flag failure.
-	BOOST_CHECK(
-		contractResult["solcore"]["reason"].get<std::string>().find("transient") != std::string::npos);
-	BOOST_CHECK_EQUAL(contractResult["solcore"]["compilerVersion"].get<std::string>(), VersionString);
-	BOOST_CHECK_EQUAL(contractResult["solcore"]["exporterFamily"].get<std::string>(), "solcore-solidity-0.8");
+	Json const& solcore = contractResult["solcore"];
+	BOOST_CHECK(!solcore.value("unsupported", false));
+	BOOST_CHECK(solcore["featureFlags"]["transientState"].get<bool>());
+	bool hasTransientCarrier = false;
+	for (Json const& field: solcore["state"]["fields"])
+		hasTransientCarrier = hasTransientCarrier || field.value("name", ""s) == "transient";
+	BOOST_CHECK(hasTransientCarrier);
+	Json const* bump = findExportedFunction(solcore["functions"], "bump");
+	BOOST_REQUIRE(bump != nullptr);
+	Json const& statements = bump->at("body")["statements"];
+	BOOST_CHECK_EQUAL(statements[0]["kind"].get<std::string>(), "transient_set");
+	BOOST_CHECK_EQUAL(statements[0]["value"]["lhs"]["kind"].get<std::string>(), "transient_get");
+	BOOST_CHECK_EQUAL(statements[1]["value"]["kind"].get<std::string>(), "transient_get");
+	BOOST_CHECK_EQUAL(solcore["compilerVersion"].get<std::string>(), VersionString);
+	BOOST_CHECK_EQUAL(solcore["exporterFamily"].get<std::string>(), "solcore-solidity-0.8");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_abi_decode_type_list_and_method_selector)
@@ -2809,12 +3672,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_abi_decode_type_list_and_method_selector)
 	// (SafeERC20._callOptionalReturn's `abi.decode(returndata, (bool))` and
 	// SignatureCheckerUpgradeable.isValidERC1271SignatureNow's
 	// `abi.decode(result, (bytes32)) == bytes32(IERC1271.isValidSignature.selector)`).
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.0;
 				interface IERC1271Like {
 					function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4);
@@ -2827,9 +3685,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_abi_decode_type_list_and_method_selector)
 						return abi.decode(result, (bytes32)) == bytes32(IERC1271Like.isValidSignature.selector);
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2849,16 +3705,19 @@ BOOST_AUTO_TEST_CASE(solcore_export_abi_decode_type_list_and_method_selector)
 
 	Json const& probeBool = solcore["internal_functions"][0];
 	BOOST_CHECK_EQUAL(probeBool["name"].get<std::string>(), "probeBool");
-	// return returndata.length == 0 || abi.decode(returndata, (bool));
-	Json const& decodeBool = probeBool["body"]["statements"][0]["value"]["rhs"];
+	// Short-circuit lowering must keep abi.decode exclusively in the false
+	// branch while preserving its type-list metadata.
+	Json const& shortCircuit = probeBool["body"]["statements"][0];
+	BOOST_CHECK_EQUAL(shortCircuit["kind"].get<std::string>(), "block");
+	Json const& shortCircuitIf = shortCircuit["statements"][2];
+	BOOST_CHECK_EQUAL(shortCircuitIf["kind"].get<std::string>(), "if");
+	BOOST_CHECK(shortCircuitIf["then"].dump().find("\"function\":\"abi_decode\"") == std::string::npos);
+	Json const& decodeBool = shortCircuitIf["else"]["statements"][0]["value"];
 	BOOST_CHECK_EQUAL(decodeBool["kind"].get<std::string>(), "internal_call");
 	BOOST_CHECK_EQUAL(decodeBool["function"].get<std::string>(), "abi_decode");
-	BOOST_REQUIRE(decodeBool["args"].is_array());
-	// Only the data argument — the type list must NOT appear as a value arg.
-	BOOST_REQUIRE(decodeBool["args"].size() == 1);
+	BOOST_REQUIRE_EQUAL(decodeBool["args"].size(), 1u);
 	BOOST_CHECK_EQUAL(decodeBool["args"][0]["kind"].get<std::string>(), "local");
-	BOOST_REQUIRE(decodeBool["decode_types"].is_array());
-	BOOST_REQUIRE(decodeBool["decode_types"].size() == 1);
+	BOOST_REQUIRE_EQUAL(decodeBool["decode_types"].size(), 1u);
 	BOOST_CHECK_EQUAL(decodeBool["decode_types"][0].get<std::string>(), "bool");
 
 	Json const& probeSelector = solcore["internal_functions"][1];
@@ -2871,7 +3730,10 @@ BOOST_AUTO_TEST_CASE(solcore_export_abi_decode_type_list_and_method_selector)
 	BOOST_REQUIRE(decodeWord["decode_types"].is_array());
 	BOOST_REQUIRE(decodeWord["decode_types"].size() == 1);
 	BOOST_CHECK_EQUAL(decodeWord["decode_types"][0].get<std::string>(), "bytes32");
-	Json const& selector = comparison["rhs"];
+	Json const& selectorWidening = comparison["rhs"];
+	BOOST_CHECK_EQUAL(selectorWidening["kind"].get<std::string>(), "u256_shl");
+	BOOST_CHECK_EQUAL(selectorWidening["rhs"]["value"].get<std::string>(), "224");
+	Json const& selector = selectorWidening["lhs"];
 	BOOST_CHECK_EQUAL(selector["kind"].get<std::string>(), "method_selector");
 	BOOST_CHECK_EQUAL(selector["method_name"].get<std::string>(), "isValidSignature");
 	BOOST_CHECK_EQUAL(selector["method_signature"].get<std::string>(), "isValidSignature(bytes32,bytes)");
@@ -2885,12 +3747,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_namespaced_storage)
 	// pointer to a struct at a computed slot. The exporter should flatten the
 	// sub-storage fields into the main Storage type and emit storage_get/set_storage
 	// operations instead of local struct manipulation.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				contract C {
@@ -2921,9 +3778,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_namespaced_storage)
 						return _getTokenStorage().balances[account];
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -2939,12 +3794,15 @@ BOOST_AUTO_TEST_CASE(solcore_export_namespaced_storage)
 
 	// Should have: totalMinted (direct) + balances, totalSupply (from TokenStorage)
 	bool hasBalances = false, hasTotalSupply = false, hasTotalMinted = false;
-	for (auto const& field : storageDecl["fields"])
+	for (auto const& field: storageDecl["fields"])
 	{
 		std::string name = field["name"].get<std::string>();
-		if (name == "totalMinted") hasTotalMinted = true;
-		if (name == "token_balances" || name == "balances") hasBalances = true;
-		if (name == "token_totalSupply" || name == "totalSupply") hasTotalSupply = true;
+		if (name == "totalMinted")
+			hasTotalMinted = true;
+		if (name == "token_balances" || name == "balances")
+			hasBalances = true;
+		if (name == "token_totalSupply" || name == "totalSupply")
+			hasTotalSupply = true;
 	}
 	BOOST_CHECK_MESSAGE(hasTotalMinted, "Storage should have totalMinted field");
 	BOOST_CHECK_MESSAGE(hasBalances, "Storage should have flattened balances field from TokenStorage");
@@ -2952,17 +3810,16 @@ BOOST_AUTO_TEST_CASE(solcore_export_namespaced_storage)
 
 	// 2. _getTokenStorage should NOT appear as an internal function
 	bool hasGetterFunction = false;
-	for (auto const& fn : solcore["internal_functions"])
+	for (auto const& fn: solcore["internal_functions"])
 	{
 		if (fn["name"].get<std::string>() == "_getTokenStorage")
 			hasGetterFunction = true;
 	}
-	BOOST_CHECK_MESSAGE(!hasGetterFunction,
-		"_getTokenStorage should be eliminated, not exported as internal function");
+	BOOST_CHECK_MESSAGE(!hasGetterFunction, "_getTokenStorage should be eliminated, not exported as internal function");
 
 	// 3. mint function should use storage_get/set_storage, not local struct ops
 	Json const* mintFn = nullptr;
-	for (auto const& fn : solcore["functions"])
+	for (auto const& fn: solcore["functions"])
 	{
 		if (fn["name"].get<std::string>() == "mint")
 			mintFn = &fn;
@@ -2973,8 +3830,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_namespaced_storage)
 	// (not struct_update or array_get on a local variable)
 	std::string mintBody = mintFn->dump();
 	BOOST_CHECK_MESSAGE(
-		mintBody.find("\"storage_set\"") != std::string::npos ||
-		mintBody.find("\"set_storage\"") != std::string::npos,
+		mintBody.find("\"storage_set\"") != std::string::npos || mintBody.find("\"set_storage\"") != std::string::npos,
 		"mint should emit set_storage for totalSupply write, not struct_update");
 	BOOST_CHECK_MESSAGE(
 		mintBody.find("\"storage_map_set\"") != std::string::npos,
@@ -2982,7 +3838,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_namespaced_storage)
 
 	// 4. balanceOf should use storage_map_get, not internal_call + array_get
 	Json const* balanceOfFn = nullptr;
-	for (auto const& fn : solcore["functions"])
+	for (auto const& fn: solcore["functions"])
 	{
 		if (fn["name"].get<std::string>() == "balanceOf")
 			balanceOfFn = &fn;
@@ -2993,20 +3849,15 @@ BOOST_AUTO_TEST_CASE(solcore_export_namespaced_storage)
 	BOOST_CHECK_MESSAGE(
 		balanceOfBody.find("\"storage_map_get\"") != std::string::npos,
 		"balanceOf should emit storage_map_get for balances read, not internal_call");
-BOOST_CHECK_MESSAGE(
-	balanceOfBody.find("\"internal_call\"") == std::string::npos ||
-	balanceOfBody.find("\"_getTokenStorage\"") == std::string::npos,
-	"balanceOf should not call _getTokenStorage");
+	BOOST_CHECK_MESSAGE(
+		balanceOfBody.find("\"internal_call\"") == std::string::npos
+			|| balanceOfBody.find("\"_getTokenStorage\"") == std::string::npos,
+		"balanceOf should not call _getTokenStorage");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_overloaded_sub_storage_getters_are_disambiguated)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				contract C {
@@ -3044,9 +3895,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_overloaded_sub_storage_getters_are_disambigu
 						return _getStorage(address(0)).fee;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3062,7 +3911,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_overloaded_sub_storage_getters_are_disambigu
 
 	Json const* balanceOfFn = nullptr;
 	Json const* feeFn = nullptr;
-	for (auto const& fn : solcore["functions"])
+	for (auto const& fn: solcore["functions"])
 	{
 		if (fn["name"].get<std::string>() == "balanceOf")
 			balanceOfFn = &fn;
@@ -3091,12 +3940,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_overloaded_sub_storage_getters_are_disambigu
 
 BOOST_AUTO_TEST_CASE(solcore_export_nested_mapping_assignment)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				contract C {
@@ -3111,9 +3955,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_nested_mapping_assignment)
 						return true;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3123,7 +3965,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_nested_mapping_assignment)
 	Json const& solcore = contractResult["solcore"];
 
 	Json const* approveFn = nullptr;
-	for (auto const& fn : solcore["internal_functions"])
+	for (auto const& fn: solcore["internal_functions"])
 	{
 		if (fn["name"].get<std::string>() == "_approve")
 			approveFn = &fn;
@@ -3141,8 +3983,8 @@ BOOST_AUTO_TEST_CASE(solcore_export_nested_mapping_assignment)
 		approveBody.find("\"function\":\"array_set_expr\"") != std::string::npos,
 		"_approve should build the updated inner mapping with array_set_expr");
 	BOOST_CHECK_MESSAGE(
-		approveBody.find("\"kind\":\"expr\",\"value\":{\"kind\":\"internal_call\",\"function\":\"array_set_expr\"") ==
-			std::string::npos,
+		approveBody.find("\"kind\":\"expr\",\"value\":{\"kind\":\"internal_call\",\"function\":\"array_set_expr\"")
+			== std::string::npos,
 		"_approve should not degrade nested mapping writes to a top-level expr array_set_expr");
 }
 
@@ -3169,16 +4011,9 @@ Json findFunctionByName(Json const& _solcore, std::string const& _name)
 
 BOOST_AUTO_TEST_CASE(solcore_export_delete_dynamic_array_struct_member)
 {
-	// `delete conf.erc20s;`-shaped: a dynamic array field of a struct state
-	// variable. Must lower to an explicitly-typed `new_array(0)`, not the
-	// `{"kind":"unit"}` shortcut (see SolCoreExporter.cpp's
-	// deleteDefaultValueForResolvedType doc comment for why).
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	// `delete conf.erc20s;`-shaped: dynamic storage arrays clear in place
+	// through the stateful storage_array_clear helper.
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					struct S { uint256[] items; }
@@ -3187,9 +4022,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_dynamic_array_struct_member)
 						delete s.items;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3198,27 +4031,17 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_dynamic_array_struct_member)
 	Json const& solcore = contractResult["solcore"];
 
 	Json fn = findFunctionByName(solcore, "clearItems");
-	// [0] the delete write, [1] the implicit trailing `return unit;` every
-	// void function without an explicit return statement gets.
-	BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
+	BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2u);
 	Json const& stmt = fn["body"]["statements"][0];
-	BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_set");
-	BOOST_CHECK_EQUAL(stmt["field"].get<std::string>(), "s");
-	Json const& update = stmt["value"];
-	BOOST_CHECK_EQUAL(update["kind"].get<std::string>(), "struct_update");
-	BOOST_CHECK_EQUAL(update["field"].get<std::string>(), "items");
-	Json const& newArray = update["value"];
-	BOOST_CHECK_EQUAL(newArray["kind"].get<std::string>(), "internal_call");
-	BOOST_CHECK_EQUAL(newArray["function"].get<std::string>(), "new_array");
-	BOOST_REQUIRE(newArray["args"].is_array());
-	BOOST_REQUIRE_EQUAL(newArray["args"].size(), 1);
-	BOOST_CHECK_EQUAL(newArray["args"][0]["value"].get<std::string>(), "0");
-	// "element_type" carries the ARRAY type itself (matching the
-	// pre-existing `new T[](n)` NewExpression convention), not the bare
-	// element -- this is what lets the frontend's new_array__<ty> name
-	// mangling agree with a real `new uint256[](0)` call.
-	BOOST_CHECK_EQUAL(newArray["element_type"]["kind"].get<std::string>(), "array");
-	BOOST_CHECK_EQUAL(newArray["element_type"]["element"].get<std::string>(), "u256");
+	BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "expr");
+	Json const& clear = stmt["value"];
+	BOOST_CHECK_EQUAL(clear["kind"].get<std::string>(), "internal_call");
+	BOOST_CHECK_EQUAL(clear["function"].get<std::string>(), "storage_array_clear");
+	BOOST_REQUIRE_EQUAL(clear["args"].size(), 1u);
+	BOOST_CHECK_EQUAL(clear["args"][0]["kind"].get<std::string>(), "field");
+	BOOST_CHECK_EQUAL(clear["args"][0]["field"].get<std::string>(), "items");
+	BOOST_CHECK_EQUAL(clear["args"][0]["base"]["kind"].get<std::string>(), "storage_get");
+	BOOST_CHECK_EQUAL(clear["args"][0]["base"]["field"].get<std::string>(), "s");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_delete_whole_struct_preserves_mapping_member)
@@ -3228,12 +4051,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_whole_struct_preserves_mapping_member
 	// left completely untouched (docs/types/operators.rst's "no effect on
 	// mappings" rule, YulUtilFunctions::clearStorageStructFunction's
 	// mapping-member skip).
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					struct S {
@@ -3246,9 +4064,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_whole_struct_preserves_mapping_member
 						delete s;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3261,26 +4077,25 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_whole_struct_preserves_mapping_member
 	BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_set");
 	BOOST_CHECK_EQUAL(stmt["field"].get<std::string>(), "s");
 
-	// Outer struct_update is the LAST-applied member in declared order: "b".
+	// Outer struct_update is the last-applied member in declared order.
 	Json const& outer = stmt["value"];
 	BOOST_CHECK_EQUAL(outer["kind"].get<std::string>(), "struct_update");
 	BOOST_CHECK_EQUAL(outer["field"].get<std::string>(), "b");
-	BOOST_CHECK_EQUAL(outer["value"]["kind"].get<std::string>(), "bool");
-	BOOST_CHECK_EQUAL(outer["value"]["value"].get<bool>(), false);
+	BOOST_CHECK_EQUAL(outer["value"]["kind"].get<std::string>(), "typed_default");
+	BOOST_CHECK_EQUAL(outer["value"]["type"].get<std::string>(), "bool");
 
 	Json const& inner = outer["base"];
 	BOOST_CHECK_EQUAL(inner["kind"].get<std::string>(), "struct_update");
 	BOOST_CHECK_EQUAL(inner["field"].get<std::string>(), "a");
-	BOOST_CHECK_EQUAL(inner["value"]["kind"].get<std::string>(), "u256");
-	BOOST_CHECK_EQUAL(inner["value"]["value"].get<std::string>(), "0");
+	BOOST_CHECK_EQUAL(inner["value"]["kind"].get<std::string>(), "typed_default");
+	BOOST_CHECK_EQUAL(inner["value"]["type"].get<std::string>(), "u256");
 
 	// The base of the innermost struct_update is the pristine snapshot read
 	// -- never touched for "m" -- so no struct_update anywhere names "m".
 	BOOST_CHECK_EQUAL(inner["base"]["kind"].get<std::string>(), "storage_get");
 	std::string serialized = fn.dump();
 	BOOST_CHECK_MESSAGE(
-		serialized.find("\"field\":\"m\"") == std::string::npos,
-		"delete must never touch the struct's mapping member");
+		serialized.find("\"field\":\"m\"") == std::string::npos, "delete must never touch the struct's mapping member");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_delete_struct_array_element)
@@ -3288,12 +4103,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_struct_array_element)
 	// `delete arr[i];` on a state array of structs (no mapping members):
 	// every member is reset via the same struct_update spine, addressed
 	// through the state array's own array_set path.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					struct W { address account; uint256 amt; }
@@ -3302,9 +4112,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_struct_array_element)
 						delete queueArr[i];
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3324,27 +4132,18 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_struct_array_element)
 	Json const& inner = outer["base"];
 	BOOST_CHECK_EQUAL(inner["kind"].get<std::string>(), "struct_update");
 	BOOST_CHECK_EQUAL(inner["field"].get<std::string>(), "account");
-	// address's delete-default is numeric zero on the wire (kind "u256",
-	// same as the pre-existing word-scalar delete behavior) -- there is no
-	// distinct "address"-kind zero literal.
-	BOOST_CHECK_EQUAL(inner["value"]["kind"].get<std::string>(), "u256");
-	BOOST_CHECK_EQUAL(inner["value"]["value"].get<std::string>(), "0");
+	BOOST_CHECK_EQUAL(inner["value"]["kind"].get<std::string>(), "typed_default");
+	BOOST_CHECK_EQUAL(inner["value"]["type"].get<std::string>(), "address");
+	BOOST_CHECK_EQUAL(outer["value"]["kind"].get<std::string>(), "typed_default");
+	BOOST_CHECK_EQUAL(outer["value"]["type"].get<std::string>(), "u256");
 	BOOST_CHECK_EQUAL(inner["base"]["kind"].get<std::string>(), "array_get");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_delete_struct_element_through_local_storage_pointer)
 {
-	// The exact StRSRP0.cancelUnstake shape: `W[] storage queue =
-	// mappingOfArrays[key]; ... delete queue[i];`. `queue` is a local
-	// storage-POINTER, so this flows through the existing (coarse but
-	// oracle-CONTAINED) local array_set_local path -- confirms delete's
-	// struct spine composes correctly with that pre-existing machinery.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	// The exact StRSRP0.cancelUnstake shape: a local storage reference keeps
+	// its producer-carried mapping path and writes through array_set_expr.
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					struct W { address account; uint256 amt; }
@@ -3354,9 +4153,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_struct_element_through_local_storage_
 						delete queue[i];
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3367,8 +4164,8 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_struct_element_through_local_storage_
 	std::string serialized = fn.dump();
 	BOOST_CHECK(serialized.find("unsupported_body") == std::string::npos);
 	BOOST_CHECK_MESSAGE(
-		serialized.find("\"function\":\"array_set_local\"") != std::string::npos,
-		"delete through a local storage-pointer element should use array_set_local");
+		serialized.find("\"function\":\"array_set_expr\"") != std::string::npos,
+		"delete through a local storage-reference element should use array_set_expr");
 	BOOST_CHECK_MESSAGE(
 		serialized.find("\"kind\":\"struct_update\"") != std::string::npos,
 		"delete of a struct element should build a struct_update spine");
@@ -3380,12 +4177,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_mapping_value_array_single_and_struct
 	// shape) AND a struct-nested mapping's scalar value
 	// (BasketHandler._setPrimeBasket's `delete config.targetAmts[k];` shape,
 	// exercising exportStorageMapLValueDeep's multi-component "path").
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					mapping(address => uint256[]) lists;
@@ -3399,9 +4191,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_mapping_value_array_single_and_struct
 						delete config.amounts[who];
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3410,15 +4200,15 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_mapping_value_array_single_and_struct
 
 	{
 		Json fn = findFunctionByName(solcore, "clearList");
-		BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
-		Json const& stmt = fn["body"]["statements"][0];
-		BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_map_set");
-		BOOST_CHECK_EQUAL(stmt["field"].get<std::string>(), "lists");
-		Json const& value = stmt["value"];
-		BOOST_CHECK_EQUAL(value["kind"].get<std::string>(), "internal_call");
-		BOOST_CHECK_EQUAL(value["function"].get<std::string>(), "new_array");
-		BOOST_CHECK_EQUAL(value["element_type"]["kind"].get<std::string>(), "array");
-		BOOST_CHECK_EQUAL(value["element_type"]["element"].get<std::string>(), "u256");
+		BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2u);
+		Json const& block = fn["body"]["statements"][0];
+		BOOST_CHECK_EQUAL(block["kind"].get<std::string>(), "block");
+		Json const& clear = block["statements"][1]["value"];
+		BOOST_CHECK_EQUAL(clear["kind"].get<std::string>(), "internal_call");
+		BOOST_CHECK_EQUAL(clear["function"].get<std::string>(), "storage_array_clear");
+		BOOST_REQUIRE_EQUAL(clear["args"].size(), 1u);
+		BOOST_CHECK_EQUAL(clear["args"][0]["kind"].get<std::string>(), "storage_map_get");
+		BOOST_CHECK_EQUAL(clear["args"][0]["field"].get<std::string>(), "lists");
 	}
 	{
 		Json fn = findFunctionByName(solcore, "clearAmount");
@@ -3429,19 +4219,14 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_mapping_value_array_single_and_struct
 		BOOST_REQUIRE_EQUAL(stmt["path"].size(), 2);
 		BOOST_CHECK_EQUAL(stmt["path"][0].get<std::string>(), "config");
 		BOOST_CHECK_EQUAL(stmt["path"][1].get<std::string>(), "amounts");
-		BOOST_CHECK_EQUAL(stmt["value"]["kind"].get<std::string>(), "u256");
-		BOOST_CHECK_EQUAL(stmt["value"]["value"].get<std::string>(), "0");
+		BOOST_CHECK_EQUAL(stmt["value"]["kind"].get<std::string>(), "typed_default");
+		BOOST_CHECK_EQUAL(stmt["value"]["type"].get<std::string>(), "u256");
 	}
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_delete_enum_resets_to_first_variant)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					enum Status { Idle, Active, Done }
@@ -3450,9 +4235,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_enum_resets_to_first_variant)
 						delete status;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3465,18 +4248,14 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_enum_resets_to_first_variant)
 	BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_set");
 	BOOST_CHECK_EQUAL(stmt["field"].get<std::string>(), "status");
 	Json const& value = stmt["value"];
-	BOOST_CHECK_EQUAL(value["kind"].get<std::string>(), "enum_variant");
-	BOOST_CHECK_EQUAL(value["variant"].get<std::string>(), "Idle");
+	BOOST_CHECK_EQUAL(value["kind"].get<std::string>(), "typed_default");
+	BOOST_CHECK_EQUAL(value["type"]["kind"].get<std::string>(), "enum");
+	BOOST_CHECK_EQUAL(value["type"]["name"].get<std::string>(), "Status");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_delete_bytes_and_string)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					bytes data;
@@ -3484,9 +4263,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_bytes_and_string)
 					function clearData() external { delete data; }
 					function clearLabel() external { delete label; }
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3496,25 +4273,21 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_bytes_and_string)
 	for (std::string const& fnName: {std::string("clearData"), std::string("clearLabel")})
 	{
 		Json fn = findFunctionByName(solcore, fnName);
-		BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2);
+		BOOST_REQUIRE_EQUAL(fn["body"]["statements"].size(), 2u);
 		Json const& stmt = fn["body"]["statements"][0];
-		BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_set");
-		Json const& value = stmt["value"];
-		BOOST_CHECK_EQUAL(value["kind"].get<std::string>(), "internal_call");
-		BOOST_CHECK_EQUAL(value["function"].get<std::string>(), "new_array");
-		BOOST_CHECK_EQUAL(value["element_type"]["kind"].get<std::string>(), "array");
-		BOOST_CHECK_EQUAL(value["element_type"]["element"].get<std::string>(), "u8");
+		BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "expr");
+		Json const& clear = stmt["value"];
+		BOOST_CHECK_EQUAL(clear["kind"].get<std::string>(), "internal_call");
+		BOOST_CHECK_EQUAL(clear["function"].get<std::string>(), "storage_array_clear");
+		BOOST_REQUIRE_EQUAL(clear["args"].size(), 1u);
+		BOOST_CHECK_EQUAL(clear["args"][0]["kind"].get<std::string>(), "storage_get");
+		BOOST_CHECK_EQUAL(clear["args"][0]["field"].get<std::string>(), fnName == "clearData" ? "data" : "label");
 	}
 }
 
-BOOST_AUTO_TEST_CASE(solcore_export_delete_fixed_size_array_fails_closed)
+BOOST_AUTO_TEST_CASE(solcore_export_delete_fixed_size_array_uses_typed_default)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					uint256[4] fixedArr;
@@ -3522,9 +4295,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_fixed_size_array_fails_closed)
 						delete fixedArr;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3532,10 +4303,14 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_fixed_size_array_fails_closed)
 	Json const& solcore = contractResult["solcore"];
 
 	Json fn = findFunctionByName(solcore, "clearFixed");
-	BOOST_CHECK_EQUAL(fn["body"]["kind"].get<std::string>(), "unsupported_body");
-	BOOST_CHECK_MESSAGE(
-		fn["body"]["error"].get<std::string>().find("fixed-size array") != std::string::npos,
-		"error should precisely name the fixed-size-array category");
+	Json const& stmt = fn["body"]["statements"][0];
+	BOOST_CHECK_EQUAL(stmt["kind"].get<std::string>(), "storage_set");
+	BOOST_CHECK_EQUAL(stmt["field"].get<std::string>(), "fixedArr");
+	Json const& value = stmt["value"];
+	BOOST_CHECK_EQUAL(value["kind"].get<std::string>(), "typed_default");
+	BOOST_CHECK_EQUAL(value["type"]["kind"].get<std::string>(), "storage_fixed_array");
+	BOOST_CHECK_EQUAL(value["type"]["size"].get<unsigned>(), 4u);
+	BOOST_CHECK_EQUAL(value["type"]["element"].get<std::string>(), "u256");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_delete_array_with_nested_mapping_element_fails_closed)
@@ -3545,12 +4320,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_array_with_nested_mapping_element_fai
 	// clearStorageArrayFunction skip mapping-containing ranges), so an
 	// empty-list model would be UNSOUND here -- must fail closed, not
 	// silently produce a too-precise `[]`.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					struct Voter {
@@ -3562,9 +4332,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_array_with_nested_mapping_element_fai
 						delete voters;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3584,12 +4352,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_vs_manual_reset_equivalence)
 	// each member to exactly the same value that writing the members by
 	// hand (two separate statements) would -- equivalent modulo statement
 	// form, per field, in declared order.
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 				contract C {
 					struct P { uint256 a; bool b; }
@@ -3601,9 +4364,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_vs_manual_reset_equivalence)
 						p2.b = false;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3613,37 +4374,34 @@ BOOST_AUTO_TEST_CASE(solcore_export_delete_vs_manual_reset_equivalence)
 	Json deleteFn = findFunctionByName(solcore, "deleteIt");
 	Json manualFn = findFunctionByName(solcore, "manualReset");
 
-	// delete: one storage_set with a struct_update(struct_update(base,a,0),b,false)
-	// spine, plus the implicit trailing `return unit;`.
-	BOOST_REQUIRE_EQUAL(deleteFn["body"]["statements"].size(), 2);
+	// delete uses typed defaults so aggregate defaults remain structural.
+	BOOST_REQUIRE_EQUAL(deleteFn["body"]["statements"].size(), 2u);
 	Json const& deleteOuter = deleteFn["body"]["statements"][0]["value"];
 	BOOST_CHECK_EQUAL(deleteOuter["field"].get<std::string>(), "b");
-	BOOST_CHECK_EQUAL(deleteOuter["value"]["value"].get<bool>(), false);
+	BOOST_CHECK_EQUAL(deleteOuter["value"]["kind"].get<std::string>(), "typed_default");
+	BOOST_CHECK_EQUAL(deleteOuter["value"]["type"].get<std::string>(), "bool");
 	Json const& deleteInner = deleteOuter["base"];
 	BOOST_CHECK_EQUAL(deleteInner["field"].get<std::string>(), "a");
-	BOOST_CHECK_EQUAL(deleteInner["value"]["value"].get<std::string>(), "0");
+	BOOST_CHECK_EQUAL(deleteInner["value"]["kind"].get<std::string>(), "typed_default");
+	BOOST_CHECK_EQUAL(deleteInner["value"]["type"].get<std::string>(), "u256");
 
-	// manual: two storage_set statements (one struct_update each, same
-	// field/value pairs), plus the implicit trailing `return unit;`.
-	BOOST_REQUIRE_EQUAL(manualFn["body"]["statements"].size(), 3);
+	// Manual writes carry the equivalent concrete zero/false values.
+	BOOST_REQUIRE_EQUAL(manualFn["body"]["statements"].size(), 3u);
 	Json const& manualA = manualFn["body"]["statements"][0]["value"];
 	Json const& manualB = manualFn["body"]["statements"][1]["value"];
 	BOOST_CHECK_EQUAL(manualA["field"].get<std::string>(), "a");
-	BOOST_CHECK_EQUAL(manualA["value"]["value"].get<std::string>(), deleteInner["value"]["value"].get<std::string>());
+	BOOST_CHECK_EQUAL(manualA["value"]["kind"].get<std::string>(), "u256");
+	BOOST_CHECK_EQUAL(manualA["value"]["value"].get<std::string>(), "0");
 	BOOST_CHECK_EQUAL(manualB["field"].get<std::string>(), "b");
-	BOOST_CHECK_EQUAL(manualB["value"]["value"].get<bool>(), deleteOuter["value"]["value"].get<bool>());
+	BOOST_CHECK_EQUAL(manualB["value"]["kind"].get<std::string>(), "bool");
+	BOOST_CHECK_EQUAL(manualB["value"]["value"].get<bool>(), false);
 }
 
 // === end delete on non-word-sized targets ===================================
 
 BOOST_AUTO_TEST_CASE(solcore_export_overloaded_internal_function_keeps_nested_mapping_write)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				contract C {
@@ -3658,9 +4416,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_overloaded_internal_function_keeps_nested_ma
 						if (emitEvent) {}
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3673,7 +4429,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_overloaded_internal_function_keeps_nested_ma
 	Json const* approve3 = nullptr;
 	Json const* approve4 = nullptr;
 	unsigned approveCount = 0;
-	for (auto const& fn : solcore["internal_functions"])
+	for (auto const& fn: solcore["internal_functions"])
 	{
 		if (fn.value("originalName", fn["name"].get<std::string>()) != "_approve")
 			continue;
@@ -3702,14 +4458,73 @@ BOOST_AUTO_TEST_CASE(solcore_export_overloaded_internal_function_keeps_nested_ma
 		"four-argument _approve should update the allowance storage field");
 }
 
+BOOST_AUTO_TEST_CASE(solcore_export_super_overloads_carry_exact_typed_coordinates)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+
+				contract Base {
+					function f(uint256 x) internal pure virtual returns (uint256) { return x + 1; }
+					function f(address x) internal pure virtual returns (uint256) { return uint160(x) + 2; }
+				}
+
+				contract Derived is Base {
+					function f(uint256 x) internal pure override returns (uint256) {
+						return super.f(x);
+					}
+					function f(address x) internal pure override returns (uint256) {
+						return super.f(x);
+					}
+					function callUint(uint256 x) external pure returns (uint256) { return f(x); }
+					function callAddress(address x) external pure returns (uint256) { return f(x); }
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "Derived");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+	BOOST_CHECK(solcore["featureFlags"]["staticBaseCallTargets"].get<bool>());
+
+	std::set<std::string> declarationNames;
+	for (Json const& fn: solcore["internal_functions"])
+		declarationNames.insert(fn["name"].get<std::string>());
+
+	std::vector<Json const*> superCalls;
+	for (Json const& fn: solcore["internal_functions"])
+	{
+		if (!fn.contains("body") || !fn["body"].is_object() || !fn["body"].contains("statements"))
+			continue;
+		for (Json const& statement: fn["body"]["statements"])
+			if (
+				statement.value("kind", ""s) == "return" && statement.contains("value")
+				&& statement["value"].value("kind", ""s) == "internal_call"
+				&& statement["value"].value("targetKind", ""s) == "super"
+			)
+				superCalls.push_back(&statement["value"]);
+	}
+
+	BOOST_REQUIRE_EQUAL(superCalls.size(), 2u);
+	std::set<std::string> calleeNames;
+	for (Json const* call: superCalls)
+	{
+		BOOST_CHECK_EQUAL(call->at("contractId").get<std::string>(), "fileA:Derived");
+		std::string callee = call->at("function").get<std::string>();
+		BOOST_CHECK_NE(callee, "f");
+		BOOST_CHECK_MESSAGE(
+			declarationNames.count(callee) == 1,
+			"super call coordinate must name an exactly exported flattened declaration");
+		calleeNames.insert(std::move(callee));
+	}
+	BOOST_CHECK_MESSAGE(
+		calleeNames.size() == 2u,
+		"same-name/same-arity super overloads must retain distinct typed identities");
+}
+
 BOOST_AUTO_TEST_CASE(solcore_export_mapping_post_increment_writes_storage_and_returns_old_value)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				contract C {
@@ -3719,9 +4534,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_mapping_post_increment_writes_storage_and_re
 						return nonces[owner]++;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3732,7 +4545,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_mapping_post_increment_writes_storage_and_re
 	BOOST_REQUIRE(solcore["internal_functions"].is_array());
 
 	Json const* useNonce = nullptr;
-	for (auto const& fn : solcore["internal_functions"])
+	for (auto const& fn: solcore["internal_functions"])
 	{
 		if (fn["name"].get<std::string>() == "_useNonce")
 			useNonce = &fn;
@@ -3759,12 +4572,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_mapping_post_increment_writes_storage_and_re
 
 BOOST_AUTO_TEST_CASE(solcore_export_initializer_modifier_is_lowered_into_function_body)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				contract C {
@@ -3783,9 +4591,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_initializer_modifier_is_lowered_into_functio
 						value = x;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3798,13 +4604,14 @@ BOOST_AUTO_TEST_CASE(solcore_export_initializer_modifier_is_lowered_into_functio
 	BOOST_REQUIRE(solcore["functions"].is_array());
 
 	Json const* initializeFn = nullptr;
-	for (auto const& fn : solcore["functions"])
+	for (auto const& fn: solcore["functions"])
 	{
 		if (fn["name"].get<std::string>() == "initialize")
 			initializeFn = &fn;
 	}
 	BOOST_REQUIRE_MESSAGE(initializeFn != nullptr, "initialize function should exist");
-	BOOST_CHECK_MESSAGE(initializeFn->value("has_modifiers", false), "initialize should still record modifier presence");
+	BOOST_CHECK_MESSAGE(
+		initializeFn->value("has_modifiers", false), "initialize should still record modifier presence");
 
 	std::string initializeBody = initializeFn->dump();
 	BOOST_CHECK_MESSAGE(
@@ -3823,12 +4630,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_initializer_modifier_is_lowered_into_functio
 
 BOOST_AUTO_TEST_CASE(solcore_export_address_code_length_lowers_to_extcodesize)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				contract C {
@@ -3836,9 +4638,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_address_code_length_lowers_to_extcodesize)
 						return address(this).code.length;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3850,21 +4650,18 @@ BOOST_AUTO_TEST_CASE(solcore_export_address_code_length_lowers_to_extcodesize)
 	BOOST_REQUIRE(solcore["functions"].is_array());
 
 	bool worldHasCodeSize = false;
-	for (auto const& decl : solcore["type_decls"])
+	for (auto const& decl: solcore["type_decls"])
 	{
 		if (decl["name"].get<std::string>() != "WorldState")
 			continue;
 		std::string declDump = decl.dump();
-		worldHasCodeSize =
-			declDump.find("\"name\":\"codeSize\"") != std::string::npos &&
-			declDump.find("\"kind\":\"mapping\"") != std::string::npos;
+		worldHasCodeSize = declDump.find("\"name\":\"codeSize\"") != std::string::npos
+						   && declDump.find("\"kind\":\"mapping\"") != std::string::npos;
 	}
-	BOOST_CHECK_MESSAGE(
-		worldHasCodeSize,
-		"WorldState should expose a codeSize mapping for extcodesize lowering");
+	BOOST_CHECK_MESSAGE(worldHasCodeSize, "WorldState should expose a codeSize mapping for extcodesize lowering");
 
 	Json const* codeLength = nullptr;
-	for (auto const& fn : solcore["functions"])
+	for (auto const& fn: solcore["functions"])
 	{
 		if (fn["name"].get<std::string>() == "codeLength")
 			codeLength = &fn;
@@ -3885,12 +4682,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_address_code_length_lowers_to_extcodesize)
 
 BOOST_AUTO_TEST_CASE(solcore_export_constructor_deployment_semantics)
 {
-	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore"}),
-		SolidityCode({
-			{"fileA", R"(
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				contract C {
@@ -3900,9 +4692,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_constructor_deployment_semantics)
 						sawZero = address(this).code.length == 0;
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -3915,6 +4705,19 @@ BOOST_AUTO_TEST_CASE(solcore_export_constructor_deployment_semantics)
 	BOOST_REQUIRE_MESSAGE(
 		solcore["deployedCodeSize"].is_string() || solcore["deployedCodeSize"].is_number_integer(),
 		"deployedCodeSize should be exported for constructor deployment semantics");
+	BOOST_REQUIRE_MESSAGE(
+		solcore["constructorDisposition"].is_object(), "explicit constructor disposition should be required");
+	Json const& disposition = solcore["constructorDisposition"];
+	BOOST_CHECK_EQUAL(disposition["kind"].get<std::string>(), "exported");
+	BOOST_CHECK_EQUAL(
+		disposition["declarationId"].get<std::string>(),
+		solcore["constructor"]["declarationId"].get<std::string>());
+	BOOST_CHECK_EQUAL(
+		disposition["function"].get<std::string>(), solcore["constructor"]["name"].get<std::string>());
+	BOOST_CHECK_MESSAGE(
+		disposition["paramsAbi"] == solcore["constructor"]["paramsAbi"],
+		"constructor disposition ABI must match the exported constructor body");
+	BOOST_CHECK(disposition["sourceLocation"].is_object());
 
 	std::string ctorDump = solcore["constructor"].dump();
 	BOOST_CHECK_MESSAGE(
@@ -3926,6 +4729,273 @@ BOOST_AUTO_TEST_CASE(solcore_export_constructor_deployment_semantics)
 	BOOST_CHECK_MESSAGE(
 		ctorDump.find("\"path\":[\"env\",\"thisAddress\"]") != std::string::npos,
 		"constructor extcodesize should read thisAddress from CallEnv");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_implicit_constructor_disposition)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+
+				contract Implicit {
+					uint256 private value;
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "Implicit");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+	BOOST_CHECK(!solcore.value("unsupported", false));
+	BOOST_REQUIRE(solcore["constructorDisposition"].is_object());
+	BOOST_CHECK_EQUAL(solcore["constructorDisposition"]["kind"].get<std::string>(), "implicit");
+	BOOST_CHECK_MESSAGE(
+		!solcore.contains("constructor"), "an AST-proven implicit constructor must not fabricate a body");
+	BOOST_REQUIRE(solcore["immutables"].is_array());
+	BOOST_CHECK(solcore["immutables"].empty());
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_immutable_declarations_and_access_identity)
+{
+	Json input = generateStandardJson(
+		false,
+		Json(),
+		Json::array({"solcore", "evm.deployedBytecode.immutableReferences"}),
+		SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+
+				contract C {
+					uint16 immutable seeded = 7;
+					address immutable owner;
+					bool immutable enabled;
+					bytes1 immutable tag1;
+					bytes4 immutable tag4;
+					bytes31 immutable tag31;
+
+					constructor(
+						address initialOwner,
+						bool initialEnabled,
+						bytes1 initialTag1,
+						bytes4 initialTag4,
+						bytes31 initialTag31
+					) {
+						owner = initialOwner;
+						enabled = initialEnabled;
+						tag1 = initialTag1;
+						tag4 = initialTag4;
+						tag31 = initialTag31;
+					}
+
+					function values()
+						external
+						view
+						returns (uint16, address, bool, bytes1, bytes4, bytes31, bytes4)
+					{
+						return (seeded, owner, enabled, tag1, tag4, tag31, tag4);
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "C");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+	BOOST_CHECK(!solcore.value("unsupported", false));
+	BOOST_REQUIRE(solcore["immutables"].is_array());
+	BOOST_REQUIRE_EQUAL(solcore["immutables"].size(), 6u);
+
+	std::map<std::string, Json const*> immutablesByName;
+	std::set<std::string> declarationIds;
+	for (auto const& immutable: solcore["immutables"])
+	{
+		BOOST_REQUIRE(immutable["declarationId"].is_string());
+		std::string declarationId = immutable["declarationId"].get<std::string>();
+		BOOST_CHECK(!declarationId.empty());
+		BOOST_CHECK_EQUAL(declarationId.find_first_not_of("0123456789"), std::string::npos);
+		declarationIds.insert(declarationId);
+		immutablesByName.emplace(immutable["name"].get<std::string>(), &immutable);
+	}
+	BOOST_REQUIRE_EQUAL(declarationIds.size(), 6u);
+	for (std::string const& name: {"seeded", "owner", "enabled", "tag1", "tag4", "tag31"})
+		BOOST_REQUIRE_MESSAGE(immutablesByName.count(name) == 1, "missing immutable metadata for " + name);
+
+	Json const* seeded = immutablesByName.at("seeded");
+	Json const* owner = immutablesByName.at("owner");
+	Json const* enabled = immutablesByName.at("enabled");
+	Json const* tag1 = immutablesByName.at("tag1");
+	Json const* tag4 = immutablesByName.at("tag4");
+	Json const* tag31 = immutablesByName.at("tag31");
+
+	BOOST_CHECK_EQUAL((*seeded)["type"].get<std::string>(), "u16");
+	BOOST_CHECK_EQUAL((*seeded)["abi"]["name"].get<std::string>(), "seeded");
+	BOOST_CHECK_EQUAL((*seeded)["abi"]["type"].get<std::string>(), "uint16");
+	BOOST_CHECK_EQUAL((*seeded)["abi"]["internalType"].get<std::string>(), "uint16");
+	BOOST_REQUIRE((*seeded)["abi"]["components"].is_array());
+	BOOST_CHECK((*seeded)["abi"]["components"].empty());
+	BOOST_CHECK((*seeded)["sourceLocation"].is_object());
+	BOOST_REQUIRE((*seeded)["initializer"].is_object());
+	BOOST_CHECK_EQUAL((*seeded)["initializer"]["kind"].get<std::string>(), "u256");
+	BOOST_CHECK_EQUAL((*seeded)["initializer"]["value"].get<std::string>(), "7");
+
+	BOOST_CHECK_EQUAL((*owner)["type"].get<std::string>(), "address");
+	BOOST_CHECK_EQUAL((*owner)["abi"]["type"].get<std::string>(), "address");
+	BOOST_CHECK((*owner)["initializer"].is_null());
+	BOOST_CHECK((*owner)["sourceLocation"].is_object());
+	BOOST_CHECK_EQUAL((*enabled)["type"].get<std::string>(), "bool");
+	BOOST_CHECK_EQUAL((*enabled)["abi"]["type"].get<std::string>(), "bool");
+	BOOST_CHECK_EQUAL((*tag1)["type"].get<std::string>(), "bytes1");
+	BOOST_CHECK_EQUAL((*tag1)["abi"]["type"].get<std::string>(), "bytes1");
+	BOOST_CHECK_EQUAL((*tag4)["type"].get<std::string>(), "bytes4");
+	BOOST_CHECK_EQUAL((*tag4)["abi"]["type"].get<std::string>(), "bytes4");
+	BOOST_CHECK_EQUAL((*tag31)["type"].get<std::string>(), "bytes31");
+	BOOST_CHECK_EQUAL((*tag31)["abi"]["type"].get<std::string>(), "bytes31");
+
+	std::string constructorDump = solcore["constructor"]["body"].dump();
+	BOOST_CHECK_NE(constructorDump.find("\"kind\":\"immutable_set\""), std::string::npos);
+	for (Json const* immutable: {owner, enabled, tag1, tag4, tag31})
+		BOOST_CHECK_NE(
+			constructorDump.find(
+				"\"declarationId\":\"" + immutable->at("declarationId").get<std::string>() + "\""),
+			std::string::npos);
+	Json const* values = findExportedFunction(solcore["functions"], "values");
+	BOOST_REQUIRE(values != nullptr);
+	std::string valuesDump = values->at("body").dump();
+	BOOST_CHECK_NE(valuesDump.find("\"kind\":\"immutable_get\""), std::string::npos);
+	BOOST_CHECK_NE(
+		valuesDump.find("\"declarationId\":\"" + (*seeded)["declarationId"].get<std::string>() + "\""),
+		std::string::npos);
+	BOOST_CHECK_NE(
+		valuesDump.find("\"declarationId\":\"" + (*owner)["declarationId"].get<std::string>() + "\""),
+		std::string::npos);
+	std::string solcoreDump = solcore.dump();
+	BOOST_CHECK_EQUAL(solcoreDump.find("\"kind\":\"storage_get\""), std::string::npos);
+	BOOST_CHECK_EQUAL(solcoreDump.find("\"kind\":\"storage_set\""), std::string::npos);
+
+	Json const& immutableReferences = contractResult["evm"]["deployedBytecode"]["immutableReferences"];
+	BOOST_REQUIRE(immutableReferences.is_object());
+	BOOST_REQUIRE_EQUAL(immutableReferences.size(), declarationIds.size());
+	for (auto const& [declarationId, ranges]: immutableReferences.items())
+	{
+		BOOST_CHECK_EQUAL(declarationIds.count(declarationId), 1u);
+		BOOST_REQUIRE(ranges.is_array());
+		BOOST_CHECK(!ranges.empty());
+		for (Json const& range: ranges)
+			BOOST_CHECK_EQUAL(range["length"].get<unsigned>(), 32u);
+	}
+	BOOST_CHECK(
+		immutableReferences.at((*tag4)["declarationId"].get<std::string>()).size() >=
+		2u);
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_deployment_constructor_identity_and_abi)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+
+				contract ExplicitChild {
+					uint16 immutable seed;
+					constructor(uint16 initialSeed) {
+						seed = initialSeed;
+					}
+				}
+
+				contract ImplicitChild {}
+
+				contract Factory {
+					function deployExplicit(uint16 initialSeed) external {
+						new ExplicitChild(initialSeed);
+					}
+
+					function deployImplicit() external {
+						new ImplicitChild();
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json explicitResult = getContractResult(result, "fileA", "ExplicitChild");
+	Json implicitResult = getContractResult(result, "fileA", "ImplicitChild");
+	Json factoryResult = getContractResult(result, "fileA", "Factory");
+	BOOST_REQUIRE(explicitResult["solcore"].is_object());
+	BOOST_REQUIRE(implicitResult["solcore"].is_object());
+	BOOST_REQUIRE(factoryResult["solcore"].is_object());
+	Json const& explicitSolcore = explicitResult["solcore"];
+	Json const& implicitSolcore = implicitResult["solcore"];
+	Json const& factorySolcore = factoryResult["solcore"];
+	BOOST_CHECK(!explicitSolcore.value("unsupported", false));
+	BOOST_CHECK(!implicitSolcore.value("unsupported", false));
+	BOOST_CHECK(!factorySolcore.value("unsupported", false));
+
+	Json const* deployExplicit = findExportedFunction(factorySolcore["functions"], "deployExplicit");
+	Json const* deployImplicit = findExportedFunction(factorySolcore["functions"], "deployImplicit");
+	BOOST_REQUIRE(deployExplicit != nullptr);
+	BOOST_REQUIRE(deployImplicit != nullptr);
+	Json const& explicitDeployment = deployExplicit->at("body")["statements"][0]["value"];
+	Json const& implicitDeployment = deployImplicit->at("body")["statements"][0]["value"];
+	BOOST_CHECK_EQUAL(explicitDeployment["kind"].get<std::string>(), "contract_deployment");
+	BOOST_CHECK_EQUAL(implicitDeployment["kind"].get<std::string>(), "contract_deployment");
+	BOOST_CHECK_EQUAL(explicitDeployment["targetContractId"].get<std::string>(), "fileA:ExplicitChild");
+	BOOST_CHECK_EQUAL(implicitDeployment["targetContractId"].get<std::string>(), "fileA:ImplicitChild");
+
+	BOOST_CHECK_MESSAGE(
+		explicitDeployment["constructorDisposition"] == explicitSolcore["constructorDisposition"],
+		"deployment must carry the exact explicit target constructor disposition");
+	BOOST_CHECK_MESSAGE(
+		explicitDeployment["constructorArgAbi"] == explicitSolcore["constructorDisposition"]["paramsAbi"],
+		"deployment constructor ABI must match its explicit target declaration");
+	BOOST_REQUIRE_EQUAL(explicitDeployment["constructorArgAbi"].size(), 1u);
+	BOOST_CHECK_EQUAL(explicitDeployment["constructorArgAbi"][0]["type"].get<std::string>(), "uint16");
+	BOOST_CHECK_EQUAL(explicitDeployment["constructorArgAbi"][0]["name"].get<std::string>(), "initialSeed");
+	BOOST_CHECK_EQUAL(explicitDeployment["constructorArgAbi"][0]["internalType"].get<std::string>(), "uint16");
+	BOOST_REQUIRE(explicitSolcore["constructor"]["params"].is_array());
+	BOOST_REQUIRE_EQUAL(explicitSolcore["constructor"]["params"].size(), 1u);
+	BOOST_CHECK_MESSAGE(
+		explicitSolcore["constructor"]["params"][0]["abi"] == explicitDeployment["constructorArgAbi"][0],
+		"ABI-visible constructor parameter must carry the same declaration-owned descriptor");
+	BOOST_CHECK_EQUAL(
+		explicitDeployment["constructorDisposition"]["declarationId"].get<std::string>(),
+		explicitSolcore["constructor"]["declarationId"].get<std::string>());
+
+	BOOST_CHECK_MESSAGE(
+		implicitDeployment["constructorDisposition"] == implicitSolcore["constructorDisposition"],
+		"deployment must carry the exact implicit target constructor disposition");
+	BOOST_CHECK_EQUAL(implicitDeployment["constructorDisposition"]["kind"].get<std::string>(), "implicit");
+	BOOST_REQUIRE(implicitDeployment["constructorArgAbi"].is_array());
+	BOOST_CHECK(implicitDeployment["constructorArgAbi"].empty());
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_unexportable_explicit_constructor_fails_contract)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+
+				contract Failing {
+					bytes32 private observed;
+
+					constructor(bytes memory data) {
+						observed = bytes32(data);
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "Failing");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+	BOOST_CHECK(solcore.value("unsupported", false));
+	BOOST_REQUIRE(solcore["reason"].is_string());
+	std::string reason = solcore["reason"].get<std::string>();
+	BOOST_CHECK_NE(reason.find("Explicit constructor body export failed"), std::string::npos);
+	BOOST_CHECK_NE(reason.find("truncating conversion is not modeled"), std::string::npos);
+	BOOST_CHECK(!solcore.contains("constructor"));
+	BOOST_CHECK(!solcore.contains("constructorDisposition"));
 }
 
 BOOST_AUTO_TEST_CASE(solcore_specific_contract_request_still_compiles)
@@ -3956,11 +5026,7 @@ BOOST_AUTO_TEST_CASE(solcore_specific_contract_request_still_compiles)
 BOOST_AUTO_TEST_CASE(solcore_export_known_external_target_metadata_and_foreign_registry)
 {
 	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore", "evm.bytecode.object"}),
-		SolidityCode({
-			{"fileA", R"(
+		false, Json(), Json::array({"solcore", "evm.bytecode.object"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				contract Ownable {
@@ -3971,7 +5037,11 @@ BOOST_AUTO_TEST_CASE(solcore_export_known_external_target_metadata_and_foreign_r
 					}
 				}
 
-				contract Token {
+				interface IToken {
+					function balanceOf(address account) external view returns (uint256);
+				}
+
+				contract Token is IToken {
 					mapping(address => uint256) internal _balances;
 					mapping(address => mapping(address => uint256)) internal _allowances;
 
@@ -4007,10 +5077,12 @@ BOOST_AUTO_TEST_CASE(solcore_export_known_external_target_metadata_and_foreign_r
 						token.transferFrom(from, to, amount);
 						marker = amount;
 					}
+
+					function balance(IToken token, address account) external view returns (uint256) {
+						return token.balanceOf(account);
+					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -4042,29 +5114,137 @@ BOOST_AUTO_TEST_CASE(solcore_export_known_external_target_metadata_and_foreign_r
 	BOOST_CHECK_MESSAGE(
 		solcoreDump.find(
 			"\"knownTarget\":{\"contractId\":\"fileA:Ownable\",\"function\":\"owner\",\"mutability\":\"view\","
-			"\"resolution\":{\"field\":\"_owner\",\"keyArgOrder\":[],\"kind\":\"storage_getter\",\"returnType\":\"address\",\"slot\":\"0\"},"
-			"\"resolutionKind\":\"storage_getter\",\"selector\":\"8da5cb5b\",\"signature\":\"owner()\"}") != std::string::npos,
+			"\"resolution\":{\"field\":\"_owner\",\"keyArgOrder\":[],\"kind\":\"storage_getter\",\"returnType\":"
+			"\"address\",\"slot\":\"0\"},"
+			"\"resolutionKind\":\"storage_getter\",\"selector\":\"8da5cb5b\",\"signature\":\"owner()\"}")
+			!= std::string::npos,
 		"known view calls should carry knownTarget metadata");
 	BOOST_CHECK_MESSAGE(
 		solcoreDump.find(
 			"\"knownTarget\":{\"contractId\":\"fileA:Token\",\"function\":\"transfer\",\"mutability\":\"stateful\","
-			"\"resolutionKind\":\"cross_contract\",\"selector\":\"a9059cbb\",\"signature\":\"transfer(address,uint256)\"}") != std::string::npos,
+			"\"resolutionKind\":\"cross_contract\",\"selector\":\"a9059cbb\",\"signature\":\"transfer(address,uint256)"
+			"\"}")
+			!= std::string::npos,
 		"known ERC20 transfer calls should carry knownTarget metadata");
 	BOOST_CHECK_MESSAGE(
 		solcoreDump.find(
 			"\"knownTarget\":{\"contractId\":\"fileA:Token\",\"function\":\"transferFrom\",\"mutability\":\"stateful\","
-			"\"resolutionKind\":\"cross_contract\",\"selector\":\"23b872dd\",\"signature\":\"transferFrom(address,address,uint256)\"}") != std::string::npos,
+			"\"resolutionKind\":\"cross_contract\",\"selector\":\"23b872dd\",\"signature\":\"transferFrom(address,"
+			"address,uint256)\"}")
+			!= std::string::npos,
 		"known ERC20 transferFrom calls should carry knownTarget metadata");
+	BOOST_CHECK_MESSAGE(
+		solcoreDump.find(
+			"\"knownTarget\":{\"contractId\":\"fileA:IToken\",\"function\":\"balanceOf\",\"mutability\":\"view\","
+			"\"resolutionKind\":\"cross_contract\",\"selector\":\"70a08231\",\"signature\":\"balanceOf(address)\"}")
+			!= std::string::npos,
+		"interface-typed receivers should preserve the declared interface instead of guessing its unique implementation");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_dispatch_entries_preserve_structural_return_types)
+{
+	Json input = generateStandardJson(
+		false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+
+				interface IRewards {
+					function getRewardsList() external view returns (address[] memory);
+				}
+
+				contract Caller {
+					function rewards(IRewards target) external view returns (address[] memory) {
+						return target.getRewardsList();
+					}
+
+					function implicitPair(uint256 a, uint256 b)
+						internal
+						pure
+						returns (uint256 hi, uint256 lo)
+					{
+						hi = a;
+						lo = b;
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json const interfaceSolcore = getContractResult(result, "fileA", "IRewards")["solcore"];
+	BOOST_REQUIRE(interfaceSolcore["dispatch_entries"].is_array());
+	BOOST_REQUIRE_EQUAL(interfaceSolcore["dispatch_entries"].size(), 1);
+	Json const& dispatchReturn = interfaceSolcore["dispatch_entries"][0]["return"];
+	BOOST_CHECK_EQUAL(dispatchReturn["kind"].get<std::string>(), "array");
+	BOOST_CHECK_EQUAL(dispatchReturn["element"].get<std::string>(), "address");
+	BOOST_REQUIRE(interfaceSolcore["dispatch_entries"][0]["returnLocations"].is_array());
+	BOOST_REQUIRE_EQUAL(interfaceSolcore["dispatch_entries"][0]["returnLocations"].size(), 1);
+	BOOST_CHECK_EQUAL(
+		interfaceSolcore["dispatch_entries"][0]["returnLocations"][0].get<std::string>(),
+		"memory");
+
+	Json const callerSolcore = getContractResult(result, "fileA", "Caller")["solcore"];
+	BOOST_REQUIRE(callerSolcore["foreign_contracts"].is_array());
+	BOOST_REQUIRE_EQUAL(callerSolcore["foreign_contracts"].size(), 1);
+	Json const& methodReturn = callerSolcore["foreign_contracts"][0]["methods"][0]["return"];
+	BOOST_CHECK_EQUAL(methodReturn, dispatchReturn);
+	BOOST_REQUIRE(callerSolcore["foreign_contracts"][0]["methods"][0]["returnLocations"].is_array());
+	BOOST_REQUIRE_EQUAL(
+		callerSolcore["foreign_contracts"][0]["methods"][0]["returnLocations"].size(),
+		1);
+	BOOST_CHECK_EQUAL(
+		callerSolcore["foreign_contracts"][0]["methods"][0]["returnLocations"][0].get<std::string>(),
+		"memory");
+
+	Json const* implicitPair = nullptr;
+	for (Json const& function: callerSolcore["internal_functions"])
+		if (function["name"] == "implicitPair")
+			implicitPair = &function;
+	BOOST_REQUIRE(implicitPair);
+	Json const& pairStatements = (*implicitPair)["body"]["statements"];
+	BOOST_REQUIRE(!pairStatements.empty());
+	Json const& pairReturn = pairStatements.back()["value"];
+	BOOST_CHECK_EQUAL(pairReturn["kind"].get<std::string>(), "tuple");
+	BOOST_REQUIRE_EQUAL(pairReturn["elements"].size(), 2);
+	BOOST_CHECK_EQUAL(pairReturn["elements"][0]["kind"].get<std::string>(), "local");
+	BOOST_CHECK_EQUAL(pairReturn["elements"][0]["name"].get<std::string>(), "hi");
+	BOOST_CHECK_EQUAL(pairReturn["elements"][1]["kind"].get<std::string>(), "local");
+	BOOST_CHECK_EQUAL(pairReturn["elements"][1]["name"].get<std::string>(), "lo");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_dispatch_entries_preserve_explicit_unit_returns)
+{
+	Json input = generateStandardJson(
+		false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+
+				interface IPing {
+					function ping() external;
+				}
+
+				contract Caller {
+					function callPing(IPing target) external {
+						target.ping();
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json const& contractResult = getContractResult(result, "fileA", "Caller");
+	BOOST_REQUIRE_MESSAGE(contractResult.is_object(), result.dump());
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE(solcore["dispatch_entries"].is_array());
+	BOOST_REQUIRE_EQUAL(solcore["dispatch_entries"].size(), 1);
+	BOOST_CHECK_EQUAL(
+		solcore["dispatch_entries"][0]["return"].get<std::string>(),
+		"unit");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_try_catch_optioned_contract_call_keeps_known_target)
 {
 	Json input = generateStandardJson(
-		false,
-		Json(),
-		Json::array({"solcore", "evm.bytecode.object"}),
-		SolidityCode({
-			{"fileA", R"(
+		false, Json(), Json::array({"solcore", "evm.bytecode.object"}), SolidityCode({{"fileA", R"(
 				pragma solidity >=0.8.20;
 
 				interface IBasket {
@@ -4088,9 +5268,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_try_catch_optioned_contract_call_keeps_known
 						}
 					}
 				}
-			)"}
-		})
-	);
+			)"}}));
 
 	Json result = compile(input.dump());
 	BOOST_REQUIRE(containsAtMostWarnings(result));
@@ -4110,7 +5288,8 @@ BOOST_AUTO_TEST_CASE(solcore_export_try_catch_optioned_contract_call_keeps_known
 	BOOST_CHECK_MESSAGE(
 		solcoreDump.find(
 			"\"knownTarget\":{\"contractId\":\"fileA:IBasket\",\"function\":\"quantity\",\"mutability\":\"view\","
-			"\"resolutionKind\":\"cross_contract\",\"selector\":\"a5a5828c\",\"signature\":\"quantity(address)\"}") != std::string::npos,
+			"\"resolutionKind\":\"cross_contract\",\"selector\":\"a5a5828c\",\"signature\":\"quantity(address)\"}")
+			!= std::string::npos,
 		"optioned try/catch contract calls should carry knownTarget metadata");
 	BOOST_CHECK_MESSAGE(
 		solcoreDump.find("\"method\":\"disableBasket\"") != std::string::npos,
@@ -4146,11 +5325,8 @@ BOOST_AUTO_TEST_CASE(source_location_of_bare_block)
 	std::string sourceMap = result["contracts"]["A.sol"]["A"]["evm"]["bytecode"]["sourceMap"].get<std::string>();
 
 	// Check that the bare block's source location is referenced.
-	std::string sourceRef =
-		";" +
-		std::to_string(std::string{"contract A { constructor() { uint x = 2; "}.size()) +
-		":" +
-		std::to_string(std::string{"{ uint y = 3; }"}.size());
+	std::string sourceRef = ";" + std::to_string(std::string{"contract A { constructor() { uint x = 2; "}.size()) + ":"
+							+ std::to_string(std::string{"{ uint y = 3; }"}.size());
 	BOOST_REQUIRE(sourceMap.find(sourceRef) != std::string::npos);
 }
 
@@ -4184,94 +5360,51 @@ BOOST_AUTO_TEST_CASE(ethdebug_debug_info_ethdebug)
 			std::nullopt,
 		},
 		{
-			generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"evm.deployedBytecode.ethdebug"})),
+			generateExperimentalStandardJson(
+				false, Json::array({"ethdebug"}), Json::array({"evm.deployedBytecode.ethdebug"})),
 			std::nullopt,
-		},
-		{
-			generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
-			std::nullopt,
-		},
-		{
-			generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"irOptimized"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"irOptimized"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.bytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.deployedBytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.bytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.deployedBytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, Json::array({"ethdebug"}), Json::array({"irOptimized"}), YulCode()),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, Json::array({"ethdebug"}), Json::array({"irOptimized"}), YulCode()),
-			{}
-		},
-		{
-			generateExperimentalStandardJson(true, Json::array({"ethdebugs"}), Json::array({"irOptimized"}), YulCode()), {}
 		},
 		{
 			generateExperimentalStandardJson(
-				true, Json::array({"ethdebug"}), {
-					{"fileA", {{"contractA", Json::array({"evm.deployedBytecode.bin"})}}},
-					{"fileB", {{"contractB", Json::array({"evm.bytecode.bin"})}}}
-				},
-				SolidityCode({
-					{"fileA", "pragma solidity >=0.0; contract contractA { function f() public pure {} }"},
-					{"fileB", "pragma solidity >=0.0; contract contractB { function f() public pure {} }"}
-				}), true
-			),
+				false,
+				Json::array({"ethdebug"}),
+				Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
+			std::nullopt,
+		},
+		{generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"irOptimized"})),
+		 [](const Json& result) { return result.dump().find("/// ethdebug: enabled") != std::string::npos; }},
+		{generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"irOptimized"})),
+		 [](const Json& result) { return result.dump().find("/// ethdebug: enabled") != std::string::npos; }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.bytecode.ethdebug"})),
+		 [](const Json& result) { return result.dump().find("/// ethdebug: enabled") != std::string::npos; }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.deployedBytecode.ethdebug"})),
+		 [](const Json& result) { return result.dump().find("/// ethdebug: enabled") != std::string::npos; }},
+		{generateExperimentalStandardJson(
+			 true, {}, Json::array({"irOptimized", "evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
+		 [](const Json& result) { return result.dump().find("/// ethdebug: enabled") != std::string::npos; }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.bytecode.ethdebug"})),
+		 [](const Json& result) { return result.dump().find("/// ethdebug: enabled") != std::string::npos; }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"irOptimized", "evm.deployedBytecode.ethdebug"})),
+		 [](const Json& result) { return result.dump().find("/// ethdebug: enabled") != std::string::npos; }},
+		{generateExperimentalStandardJson(
+			 true, {}, Json::array({"irOptimized", "evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
+		 [](const Json& result) { return result.dump().find("/// ethdebug: enabled") != std::string::npos; }},
+		{generateExperimentalStandardJson(true, Json::array({"ethdebug"}), Json::array({"irOptimized"}), YulCode()),
+		 [](const Json& result) { return result.dump().find("/// ethdebug: enabled") != std::string::npos; }},
+		{generateExperimentalStandardJson(true, Json::array({"ethdebug"}), Json::array({"irOptimized"}), YulCode()),
+		 {}},
+		{generateExperimentalStandardJson(true, Json::array({"ethdebugs"}), Json::array({"irOptimized"}), YulCode()),
+		 {}},
+		{
+			generateExperimentalStandardJson(
+				true,
+				Json::array({"ethdebug"}),
+				{{"fileA", {{"contractA", Json::array({"evm.deployedBytecode.bin"})}}},
+				 {"fileB", {{"contractB", Json::array({"evm.bytecode.bin"})}}}},
+				SolidityCode(
+					{{"fileA", "pragma solidity >=0.0; contract contractA { function f() public pure {} }"},
+					 {"fileB", "pragma solidity >=0.0; contract contractB { function f() public pure {} }"}}),
+				true),
 			std::nullopt,
 		},
 		{
@@ -4295,163 +5428,120 @@ BOOST_AUTO_TEST_CASE(ethdebug_debug_info_ethdebug)
 BOOST_AUTO_TEST_CASE(ethdebug_ethdebug_output)
 {
 	static std::vector<std::tuple<Json, std::optional<std::function<bool(Json)>>>> tests{
-		{
-			generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"evm.bytecode.ethdebug"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(false, {}, Json::array({"evm.bytecode.ethdebug"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"evm.deployedBytecode.ethdebug"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(false, {}, Json::array({"evm.deployedBytecode.ethdebug"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(false, {}, Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(true, Json::array({"location"}), Json::array({"evm.bytecode.ethdebug"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(true, Json::array({"location"}), Json::array({"evm.deployedBytecode.ethdebug"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(true, Json::array({"location"}), Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(true, Json::array({"ethdebug"}), Json::array({"evm.bytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.contains("ethdebug") && result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, Json::array({"ethdebug"}), Json::array({"evm.deployedBytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.contains("ethdebug") && result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, Json::array({"ethdebug"}), Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.contains("ethdebug") && result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug") &&
-					 result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.contains("ethdebug") && result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.contains("ethdebug") && result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
-			[](const Json& result)
-			{
-				return result.contains("ethdebug") && result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug") &&
-					 result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebug", "ir"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos && result.contains("ethdebug") && result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode.ethdebug", "ir"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos && result.contains("ethdebug") && result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebugs"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode.ethdebugs"})),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug", "ir"})),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos && result.contains("ethdebug") && result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug") &&
-					 result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebug", "ir"}), YulCode()),
-			[](const Json& result)
-			{
-				return result.dump().find("/// ethdebug: enabled") != std::string::npos && result["contracts"]["fileA"]["object"]["evm"]["bytecode"].contains("ethdebug");
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode.ethdebug", "ir"}), YulCode()),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug", "ir"}), YulCode()),
-			std::nullopt
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode"})),
-			[](const Json& result)
-			{
-				return result.dump().find("ethdebug") == std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode"})),
-			[](const Json& result)
-			{
-				return result.dump().find("ethdebug") == std::string::npos;
-			}
-		},
-		{
-			generateExperimentalStandardJson(
-				true, {}, {
-					{"fileA", {{"contractA", Json::array({"evm.deployedBytecode.ethdebug"})}}},
-					{"fileB", {{"contractB", Json::array({"evm.bytecode.ethdebug"})}}}
-				},
-				SolidityCode({
-					{"fileA", "pragma solidity >=0.0; contract contractA { function f() public pure {} }"},
-					{"fileB", "pragma solidity >=0.0; contract contractB { function f() public pure {} }"}
-				}), true
-			),
-			[](const Json& result)
-			{
-				return result["contracts"]["fileA"]["contractA"]["evm"]["deployedBytecode"].contains("ethdebug") &&
-					result["contracts"]["fileB"]["contractB"]["evm"]["bytecode"].contains("ethdebug") && result.contains("ethdebug");
-			}
-		}
-	};
+		{generateExperimentalStandardJson(false, Json::array({"ethdebug"}), Json::array({"evm.bytecode.ethdebug"})),
+		 std::nullopt},
+		{generateExperimentalStandardJson(false, {}, Json::array({"evm.bytecode.ethdebug"})), std::nullopt},
+		{generateExperimentalStandardJson(
+			 false, Json::array({"ethdebug"}), Json::array({"evm.deployedBytecode.ethdebug"})),
+		 std::nullopt},
+		{generateExperimentalStandardJson(false, {}, Json::array({"evm.deployedBytecode.ethdebug"})), std::nullopt},
+		{generateExperimentalStandardJson(
+			 false, Json::array({"ethdebug"}), Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
+		 std::nullopt},
+		{generateExperimentalStandardJson(
+			 false, {}, Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
+		 std::nullopt},
+		{generateExperimentalStandardJson(true, Json::array({"location"}), Json::array({"evm.bytecode.ethdebug"})),
+		 std::nullopt},
+		{generateExperimentalStandardJson(
+			 true, Json::array({"location"}), Json::array({"evm.deployedBytecode.ethdebug"})),
+		 std::nullopt},
+		{generateExperimentalStandardJson(
+			 true, Json::array({"location"}), Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
+		 std::nullopt},
+		{generateExperimentalStandardJson(true, Json::array({"ethdebug"}), Json::array({"evm.bytecode.ethdebug"})),
+		 [](const Json& result)
+		 {
+			 return result.contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(
+			 true, Json::array({"ethdebug"}), Json::array({"evm.deployedBytecode.ethdebug"})),
+		 [](const Json& result)
+		 {
+			 return result.contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(
+			 true, Json::array({"ethdebug"}), Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
+		 [](const Json& result)
+		 {
+			 return result.contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebug"})),
+		 [](const Json& result)
+		 {
+			 return result.contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode.ethdebug"})),
+		 [](const Json& result)
+		 {
+			 return result.contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(
+			 true, {}, Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug"})),
+		 [](const Json& result)
+		 {
+			 return result.contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebug", "ir"})),
+		 [](const Json& result)
+		 {
+			 return result.dump().find("/// ethdebug: enabled") != std::string::npos && result.contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode.ethdebug", "ir"})),
+		 [](const Json& result)
+		 {
+			 return result.dump().find("/// ethdebug: enabled") != std::string::npos && result.contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebugs"})), std::nullopt},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode.ethdebugs"})), std::nullopt},
+		{generateExperimentalStandardJson(
+			 true, {}, Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug", "ir"})),
+		 [](const Json& result)
+		 {
+			 return result.dump().find("/// ethdebug: enabled") != std::string::npos && result.contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["deployedBytecode"].contains("ethdebug")
+					&& result["contracts"]["fileA"]["C"]["evm"]["bytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode.ethdebug", "ir"}), YulCode()),
+		 [](const Json& result)
+		 {
+			 return result.dump().find("/// ethdebug: enabled") != std::string::npos
+					&& result["contracts"]["fileA"]["object"]["evm"]["bytecode"].contains("ethdebug");
+		 }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode.ethdebug", "ir"}), YulCode()),
+		 std::nullopt},
+		{generateExperimentalStandardJson(
+			 true, {}, Json::array({"evm.bytecode.ethdebug", "evm.deployedBytecode.ethdebug", "ir"}), YulCode()),
+		 std::nullopt},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.bytecode"})),
+		 [](const Json& result) { return result.dump().find("ethdebug") == std::string::npos; }},
+		{generateExperimentalStandardJson(true, {}, Json::array({"evm.deployedBytecode"})),
+		 [](const Json& result) { return result.dump().find("ethdebug") == std::string::npos; }},
+		{generateExperimentalStandardJson(
+			 true,
+			 {},
+			 {{"fileA", {{"contractA", Json::array({"evm.deployedBytecode.ethdebug"})}}},
+			  {"fileB", {{"contractB", Json::array({"evm.bytecode.ethdebug"})}}}},
+			 SolidityCode(
+				 {{"fileA", "pragma solidity >=0.0; contract contractA { function f() public pure {} }"},
+				  {"fileB", "pragma solidity >=0.0; contract contractB { function f() public pure {} }"}}),
+			 true),
+		 [](const Json& result)
+		 {
+			 return result["contracts"]["fileA"]["contractA"]["evm"]["deployedBytecode"].contains("ethdebug")
+					&& result["contracts"]["fileB"]["contractB"]["evm"]["bytecode"].contains("ethdebug")
+					&& result.contains("ethdebug");
+		 }}};
 	frontend::StandardCompiler compiler;
 	for (auto const& [standardJsonToCompile, optionalCheck]: tests)
 	{
@@ -4462,10 +5552,14 @@ BOOST_AUTO_TEST_CASE(ethdebug_ethdebug_output)
 	}
 }
 
-BOOST_DATA_TEST_CASE(ethdebug_output_instructions_smoketest, boost::unit_test::data::make({"deployedBytecode", "bytecode"}), bytecodeType)
+BOOST_DATA_TEST_CASE(
+	ethdebug_output_instructions_smoketest,
+	boost::unit_test::data::make({"deployedBytecode", "bytecode"}),
+	bytecodeType)
 {
 	frontend::StandardCompiler compiler;
-	Json result = compiler.compile(generateExperimentalStandardJson(true, {}, Json::array({std::string("evm.") + bytecodeType + ".ethdebug"})));
+	Json result = compiler.compile(
+		generateExperimentalStandardJson(true, {}, Json::array({std::string("evm.") + bytecodeType + ".ethdebug"})));
 	BOOST_REQUIRE(result["contracts"]["fileA"]["C"]["evm"][bytecodeType].contains("ethdebug"));
 	bool creation = std::string(bytecodeType) == "bytecode";
 	Json ethdebugInstructionsToCheck = result["contracts"]["fileA"]["C"]["evm"][bytecodeType]["ethdebug"];
@@ -4495,7 +5589,8 @@ BOOST_DATA_TEST_CASE(ethdebug_output_instructions_smoketest, boost::unit_test::d
 				BOOST_REQUIRE(instruction["operation"]["arguments"].size() == 1);
 				std::string argument = instruction["operation"]["arguments"][0];
 				BOOST_REQUIRE(argument.length() % 2 == 0);
-				BOOST_REQUIRE(bytesToPush == (argument.length() - 2) / 2); // remove "0x" and calculate actual byte size from hex.
+				BOOST_REQUIRE(
+					bytesToPush == (argument.length() - 2) / 2); // remove "0x" and calculate actual byte size from hex.
 			}
 			else
 				BOOST_REQUIRE(!instruction["operation"].contains("arguments"));
@@ -4527,7 +5622,11 @@ BOOST_AUTO_TEST_CASE(no_experimental_import_ast_solidity_evmasm)
 		Json parsedInput;
 		BOOST_REQUIRE(util::jsonParseStrict(input, parsedInput));
 		Json result = compiler.compile(parsedInput);
-		BOOST_CHECK(containsError(result, "FatalError", "'SolidityAST' and 'EVMAssembly' inputs are experimental and can only be used with the 'settings.experimental' option enabled."));
+		BOOST_CHECK(containsError(
+			result,
+			"FatalError",
+			"'SolidityAST' and 'EVMAssembly' inputs are experimental and can only be used with the "
+			"'settings.experimental' option enabled."));
 	}
 }
 
@@ -4555,12 +5654,11 @@ BOOST_AUTO_TEST_CASE(no_experimental_invalid_output_selection)
 	Json parsedInput;
 	BOOST_REQUIRE(util::jsonParseStrict(input, parsedInput));
 	Json result = compiler.compile(parsedInput);
-	BOOST_CHECK(
-		containsError(
-			result,
-			"FatalError", "'irAst', 'irOptimizedAst', 'yulCFGJson', and 'ethdebug' outputs are experimental and can only be used with the 'settings.experimental' option enabled."
-		)
-	);
+	BOOST_CHECK(containsError(
+		result,
+		"FatalError",
+		"'irAst', 'irOptimizedAst', 'yulCFGJson', and 'ethdebug' outputs are experimental and can only be used with "
+		"the 'settings.experimental' option enabled."));
 }
 
 BOOST_AUTO_TEST_CASE(experimental_non_boolean)
