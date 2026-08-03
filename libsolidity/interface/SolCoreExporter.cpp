@@ -2232,11 +2232,14 @@ Json exportAbiDescriptor(
 		auto const* solidityArrayType = dynamic_cast<ArrayType const*>(_solidityType);
 		if (!solidityArrayType || !arrayType->baseType() || !solidityArrayType->baseType())
 			throw UnsupportedSolCore("Compiler-resolved ABI array lost its Solidity element type.");
+		// Inside a wire-encoded array the elements are encoded inline; the
+		// library-only storage-pointer spelling applies to top-level
+		// parameters only (storage aggregates never reach this branch).
 		Json element = exportAbiDescriptor(
 			"",
 			arrayType->baseType(),
 			solidityArrayType->baseType(),
-			_forLibrary);
+			false);
 		if (!element["type"].is_string() || !element["components"].is_array())
 			throw UnsupportedSolCore("Compiler-resolved ABI array element has a malformed descriptor.");
 		std::string suffix = arrayType->isDynamicallySized()
@@ -2261,7 +2264,12 @@ Json exportAbiDescriptor(
 			Type const* solidityMemberType = member->annotation().type;
 			if (!solidityMemberType)
 				throw UnsupportedSolCore("ABI struct member has no compiler-resolved Solidity type.");
-			Type const* encodingMemberType = solidityMemberType->interfaceType(_forLibrary);
+			// Struct member types default to storage locations in the AST,
+			// and a library's interfaceType(true) preserves them, which
+			// would misrender wire-tuple members as componentless storage
+			// pointers. This tuple is wire-encoded (storage-pointer params
+			// return before recursion), so members encode as ordinary ABI.
+			Type const* encodingMemberType = solidityMemberType->interfaceType(false);
 			if (!encodingMemberType)
 				throw UnsupportedSolCore(
 					"ABI struct member '" + member->name() + "' has no compiler-resolved external type.");
@@ -2269,7 +2277,7 @@ Json exportAbiDescriptor(
 				member->name(),
 				encodingMemberType,
 				solidityMemberType,
-				_forLibrary));
+				false));
 		}
 		return result;
 	}
@@ -2288,7 +2296,7 @@ Json exportAbiDescriptor(
 				"",
 				tupleType->components()[i],
 				solidityTupleType->components()[i],
-				_forLibrary));
+				false));
 		}
 		return result;
 	}
