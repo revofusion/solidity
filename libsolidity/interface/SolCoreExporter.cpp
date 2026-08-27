@@ -666,6 +666,89 @@ std::string exportedEnumName(EnumDefinition const& _enumDef)
 	return _enumDef.name();
 }
 
+template<class F>
+void forEachStructDefinition(SourceUnit const& _unit, F&& _f)
+{
+	for (auto const& node: _unit.nodes())
+	{
+		if (auto const* structDef = dynamic_cast<StructDefinition const*>(node.get()))
+			_f(*structDef);
+		else if (auto const* contractNode = dynamic_cast<ContractDefinition const*>(node.get()))
+			for (auto const* structDef: contractNode->definedStructs())
+				_f(*structDef);
+	}
+}
+
+std::string sanitizedIdentifierComponent(std::string const& _raw)
+{
+	std::string out;
+	for (char c: _raw)
+		out += (std::isalnum(static_cast<unsigned char>(c)) || c == '_') ? c : '_';
+	if (out.empty() || std::isdigit(static_cast<unsigned char>(out[0])))
+		out = "_" + out;
+	return out;
+}
+
+/// Scope-qualified struct spelling used when the bare name collides:
+/// `<ScopeContract>_<Name>` for contract/library/interface-scoped structs,
+/// `<SourceStem>_<Name>` for file-level structs. The suffix `_<astId>` is
+/// appended only when qualification itself still collides.
+std::string qualifiedStructName(StructDefinition const& _structDef)
+{
+	if (auto const* scope = dynamic_cast<ContractDefinition const*>(_structDef.scope()))
+		return sanitizedIdentifierComponent(scope->name()) + "_" + _structDef.name();
+	std::string stem = _structDef.sourceUnitName();
+	if (auto const slash = stem.find_last_of('/'); slash != std::string::npos)
+		stem = stem.substr(slash + 1);
+	if (auto const dot = stem.find('.'); dot != std::string::npos)
+		stem = stem.substr(0, dot);
+	return sanitizedIdentifierComponent(stem) + "_" + _structDef.name();
+}
+
+/// Two distinct struct DEFINITIONS sharing one bare name would collapse to a
+/// single exported record, silently binding every user of the suppressed
+/// declaration to the survivor's layout (e.g. PoolOracle.Observation vs
+/// IPoolTape.Observation). Mirror [exportedEnumName]: qualify iff some OTHER
+/// definition shares the bare name anywhere in the compiler stack.
+std::string exportedStructName(StructDefinition const& _structDef)
+{
+	if (!activeCompilerStack)
+		return _structDef.name();
+	static thread_local CompilerStack const* cachedStructStack = nullptr;
+	static thread_local std::map<std::string, std::set<StructDefinition const*>> structDefsByName;
+	static thread_local std::map<std::string, std::set<StructDefinition const*>> structDefsByQualifiedName;
+	if (cachedStructStack != activeCompilerStack)
+	{
+		structDefsByName.clear();
+		structDefsByQualifiedName.clear();
+		for (auto const& sourceName: activeCompilerStack->sourceNames())
+		{
+			try
+			{
+				forEachStructDefinition(
+					activeCompilerStack->ast(sourceName),
+					[&](StructDefinition const& candidate)
+					{
+						structDefsByName[candidate.name()].insert(&candidate);
+						structDefsByQualifiedName[qualifiedStructName(candidate)].insert(&candidate);
+					});
+			}
+			catch (...)
+			{
+			}
+		}
+		cachedStructStack = activeCompilerStack;
+	}
+	auto const it = structDefsByName.find(_structDef.name());
+	if (it == structDefsByName.end() || it->second.size() <= 1)
+		return _structDef.name();
+	std::string qualified = qualifiedStructName(_structDef);
+	auto const qit = structDefsByQualifiedName.find(qualified);
+	if (qit != structDefsByQualifiedName.end() && qit->second.size() > 1)
+		qualified += "_" + std::to_string(_structDef.id());
+	return qualified;
+}
+
 /// Derive a field prefix from a struct name.
 /// "TokenStorage" → "token_", "MyDataStorage" → "myData_"
 std::string derivePrefix(std::string const& _structName)
@@ -2830,46 +2913,26 @@ Json exportTypeName(TypeName const& _typeName, bool _storage)
 		Json element = exportTypeName(arrayType->baseType(), _storage);
 		if (arrayType->length())
 		{
-			// Fixed-size array: uint256[10] or uint256[2**10 + 3]
-			// First try to get the size from the literal expression
-			bool sizeResolved = false;
-			if (auto const* literal = dynamic_cast<Literal const*>(arrayType->length()))
-			{
-				try
-				{
-					result["kind"] = _storage ? "storage_fixed_array" : "fixed_array";
-					result["element"] = element;
-					result["size"] = std::stoul(literal->value());
-					sizeResolved = true;
-				}
-				catch (...)
-				{
-					// Non-integer literal — will try resolved type below
-				}
-			}
-			// If the length is a computed expression (e.g. 2**10 + 3),
-			// use the resolved type annotation to get the actual size
-			if (!sizeResolved)
-			{
-				auto const* resolvedArrayType = dynamic_cast<ArrayType const*>(arrayType->annotation().type);
-				if (resolvedArrayType && !resolvedArrayType->isDynamicallySized())
-				{
-					u256 len = resolvedArrayType->length();
-					if (len <= std::numeric_limits<unsigned long>::max())
-					{
-						result["kind"] = _storage ? "storage_fixed_array" : "fixed_array";
-						result["element"] = element;
-						result["size"] = len.convert_to<unsigned long>();
-						sizeResolved = true;
-					}
-				}
-			}
-			// Final fallback: treat as dynamic array
-			if (!sizeResolved)
-			{
-				result["kind"] = _storage ? "storage_array" : "array";
-				result["element"] = element;
-			}
+			// Fixed-size array. The length is ALWAYS taken from the
+			// compiler-resolved array type: the previous literal-text fast
+			// path used std::stoul on the raw literal, which silently
+			// truncates underscore literals (`UserPoint[1_000_000_000]`
+			// parsed as size 1) — a storage-layout corruption, not an
+			// error. A fixed array whose length cannot be resolved is a
+			// refusal, never a silent demotion to a dynamic array (the
+			// two have different storage layouts).
+			auto const* resolvedArrayType = dynamic_cast<ArrayType const*>(arrayType->annotation().type);
+			if (!resolvedArrayType || resolvedArrayType->isDynamicallySized())
+				throw UnsupportedSolCore(
+					"Fixed-size array type name has no compiler-resolved static length; "
+					"refusing to guess the storage layout.");
+			u256 const len = resolvedArrayType->length();
+			if (len > std::numeric_limits<unsigned long>::max())
+				throw UnsupportedSolCore(
+					"Fixed-size array length exceeds the exporter's representable range.");
+			result["kind"] = _storage ? "storage_fixed_array" : "fixed_array";
+			result["element"] = element;
+			result["size"] = len.convert_to<unsigned long>();
 		}
 		else
 		{
@@ -2902,7 +2965,10 @@ Json exportTypeName(TypeName const& _typeName, bool _storage)
 		}
 		Json result = Json::object();
 		result["kind"] = _storage ? "storage_named" : "named";
-		result["name"] = std::string(path.back());
+		if (auto const* structDef = dynamic_cast<StructDefinition const*>(referencedDecl))
+			result["name"] = exportedStructName(*structDef);
+		else
+			result["name"] = std::string(path.back());
 		return result;
 	}
 	// Preserve external values as their address/selector pair and internal
@@ -7662,14 +7728,41 @@ Json exportExpr(Expression const& _expr)
 							"size-preserving lowering (the type checker should "
 							"have rejected this).");
 				}
-				if (targetFB && sourceType && sourceType->category() == Type::Category::Array)
-					throw UnsupportedSolCore(
-						"`bytes" + std::to_string(targetFB->numBytes())
-						+ "(<dynamic bytes>)` truncating conversion is not modeled "
-						  "(narrow-bytesN campaign residual): the operand is a byte-array "
-						  "value, not a word, so a pass-through would reinterpret a "
-						  "pointer/array as the bytesN value. Refusing fail-closed.");
-				if (sourceFB && targetType && targetType->category() == Type::Category::Array)
+				// `bytesN(<dynamic bytes / bytes slice>)` (Solidity 0.8.5+):
+				// the FIRST N bytes of the array as the bytesN value,
+				// zero-padded on the right when shorter. The operand is a
+				// byte-ARRAY value, so a pass-through would reinterpret an
+				// array as the word — lower through the dedicated typed
+				// helper instead. Calldata slices arrive as ArraySliceType
+				// (NOT Category::Array), which the old fail-closed guard
+				// missed: the conversion silently passed the array value
+				// through, losing the reinterpretation entirely.
+				if (targetFB && sourceType)
+				{
+					ArrayType const* sourceArray = nullptr;
+					if (auto const* arr = dynamic_cast<ArrayType const*>(sourceType))
+						sourceArray = arr;
+					else if (auto const* slice = dynamic_cast<ArraySliceType const*>(sourceType))
+						sourceArray = &slice->arrayType();
+					if (sourceArray)
+					{
+						if (!sourceArray->isByteArrayOrString())
+							throw UnsupportedSolCore(
+								"`bytes" + std::to_string(targetFB->numBytes())
+								+ "(<non-byte array>)` conversion has no lowering "
+								  "(the type checker should have rejected this).");
+						Json result = Json::object();
+						result["kind"] = "internal_call";
+						result["function"]
+							= "byte_array_to_bytesn__" + std::to_string(targetFB->numBytes());
+						result["args"] = Json::array();
+						result["args"].emplace_back(innerJson);
+						return result;
+					}
+				}
+				if (sourceFB && targetType
+					&& (targetType->category() == Type::Category::Array
+						|| targetType->category() == Type::Category::ArraySlice))
 					throw UnsupportedSolCore(
 						"`bytes(<bytesN>)` conversion to dynamic bytes is not modeled "
 						"(narrow-bytesN campaign residual): the result is a byte-array "
@@ -7683,8 +7776,12 @@ Json exportExpr(Expression const& _expr)
 		{
 			Json result = Json::object();
 			result["kind"] = "struct_constructor";
-			// Try to get the struct name from the expression
-			if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
+			// Name the constructed record from the compiler-resolved struct
+			// type (never the callee's surface spelling): the exported record
+			// name is disambiguated when bare struct names collide.
+			if (auto const* structType = dynamic_cast<StructType const*>(call->annotation().type))
+				result["name"] = exportedStructName(structType->structDefinition());
+			else if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
 				result["name"] = callee->name();
 			else if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&call->expression()))
 				result["name"] = memberAccess->memberName();
@@ -9803,7 +9900,7 @@ Json exportResolvedType(Type const* _type, bool _storage)
 		auto const* structType = dynamic_cast<StructType const*>(_type);
 		Json result = Json::object();
 		result["kind"] = storage ? "storage_named" : "named";
-		result["name"] = structType->structDefinition().name();
+		result["name"] = exportedStructName(structType->structDefinition());
 		return result;
 	}
 	case Type::Category::Array:
@@ -14304,7 +14401,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 					// Skip struct fields that cause unexpected errors during export
 				}
 			}
-			typeDecls.emplace_back(runtimeTypeDecl(structDef->name(), std::move(structFields)));
+			typeDecls.emplace_back(runtimeTypeDecl(exportedStructName(*structDef), std::move(structFields)));
 		}
 	}
 	// Also check structs defined inside contracts and interfaces
@@ -14317,7 +14414,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 				// Avoid duplicates (struct might already be added from source unit level)
 				bool exists = false;
 				for (auto const& existing: typeDecls)
-					if (existing.value("name", "") == structDef->name())
+					if (existing.value("name", "") == exportedStructName(*structDef))
 						exists = true;
 				if (!exists)
 				{
@@ -14333,7 +14430,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 							// Skip struct fields with unsupported types
 						}
 					}
-					typeDecls.emplace_back(runtimeTypeDecl(structDef->name(), std::move(structFields)));
+					typeDecls.emplace_back(runtimeTypeDecl(exportedStructName(*structDef), std::move(structFields)));
 				}
 			}
 		}
@@ -14348,7 +14445,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 
 		auto tryAddStruct = [&](StructDefinition const* structDef)
 		{
-			if (addedTypeNames.count(structDef->name()))
+			if (addedTypeNames.count(exportedStructName(*structDef)))
 				return;
 			Json structFields = Json::array();
 			for (auto const& member: structDef->members())
@@ -14361,8 +14458,8 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 				{
 				}
 			}
-			typeDecls.emplace_back(runtimeTypeDecl(structDef->name(), std::move(structFields)));
-			addedTypeNames.insert(structDef->name());
+			typeDecls.emplace_back(runtimeTypeDecl(exportedStructName(*structDef), std::move(structFields)));
+			addedTypeNames.insert(exportedStructName(*structDef));
 		};
 
 		// Collect all reachable source units by walking the import graph
@@ -14980,14 +15077,77 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	// arbitrary assembly can address their storage slot without naming the
 	// Solidity declaration. Aggregate memory values are conservative too,
 	// because raw mstore can bypass the compiler's external-reference map.
+	//
+	// The poisoning is function-granular, not contract-granular: only a
+	// function whose export involves an internal-function VALUE (a typed
+	// internal_function node, or a call routed through a candidate table's
+	// dispatcher/delegate) depends on the closed-table guarantee — direct
+	// calls never do. Demote exactly those functions to unsupported_body
+	// (carrying this refusal reason) and drop the voided tables, so the
+	// rest of the contract — e.g. OZ Arrays' unsafeAccess family beside its
+	// open-world fn-pointer quicksort — keeps its exact model.
 	if (!internalFnTablesByFingerprint.empty()
 		&& (internalFnAssemblyTouchesValue
 			|| (internalFnContractContainsAssembly
 				&& (contractHasStoredInternalFnValue(contract)
 					|| contractHasAggregateInternalFnValue(contract)))))
-		throw UnsupportedSolCore(
+	{
+		std::string const poisonReason =
 			"Inline assembly can mutate an internal-function value outside its closed candidate table; "
-			"raw assembly code-pointer construction is open-world and is refused.");
+			"raw assembly code-pointer construction is open-world, so every function whose export "
+			"involves an internal-function value is refused.";
+		std::set<std::string> tableNames;
+		for (auto const& [fingerprint, table]: internalFnTablesByFingerprint)
+		{
+			(void) fingerprint;
+			tableNames.insert(table.dispatcherName);
+			for (auto const& [tag, candidate]: table.candidatesByTag)
+			{
+				(void) tag;
+				tableNames.insert(candidate.delegateName);
+			}
+		}
+		std::function<bool(Json const&)> usesInternalFnValue = [&](Json const& _node) -> bool
+		{
+			if (_node.is_object())
+			{
+				auto kind = _node.find("kind");
+				if (kind != _node.end() && kind->is_string() && kind->get<std::string>() == "internal_function")
+					return true;
+				for (auto const& [key, value]: _node.items())
+				{
+					(void) key;
+					if (usesInternalFnValue(value))
+						return true;
+				}
+			}
+			else if (_node.is_array())
+			{
+				for (auto const& value: _node)
+					if (usesInternalFnValue(value))
+						return true;
+			}
+			else if (_node.is_string() && tableNames.count(_node.get<std::string>()))
+				return true;
+			return false;
+		};
+		auto demote = [&](Json& _fn)
+		{
+			if (!usesInternalFnValue(_fn))
+				return;
+			Json failedBody = Json::object();
+			failedBody["kind"] = "unsupported_body";
+			failedBody["error"] = poisonReason;
+			_fn["body"] = std::move(failedBody);
+		};
+		for (auto& fn: functions)
+			demote(fn);
+		for (auto& fn: internalFunctions)
+			demote(fn);
+		if (solcore.contains("constructor"))
+			demote(solcore["constructor"]);
+		internalFnTablesByFingerprint.clear();
+	}
 	auto functionNameExists = [&](std::string const& _name)
 	{
 		for (Json const* entries: {&functions, &internalFunctions})
