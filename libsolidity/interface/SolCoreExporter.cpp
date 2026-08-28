@@ -6017,11 +6017,13 @@ Json exportExpr(Expression const& _expr)
 			result["value"] = false;
 			return result;
 		}
-		if (literal->annotation().type && literal->annotation().type->category() == Type::Category::RationalNumber)
+		if (auto const* rationalType = dynamic_cast<RationalNumberType const*>(literal->annotation().type))
 		{
+			if (rationalType->isFractional())
+				throw UnsupportedSolCore("Fractional numeric literal has no exact u256 lowering.");
 			Json result = Json::object();
 			result["kind"] = "u256";
-			result["value"] = literal->value();
+			result["value"] = rationalType->literalValue(literal).str();
 			return result;
 		}
 		// Address literals: 0x... with 40 hex digits.
@@ -13885,10 +13887,33 @@ Json exportConstructor(FunctionDefinition const& _function, ContractDefinition c
 		result["params"].emplace_back(exportParam(*parameter, true, false));
 	result["return"] = Json("unit");
 	result["returnAbi"] = Json::array();
-	Json body = exportBody(_function);
-	if (body.value("kind", ""s) == "unsupported_body")
-		throw UnsupportedSolCore(
-			"Explicit constructor body export failed: " + body.value("error", "unknown export failure"s));
+	Json body;
+	for (ContractDefinition const* base: _contract.annotation().linearizedBaseContracts)
+	{
+		if (base == &_contract)
+			continue;
+		FunctionDefinition const* baseConstructor = base->constructor();
+		if (!baseConstructor)
+			continue;
+		bool const hasStatements
+			= baseConstructor->isImplemented() && !baseConstructor->body().statements().empty();
+		bool const hasArguments
+			= _contract.annotation().baseConstructorArguments.count(baseConstructor) != 0;
+		if (!hasStatements && !hasArguments)
+			continue;
+
+		body = Json::object();
+		body["kind"] = "unsupported_body";
+		body["error"]
+			= "Inherited constructor chain is not modeled faithfully: base constructor '"
+			  + base->name() + "' has "
+			  + (hasStatements && hasArguments ? "statements and constructor arguments"
+											   : hasStatements ? "statements" : "constructor arguments")
+			  + ".";
+		break;
+	}
+	if (body.is_null())
+		body = exportBody(_function);
 	result["body"] = std::move(body);
 	result["ast_write_oracle"] = astWriteOracleJson(_function, _contract);
 	return result;
