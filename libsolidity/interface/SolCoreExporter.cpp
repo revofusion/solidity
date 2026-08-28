@@ -3127,42 +3127,25 @@ Json exportConstructorParamsAbi(FunctionDefinition const& _constructor)
 	return result;
 }
 
-std::optional<std::string> inheritedConstructorFailureReason(ContractDefinition const& _contract)
+bool inheritedConstructorHasWork(ContractDefinition const& _contract)
 {
-	std::vector<std::string> affectedBases;
 	for (ContractDefinition const* base: _contract.annotation().linearizedBaseContracts)
 	{
 		if (base == &_contract)
 			continue;
+		for (VariableDeclaration const* stateVariable: base->stateVariables())
+			if (!stateVariable->isConstant() && stateVariable->value())
+				return true;
 		FunctionDefinition const* baseConstructor = base->constructor();
 		if (!baseConstructor)
 			continue;
-		bool const hasStatements
-			= baseConstructor->isImplemented() && !baseConstructor->body().statements().empty();
-		bool const hasArguments
-			= _contract.annotation().baseConstructorArguments.count(baseConstructor) != 0;
-		if (!hasStatements && !hasArguments)
-			continue;
-
-		affectedBases.emplace_back(
-			"'" + base->name() + "' ("
-			+ (hasStatements && hasArguments ? "statements and constructor arguments"
-											: hasStatements ? "statements" : "constructor arguments")
-			+ ")");
+		if (
+			(baseConstructor->isImplemented() && !baseConstructor->body().statements().empty())
+			|| _contract.annotation().baseConstructorArguments.count(baseConstructor) != 0
+		)
+			return true;
 	}
-	if (affectedBases.empty())
-		return std::nullopt;
-
-	std::string reason = "Inherited constructor chain is not modeled faithfully: base constructor";
-	reason += affectedBases.size() == 1 ? " " : "s ";
-	for (size_t i = 0; i < affectedBases.size(); ++i)
-	{
-		if (i != 0)
-			reason += ", ";
-		reason += affectedBases[i];
-	}
-	reason += ".";
-	return reason;
+	return false;
 }
 
 Json exportConstructorDisposition(ContractDefinition const& _contract)
@@ -3171,7 +3154,7 @@ Json exportConstructorDisposition(ContractDefinition const& _contract)
 	FunctionDefinition const* constructor = _contract.constructor();
 	if (!constructor)
 	{
-		if (inheritedConstructorFailureReason(_contract))
+		if (inheritedConstructorHasWork(_contract))
 		{
 			result["kind"] = "exported";
 			result["declarationId"] = std::to_string(_contract.id());
@@ -4507,15 +4490,28 @@ std::string storageRefInternalEntryName(FunctionDefinition const& _function)
 	return exportedFunctionName(_function) + "__storage_ref";
 }
 
-bool functionUsesStructuralStorageRefs(FunctionDefinition const& _function)
+bool storageRefParameterIsWrittenThrough(
+	FunctionDefinition const& _function, VariableDeclaration const* _parameter)
+{
+	if (!isStorageRefParameter(_parameter))
+		return false;
+	StorageRefWriteThroughScanner writeThrough;
+	_function.body().accept(writeThrough);
+	return writeThrough.writtenThrough.count(_parameter) != 0;
+}
+
+bool functionNeedsAllStructuralStorageRefs(FunctionDefinition const& _function)
 {
 	return isResidualStorageRefFunction(_function) || isPublicLibraryStructuralStorageFunction(_function)
 		   || functionNeedsResidualStorageRefLocals(_function);
 }
 
+
 bool isStructuralStorageRefParameter(FunctionDefinition const& _function, VariableDeclaration const* _parameter)
 {
-	return isStorageRefParameter(_parameter) && functionUsesStructuralStorageRefs(_function);
+	return isStorageRefParameter(_parameter)
+		   && (functionNeedsAllStructuralStorageRefs(_function)
+			   || storageRefParameterIsWrittenThrough(_function, _parameter));
 }
 
 FunctionDefinition const* calledFunctionDefinition(FunctionCall const& _call)
@@ -9000,6 +8996,9 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 			= dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
 		if (declaration && storageRefValueLocals.count(declaration))
 		{
+			if (isStorageRefParameter(declaration))
+				throw UnsupportedSolCore(
+					"Whole-root assignment cannot reseat a storage-reference parameter.");
 			if (_op != Token::Assign)
 				throw UnsupportedSolCore("Compound assignment cannot rebind a storage-reference value.");
 			auto reference = exportStorageRefValue(_rhs);
@@ -10201,6 +10200,51 @@ Json exportDelete(Expression const& _target)
 		call["args"].emplace_back(exportExpr(_target));
 		result["value"] = std::move(call);
 		return result;
+	}
+	if (hasResidualStorageRefRoot(_target))
+	{
+		auto reference = exportStorageRefValue(_target);
+		if (!reference)
+			throw UnsupportedSolCore(
+				"delete through a storage-reference parameter did not resolve to an exact typed path.");
+		std::string tempName = "__solcore_delete_sref_" + std::to_string(stableSyntheticNodeId(_target));
+		Json letReference = Json::object();
+		letReference["kind"] = "let";
+		letReference["sourceDeclarationId"] = Json();
+		letReference["name"] = tempName;
+		letReference["type"] = storageRefWireType(type);
+		letReference["value"] = std::move(*reference);
+
+		Json localReference = localExpr(tempName);
+		Json deletedValue;
+		if (hasSlotPreservingDynamicStorageArraySemantics(type))
+		{
+			deletedValue["kind"] = "internal_call";
+			deletedValue["function"] = "storage_array_clear";
+			deletedValue["args"] = Json::array();
+			deletedValue["args"].emplace_back(storageRefGetJson(localReference, type));
+		}
+		else if (type->category() == Type::Category::Struct)
+		{
+			auto const* structType = dynamic_cast<StructType const*>(type);
+			deletedValue = exportDeleteStructSpine(
+				storageRefGetJson(localReference, type), structType->structDefinition());
+		}
+		else
+			deletedValue = deleteDefaultValueForResolvedType(type);
+
+		Json set = Json::object();
+		set["kind"] = "storage_ref_set";
+		set["referentType"] = exportResolvedType(type, true);
+		set["reference"] = std::move(localReference);
+		set["value"] = std::move(deletedValue);
+
+		Json block = Json::object();
+		block["kind"] = "block";
+		block["statements"] = Json::array();
+		block["statements"].emplace_back(std::move(letReference));
+		block["statements"].emplace_back(std::move(set));
+		return block;
 	}
 
 	if (hasSlotPreservingDynamicStorageArraySemantics(type))
@@ -13467,10 +13511,9 @@ Json exportBody(FunctionDefinition const& _function)
 		storageRefSingleAssignBindable = rebindScanner.singleAssignBindable();
 	}
 	activeResidualStorageRefReturn = isResidualStorageRefFunction(_function);
-	if (functionUsesStructuralStorageRefs(_function))
-		for (auto const& parameter: _function.parameters())
-			if (isStorageRefParameter(parameter.get()))
-				storageRefValueLocals.insert(parameter.get());
+	for (auto const& parameter: _function.parameters())
+		if (isStructuralStorageRefParameter(_function, parameter.get()))
+			storageRefValueLocals.insert(parameter.get());
 
 
 	Json body;
@@ -13919,7 +13962,190 @@ Json exportFunction(
 	return result;
 }
 
-Json exportImplicitConstructorFailure(ContractDefinition const& _contract, std::string const& _reason)
+std::vector<ASTPointer<Expression>> const* constructorArguments(ASTNode const& _node)
+{
+	if (auto const* inheritance = dynamic_cast<InheritanceSpecifier const*>(&_node))
+		return inheritance->arguments();
+	if (auto const* invocation = dynamic_cast<ModifierInvocation const*>(&_node))
+		return invocation->arguments();
+	throw UnsupportedSolCore("Base-constructor argument annotation has an unsupported AST owner.");
+}
+
+void appendConstructorBodyStatements(
+	Json& _statements, Json const& _body, std::string const& _contractName, bool _includeTerminalReturn)
+{
+	if (!_body.is_object() || _body.value("kind", ""s) != "block" || !_body.contains("statements")
+		|| !_body["statements"].is_array())
+		throw UnsupportedSolCore(
+			"Constructor body for '" + _contractName + "' could not be exported faithfully: "
+			+ (_body.is_object() && _body.contains("error") && _body["error"].is_string()
+				   ? _body["error"].get<std::string>()
+				   : "body did not have the required block shape"));
+	Json const& bodyStatements = _body["statements"];
+	for (size_t i = 0; i < bodyStatements.size(); ++i)
+		if (
+			_includeTerminalReturn || i + 1 != bodyStatements.size() || !bodyStatements[i].is_object()
+			|| bodyStatements[i].value("kind", ""s) != "return"
+		)
+			_statements.emplace_back(bodyStatements[i]);
+}
+void appendStateVariableInitializers(Json& _statements, ContractDefinition const& _contract)
+{
+	for (VariableDeclaration const* variable: _contract.stateVariables())
+	{
+		if (variable->isConstant() || !variable->value())
+			continue;
+		Json statement = Json::object();
+		if (variable->immutable())
+			statement = immutableSet(*variable, exportExpr(*variable->value()));
+		else if (isTransientStateVar(variable))
+		{
+			statement["kind"] = "transient_set";
+			statement["field"] = variable->name();
+			statement["value"] = exportExpr(*variable->value());
+		}
+		else
+		{
+			statement["kind"] = "storage_set";
+			statement["field"] = variable->name();
+			statement["value"] = exportExpr(*variable->value());
+		}
+		_statements.emplace_back(std::move(statement));
+	}
+}
+
+Json exportConstructorChainBody(ContractDefinition const& _mostDerived)
+{
+	try
+	{
+		auto const& derivedFirst = _mostDerived.annotation().linearizedBaseContracts;
+		std::map<VariableDeclaration const*, std::string> argumentTemps;
+
+		auto buildFrame = [&](auto&& self, size_t _index) -> Json
+		{
+			ContractDefinition const* current = derivedFirst.at(_index);
+			Json frame = Json::object();
+			frame["kind"] = "block";
+			frame["statements"] = Json::array();
+			Json& statements = frame["statements"];
+
+			if (_index != 0)
+				if (FunctionDefinition const* constructor = current->constructor())
+					for (auto const& parameter: constructor->parameters())
+					{
+						auto temp = argumentTemps.find(parameter.get());
+						if (temp == argumentTemps.end())
+							throw UnsupportedSolCore(
+								"No evaluated argument was available for base constructor parameter '"
+								+ parameter->name() + "' of '" + current->name() + "'.");
+						Json binding = Json::object();
+						binding["kind"] = "let";
+						binding["sourceDeclarationId"] = std::to_string(parameter->id());
+						binding["name"] = parameter->name().empty()
+											  ? ("constructor_arg" + std::to_string(parameter->id()))
+											  : parameter->name();
+						binding["type"] = exportTypeName(parameter->typeName());
+						binding["value"] = localExpr(temp->second);
+						statements.emplace_back(std::move(binding));
+					}
+
+			for (ContractDefinition const* target: derivedFirst)
+			{
+				FunctionDefinition const* targetConstructor = target->constructor();
+				if (!targetConstructor)
+					continue;
+				auto annotated
+					= _mostDerived.annotation().baseConstructorArguments.find(targetConstructor);
+				if (annotated == _mostDerived.annotation().baseConstructorArguments.end()
+					|| !current->location().contains(annotated->second->location()))
+					continue;
+				auto const* arguments = constructorArguments(*annotated->second);
+				if (!arguments || arguments->size() != targetConstructor->parameters().size())
+					throw UnsupportedSolCore(
+						"Base constructor argument count did not match the compiler-resolved parameter list for '"
+						+ target->name() + "'.");
+				for (size_t i = 0; i < arguments->size(); ++i)
+				{
+					VariableDeclaration const* parameter = targetConstructor->parameters()[i].get();
+					std::string tempName = "__solcore_ctor_arg_" + std::to_string(parameter->id());
+					Json evaluated = Json::object();
+					evaluated["kind"] = "let";
+					evaluated["sourceDeclarationId"] = Json();
+					evaluated["name"] = tempName;
+					evaluated["type"] = exportTypeName(parameter->typeName());
+					evaluated["value"] = exportExpr(*arguments->at(i));
+					statements.emplace_back(std::move(evaluated));
+					argumentTemps[parameter] = std::move(tempName);
+				}
+			}
+
+			if (_index + 1 < derivedFirst.size())
+				statements.emplace_back(self(self, _index + 1));
+
+			appendStateVariableInitializers(statements, *current);
+			if (FunctionDefinition const* constructor = current->constructor())
+			{
+				if (!constructor->isImplemented())
+					throw UnsupportedSolCore(
+						"Base constructor for '" + current->name() + "' has no exportable body.");
+				appendConstructorBodyStatements(
+					statements, exportBody(*constructor), current->name(), _index == 0);
+			}
+			else if (_index == 0)
+				statements.emplace_back(Json{{"kind", "return"}, {"value", Json{{"kind", "unit"}}}});
+			return frame;
+		};
+
+		if (derivedFirst.empty() || derivedFirst.front() != &_mostDerived)
+			throw UnsupportedSolCore("Constructor C3 linearization did not start at the most-derived contract.");
+		return buildFrame(buildFrame, 0);
+	}
+	catch (...)
+	{
+		std::string reason = "unknown constructor-chain export failure";
+		try
+		{
+			throw;
+		}
+		catch (UnsupportedSolCore const& e)
+		{
+			reason = e.what();
+		}
+		catch (std::exception const& e)
+		{
+			reason = e.what();
+		}
+		catch (...)
+		{
+		}
+		return Json{{"kind", "unsupported_body"}, {"error", reason}};
+	}
+}
+
+Json constructorChainWriteOracle(ContractDefinition const& _contract)
+{
+	WriteOracleResult combined;
+	for (ContractDefinition const* current: _contract.annotation().linearizedBaseContracts)
+	{
+		for (VariableDeclaration const* variable: current->stateVariables())
+			if (!variable->isConstant() && !variable->immutable() && variable->value())
+				combined.writes.insert(variable->name());
+		if (FunctionDefinition const* constructor = current->constructor())
+		{
+			WriteOracleResult oracle = computeAstWriteOracle(*constructor, _contract);
+			combined.writes.insert(oracle.writes.begin(), oracle.writes.end());
+			combined.unknown = combined.unknown || oracle.unknown;
+		}
+	}
+	Json result = Json::object();
+	result["writes"] = Json::array();
+	for (std::string const& name: combined.writes)
+		result["writes"].emplace_back(name);
+	result["unknown"] = combined.unknown;
+	return result;
+}
+
+Json exportImplicitConstructor(ContractDefinition const& _contract)
 {
 	Json result = Json::object();
 	result["name"] = "constructor";
@@ -13929,14 +14155,8 @@ Json exportImplicitConstructorFailure(ContractDefinition const& _contract, std::
 	result["params"] = Json::array();
 	result["return"] = Json("unit");
 	result["returnAbi"] = Json::array();
-	Json body = Json::object();
-	body["kind"] = "unsupported_body";
-	body["error"] = _reason;
-	result["body"] = std::move(body);
-	Json astWriteOracle = Json::object();
-	astWriteOracle["writes"] = Json::array();
-	astWriteOracle["unknown"] = true;
-	result["ast_write_oracle"] = std::move(astWriteOracle);
+	result["body"] = exportConstructorChainBody(_contract);
+	result["ast_write_oracle"] = constructorChainWriteOracle(_contract);
 	return result;
 }
 
@@ -13955,17 +14175,8 @@ Json exportConstructor(FunctionDefinition const& _function, ContractDefinition c
 		result["params"].emplace_back(exportParam(*parameter, true, false));
 	result["return"] = Json("unit");
 	result["returnAbi"] = Json::array();
-	Json body;
-	if (std::optional<std::string> reason = inheritedConstructorFailureReason(_contract))
-	{
-		body = Json::object();
-		body["kind"] = "unsupported_body";
-		body["error"] = *reason;
-	}
-	else
-		body = exportBody(_function);
-	result["body"] = std::move(body);
-	result["ast_write_oracle"] = astWriteOracleJson(_function, _contract);
+	result["body"] = exportConstructorChainBody(_contract);
+	result["ast_write_oracle"] = constructorChainWriteOracle(_contract);
 	return result;
 }
 
@@ -14816,8 +15027,8 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	Json constructorDisposition = exportConstructorDisposition(contract);
 	if (auto const* constructor = contract.constructor())
 		solcore["constructor"] = exportConstructor(*constructor, contract);
-	else if (std::optional<std::string> reason = inheritedConstructorFailureReason(contract))
-		solcore["constructor"] = exportImplicitConstructorFailure(contract, *reason);
+	else if (inheritedConstructorHasWork(contract))
+		solcore["constructor"] = exportImplicitConstructor(contract);
 	solcore["constructorDisposition"] = std::move(constructorDisposition);
 
 	Json dispatchEntries = Json::array();
