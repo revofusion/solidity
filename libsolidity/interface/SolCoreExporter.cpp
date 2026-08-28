@@ -3127,13 +3127,60 @@ Json exportConstructorParamsAbi(FunctionDefinition const& _constructor)
 	return result;
 }
 
+std::optional<std::string> inheritedConstructorFailureReason(ContractDefinition const& _contract)
+{
+	std::vector<std::string> affectedBases;
+	for (ContractDefinition const* base: _contract.annotation().linearizedBaseContracts)
+	{
+		if (base == &_contract)
+			continue;
+		FunctionDefinition const* baseConstructor = base->constructor();
+		if (!baseConstructor)
+			continue;
+		bool const hasStatements
+			= baseConstructor->isImplemented() && !baseConstructor->body().statements().empty();
+		bool const hasArguments
+			= _contract.annotation().baseConstructorArguments.count(baseConstructor) != 0;
+		if (!hasStatements && !hasArguments)
+			continue;
+
+		affectedBases.emplace_back(
+			"'" + base->name() + "' ("
+			+ (hasStatements && hasArguments ? "statements and constructor arguments"
+											: hasStatements ? "statements" : "constructor arguments")
+			+ ")");
+	}
+	if (affectedBases.empty())
+		return std::nullopt;
+
+	std::string reason = "Inherited constructor chain is not modeled faithfully: base constructor";
+	reason += affectedBases.size() == 1 ? " " : "s ";
+	for (size_t i = 0; i < affectedBases.size(); ++i)
+	{
+		if (i != 0)
+			reason += ", ";
+		reason += affectedBases[i];
+	}
+	reason += ".";
+	return reason;
+}
+
 Json exportConstructorDisposition(ContractDefinition const& _contract)
 {
 	Json result = Json::object();
 	FunctionDefinition const* constructor = _contract.constructor();
 	if (!constructor)
 	{
-		result["kind"] = "implicit";
+		if (inheritedConstructorFailureReason(_contract))
+		{
+			result["kind"] = "exported";
+			result["declarationId"] = std::to_string(_contract.id());
+			result["function"] = "constructor";
+			result["paramsAbi"] = Json::array();
+			result["sourceLocation"] = sourceLocation(_contract.location());
+		}
+		else
+			result["kind"] = "implicit";
 		return result;
 	}
 	if (!constructor->isImplemented())
@@ -13872,6 +13919,27 @@ Json exportFunction(
 	return result;
 }
 
+Json exportImplicitConstructorFailure(ContractDefinition const& _contract, std::string const& _reason)
+{
+	Json result = Json::object();
+	result["name"] = "constructor";
+	result["declarationId"] = std::to_string(_contract.id());
+	result["sourceLocation"] = sourceLocation(_contract.location());
+	result["paramsAbi"] = Json::array();
+	result["params"] = Json::array();
+	result["return"] = Json("unit");
+	result["returnAbi"] = Json::array();
+	Json body = Json::object();
+	body["kind"] = "unsupported_body";
+	body["error"] = _reason;
+	result["body"] = std::move(body);
+	Json astWriteOracle = Json::object();
+	astWriteOracle["writes"] = Json::array();
+	astWriteOracle["unknown"] = true;
+	result["ast_write_oracle"] = std::move(astWriteOracle);
+	return result;
+}
+
 Json exportConstructor(FunctionDefinition const& _function, ContractDefinition const& _contract)
 {
 	if (!_function.isConstructor() || !_function.isImplemented())
@@ -13888,31 +13956,13 @@ Json exportConstructor(FunctionDefinition const& _function, ContractDefinition c
 	result["return"] = Json("unit");
 	result["returnAbi"] = Json::array();
 	Json body;
-	for (ContractDefinition const* base: _contract.annotation().linearizedBaseContracts)
+	if (std::optional<std::string> reason = inheritedConstructorFailureReason(_contract))
 	{
-		if (base == &_contract)
-			continue;
-		FunctionDefinition const* baseConstructor = base->constructor();
-		if (!baseConstructor)
-			continue;
-		bool const hasStatements
-			= baseConstructor->isImplemented() && !baseConstructor->body().statements().empty();
-		bool const hasArguments
-			= _contract.annotation().baseConstructorArguments.count(baseConstructor) != 0;
-		if (!hasStatements && !hasArguments)
-			continue;
-
 		body = Json::object();
 		body["kind"] = "unsupported_body";
-		body["error"]
-			= "Inherited constructor chain is not modeled faithfully: base constructor '"
-			  + base->name() + "' has "
-			  + (hasStatements && hasArguments ? "statements and constructor arguments"
-											   : hasStatements ? "statements" : "constructor arguments")
-			  + ".";
-		break;
+		body["error"] = *reason;
 	}
-	if (body.is_null())
+	else
 		body = exportBody(_function);
 	result["body"] = std::move(body);
 	result["ast_write_oracle"] = astWriteOracleJson(_function, _contract);
@@ -14766,6 +14816,8 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	Json constructorDisposition = exportConstructorDisposition(contract);
 	if (auto const* constructor = contract.constructor())
 		solcore["constructor"] = exportConstructor(*constructor, contract);
+	else if (std::optional<std::string> reason = inheritedConstructorFailureReason(contract))
+		solcore["constructor"] = exportImplicitConstructorFailure(contract, *reason);
 	solcore["constructorDisposition"] = std::move(constructorDisposition);
 
 	Json dispatchEntries = Json::array();
