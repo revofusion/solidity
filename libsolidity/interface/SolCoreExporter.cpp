@@ -903,17 +903,35 @@ struct StorageRefTarget
 	enum class RootKind
 	{
 		StateField,
-		LocalParameter
+		LocalParameter,
+		RawSlot
 	};
 
 	std::string root;				   ///< State field or threaded storage parameter name.
 	std::vector<StorageRefStep> steps; ///< Access steps in order, outermost first.
 	RootKind rootKind = RootKind::StateField;
 	Type const* rootType = nullptr; ///< Exact typed root for residual structural references.
+	Json rawSlot; ///< RootKind::RawSlot: exact caller-context slot-word expression.
+
+	StorageRefTarget() = default;
+	StorageRefTarget(
+		std::string _root,
+		std::vector<StorageRefStep> _steps,
+		RootKind _rootKind = RootKind::StateField,
+		Type const* _rootType = nullptr,
+		Json _rawSlot = Json{}):
+		root(std::move(_root)),
+		steps(std::move(_steps)),
+		rootKind(_rootKind),
+		rootType(_rootType),
+		rawSlot(std::move(_rawSlot))
+	{}
 };
+
 bool storageRefTargetsEqual(StorageRefTarget const& _lhs, StorageRefTarget const& _rhs)
 {
-	if (_lhs.root != _rhs.root || _lhs.rootKind != _rhs.rootKind || _lhs.steps.size() != _rhs.steps.size())
+	if (_lhs.root != _rhs.root || _lhs.rootKind != _rhs.rootKind || _lhs.steps.size() != _rhs.steps.size()
+		|| (_lhs.rootKind == StorageRefTarget::RootKind::RawSlot && _lhs.rawSlot != _rhs.rawSlot))
 		return false;
 	for (size_t i = 0; i < _lhs.steps.size(); ++i)
 	{
@@ -3773,7 +3791,84 @@ Json exportStorageRefSnapshotValue(Expression const& _expr, std::vector<Json>& _
 	}
 	for (Json& statement: nestedStatements)
 		_snapshots.emplace_back(std::move(statement));
+
 	return value;
+}
+/// Resolve the compiler-owned provenance established by the canonical
+/// StorageSlot assembly helper:
+///
+///     function getXSlot(bytes32 slot) internal pure
+///         returns (XSlot storage result)
+///     { assembly { result.slot := slot } }
+///
+/// The Yul assignment and both of its external-reference declarations are
+/// checked structurally.  The caller argument is evaluated exactly once at
+/// the reference-creation point and becomes the word carried by the raw-slot
+/// root.  No helper name, wrapper member name, or struct offset is guessed.
+std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
+	FunctionDefinition const& _callee,
+	std::map<VariableDeclaration const*, Expression const*> const& _paramBinding,
+	ASTNode const& _snapshotOwner,
+	std::vector<Json>& _snapshots)
+{
+	if (!_callee.isImplemented() || _callee.returnParameters().size() != 1)
+		return std::nullopt;
+	VariableDeclaration const* returnSlot = _callee.returnParameters().front().get();
+	if (!returnSlot || returnSlot->referenceLocation() != VariableDeclaration::Location::Storage)
+		return std::nullopt;
+	Block const& body = _callee.body();
+	if (body.statements().size() != 1)
+		return std::nullopt;
+	auto const* assembly = dynamic_cast<InlineAssembly const*>(body.statements().front().get());
+	if (!assembly)
+		return std::nullopt;
+	yul::Block const& root = assembly->operations().root();
+	if (root.statements.size() != 1)
+		return std::nullopt;
+	auto const* assignment = std::get_if<yul::Assignment>(&root.statements.front());
+	if (!assignment || assignment->variableNames.size() != 1 || !assignment->value)
+		return std::nullopt;
+	auto const& references = assembly->annotation().externalReferences;
+	auto lhsReference = references.find(&assignment->variableNames.front());
+	if (lhsReference == references.end() || lhsReference->second.declaration != returnSlot
+		|| lhsReference->second.suffix != "slot")
+		return std::nullopt;
+	auto const* rhs = std::get_if<yul::Identifier>(assignment->value.get());
+	if (!rhs)
+		throw UnsupportedSolCore(
+			"Assembly-assigned storage-pointer return `" + returnSlot->name()
+			+ ".slot` has a slot expression that is not a single compiler-owned Solidity value; "
+			  "raw-slot provenance is unresolvable.");
+	auto rhsReference = references.find(rhs);
+	if (rhsReference == references.end() || !rhsReference->second.suffix.empty())
+		throw UnsupportedSolCore(
+			"Assembly-assigned storage-pointer return `" + returnSlot->name()
+			+ ".slot` has no exact compiler-owned slot-word provenance.");
+	auto const* slotParameter
+		= dynamic_cast<VariableDeclaration const*>(rhsReference->second.declaration);
+	auto argument = slotParameter ? _paramBinding.find(slotParameter) : _paramBinding.end();
+	if (argument == _paramBinding.end() || !argument->second)
+		throw UnsupportedSolCore(
+			"Assembly-assigned storage-pointer return `" + returnSlot->name()
+			+ ".slot` depends on a value that is not an exactly bound helper parameter; "
+			  "raw-slot provenance is unresolvable.");
+
+	std::string tempName = storageRefKeyTempName(_snapshotOwner, _snapshots.size());
+	Json letStmt = Json::object();
+	letStmt["kind"] = "let";
+	letStmt["sourceDeclarationId"] = Json();
+	letStmt["name"] = tempName;
+	Type const* slotType = argument->second->annotation().type;
+	auto simpleSlotType = slotType ? exportSimpleType(*slotType) : std::nullopt;
+	letStmt["type"] = simpleSlotType.has_value() ? *simpleSlotType : Json("u256");
+	letStmt["value"] = exportStorageRefSnapshotValue(*argument->second, _snapshots);
+	_snapshots.emplace_back(std::move(letStmt));
+
+	StorageRefTarget target;
+	target.rootKind = StorageRefTarget::RootKind::RawSlot;
+	target.rootType = returnSlot->annotation().type;
+	target.rawSlot = localExpr(tempName);
+	return target;
 }
 
 std::optional<StorageRefTarget> resolveCalleeReturnPath(
@@ -3986,14 +4081,9 @@ std::optional<StorageRefTarget> resolveCalleeSuccessfulReturnPath(
 /// bounds check (reads re-project at use sites) — E1 adds no new divergence
 /// class beyond that landed discipline.
 ///
-/// Namespaced-storage getters and EIP-1967 `StorageSlot.getXSlot(...)`
-/// wrapper getters never resolve here (their bodies are assembly, not a
-/// single `return <path>;`) and deliberately keep their pre-existing
-/// handling: the former is intercepted at the declaration statement before
-/// this resolver runs, the latter keeps the status-quo copy-`let` lowering
-/// that Base.ml/LeanSupport.ml's `FieldAccess(InternalCall{getXSlot},
-/// "value")` recognizers already model soundly (see the oracle-side note
-/// next to `isKnownStorageSlotHelperOracle`).
+/// Assembly-derived storage-slot helpers resolve first through their exact
+/// Yul assignment provenance.  Ordinary call-returned paths then retain the
+/// conservative effect-preserving substitution below.
 std::optional<StorageRefTarget>
 resolveStorageRefCallRoot(FunctionCall const& _call, ASTNode const& _snapshotOwner, std::vector<Json>& _snapshots)
 {
@@ -4035,12 +4125,19 @@ resolveStorageRefCallRoot(FunctionCall const& _call, ASTNode const& _snapshotOwn
 		callerArgs.push_back(arg.get());
 	if (callerArgs.size() != callee->parameters().size())
 		return std::nullopt;
-	for (auto const* arg: callerArgs)
-		if (!arg || !isSideEffectFreeExpr(*arg))
-			return std::nullopt;
 	std::map<VariableDeclaration const*, Expression const*> paramBinding;
 	for (size_t i = 0; i < callerArgs.size(); ++i)
+	{
+		if (!callerArgs[i])
+			return std::nullopt;
 		paramBinding[callee->parameters()[i].get()] = callerArgs[i];
+	}
+	if (auto rawSlotTarget
+		= resolveAssemblyRawSlotReturnPath(*callee, paramBinding, _snapshotOwner, _snapshots))
+		return rawSlotTarget;
+	for (auto const* arg: callerArgs)
+		if (!isSideEffectFreeExpr(*arg))
+			return std::nullopt;
 	auto target = resolveCalleeSuccessfulReturnPath(*callee, paramBinding, _snapshotOwner, _snapshots);
 	if (!target)
 		return std::nullopt;
@@ -4559,6 +4656,14 @@ Json storageRefFromTarget(StorageRefTarget const& _target)
 	Json current = Json::object();
 	if (_target.rootKind == StorageRefTarget::RootKind::LocalParameter)
 		current = localExpr(_target.root);
+	else if (_target.rootKind == StorageRefTarget::RootKind::RawSlot)
+	{
+		if (_target.rawSlot.is_null())
+			throw UnsupportedSolCore("Raw-slot storage-reference target has no slot-word provenance.");
+		current["kind"] = "storage_ref_raw_slot";
+		current["referentType"] = exportResolvedType(_target.rootType, true);
+		current["slot"] = _target.rawSlot;
+	}
 	else
 	{
 		current["kind"] = "storage_ref_root";
@@ -4642,6 +4747,13 @@ std::optional<Json> exportStorageRefValue(Expression const& _expr)
 	if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_expr))
 		if (!tuple->isInlineArray() && tuple->components().size() == 1 && tuple->components().front())
 			return exportStorageRefValue(*tuple->components().front());
+
+	if (activeHoistScope)
+	{
+		auto memo = activeHoistScope->memo.find(static_cast<int64_t>(_expr.id()));
+		if (memo != activeHoistScope->memo.end())
+			return localExpr(memo->second);
+	}
 
 	if (auto const* conditional = dynamic_cast<Conditional const*>(&_expr))
 	{
@@ -4735,12 +4847,16 @@ std::optional<Json> exportStorageRefValue(Expression const& _expr)
 	}
 
 	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
+	{
+		if (auto reference = exportOrderedStorageRefValueUse(*call))
+			return reference;
 		if (auto const* function = calledFunctionDefinition(*call))
 			if (isResidualStorageRefFunction(*function))
 			{
 				StorageRefValueExpressionScope scope;
 				return exportExpr(*call);
 			}
+	}
 
 	return std::nullopt;
 }
@@ -4765,7 +4881,7 @@ bool hasResidualStorageRefRoot(Expression const& _expr)
 			   && hasResidualStorageRefRoot(*tuple->components().front());
 	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
 		if (auto const* function = calledFunctionDefinition(*call))
-			return isResidualStorageRefFunction(*function);
+			return hasSingleStorageReferenceReturn(*function);
 	return false;
 }
 

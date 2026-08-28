@@ -3855,6 +3855,61 @@ BOOST_AUTO_TEST_CASE(solcore_export_namespaced_storage)
 		"balanceOf should not call _getTokenStorage");
 }
 
+BOOST_AUTO_TEST_CASE(solcore_export_assembly_derived_raw_slot_storage_pointer)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+
+				library StorageSlot {
+					struct Uint256Slot { uint256 value; }
+					function getUint256Slot(bytes32 slot)
+						internal pure returns (Uint256Slot storage result)
+					{
+						assembly ("memory-safe") { result.slot := slot }
+					}
+				}
+
+				contract Guard {
+					using StorageSlot for bytes32;
+					uint256 constant NOT_ENTERED = 1;
+					bytes32 constant GUARD_SLOT = keccak256("fixture.guard");
+					constructor() {
+						_guardSlot().getUint256Slot().value = NOT_ENTERED;
+					}
+					function _guardSlot() private pure returns (bytes32) {
+						return GUARD_SLOT;
+					}
+				}
+				contract Pool is Guard {}
+
+				contract Negative {
+					struct BadSlot { uint256 value; }
+					constructor() { _bad().value = 7; }
+					function _bad() private pure returns (BadSlot storage result) {
+						assembly ("memory-safe") { result.slot := add(40, 2) }
+					}
+				}
+			)"}}));
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json pool = getContractResult(result, "fileA", "Pool")["solcore"];
+	std::string constructor = pool["constructor"]["body"].dump();
+	BOOST_CHECK_EQUAL(constructor.find("\"kind\":\"unsupported_body\""), std::string::npos);
+	BOOST_CHECK_NE(constructor.find("\"kind\":\"storage_ref_raw_slot\""), std::string::npos);
+	BOOST_CHECK_NE(constructor.find("\"kind\":\"storage_ref_field\""), std::string::npos);
+	BOOST_CHECK_NE(constructor.find("\"kind\":\"storage_ref_set\""), std::string::npos);
+
+	Json negative = getContractResult(result, "fileA", "Negative")["solcore"];
+	BOOST_REQUIRE_EQUAL(
+		negative["constructor"]["body"]["kind"].get<std::string>(),
+		"unsupported_body");
+	BOOST_CHECK_NE(
+		negative["constructor"]["body"]["error"].get<std::string>().find(
+			"raw-slot provenance is unresolvable"),
+		std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(solcore_export_overloaded_sub_storage_getters_are_disambiguated)
 {
 	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
