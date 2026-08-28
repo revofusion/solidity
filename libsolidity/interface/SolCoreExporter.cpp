@@ -1368,18 +1368,18 @@ void requireLoweredStorageWriteRootOrThrow(Expression const& _lhs, std::string c
 /// at least one member/index step, plus `delete`/`push`/`pop`/`++`/`--`, are
 /// writes through the pointed-to storage.
 ///
-/// PARAMETERS ARE COLLECTED BUT NEVER CONSUMED HERE. `referenceLocation()` is
-/// `Storage` for a `T storage` parameter too, and this scanner does flag one
-/// that is written through; the guard below is called ONLY from the
-/// variable-declaration statement lowering, so parameters cannot reach it.
-/// Writes through storage-ref PARAMETERS whose caller-side path the generator
-/// cannot resolve are a separate, live defect with its own fix site
-/// (`Base.ml`'s `compute_fun_param_storage_paths`) — deliberately not widened
-/// into here, because refusing every storage-param mutator would refuse shapes
-/// this guard has no evidence about.
+/// Parameters feed two consumers. Direct writes mark the parameter itself as
+/// structural, while one level of forwarding to a directly-mutating callee
+/// propagates that requirement through wrappers such as EnumerableSet's
+/// `Bytes32Set._inner` adapters. The direct-only callee scan deliberately does
+/// not recurse: passing a pointer to a view/pure helper is not evidence of a
+/// write, and recursive wrapper cycles must not manufacture one.
 struct StorageRefWriteThroughScanner: ASTConstVisitor
 {
 	std::set<VariableDeclaration const*> writtenThrough;
+	bool followCalls = true;
+
+	explicit StorageRefWriteThroughScanner(bool _followCalls = true): followCalls(_followCalls) {}
 
 	/// Record `_lhs`'s peeled root when it is a storage-located local/parameter
 	/// declaration. `_requireSteps` distinguishes an assignment (which must
@@ -1430,9 +1430,41 @@ struct StorageRefWriteThroughScanner: ASTConstVisitor
 
 	bool visit(FunctionCall const& _call) override
 	{
-		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_call.expression()))
-			if (memberAccess->memberName() == "push" || memberAccess->memberName() == "pop")
+		auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_call.expression());
+		if (memberAccess && (memberAccess->memberName() == "push" || memberAccess->memberName() == "pop"))
+			noteRoot(memberAccess->expression(), /*_requireSteps=*/false);
+		if (!followCalls)
+			return true;
+
+
+		Declaration const* referenced = nullptr;
+		if (auto const* identifier = dynamic_cast<Identifier const*>(&_call.expression()))
+			referenced = identifier->annotation().referencedDeclaration;
+		else if (memberAccess)
+			referenced = memberAccess->annotation().referencedDeclaration;
+		auto const* callee = dynamic_cast<FunctionDefinition const*>(referenced);
+		if (!callee || !callee->isImplemented())
+			return true;
+		// Propagate only compiler-proven direct writes from the callee. This
+		// keeps ordinary read-only storage helpers on their value carrier.
+		StorageRefWriteThroughScanner directWrites(/*_followCalls=*/false);
+		callee->body().accept(directWrites);
+
+		size_t parameterOffset = 0;
+		auto const* functionType = dynamic_cast<FunctionType const*>(_call.expression().annotation().type);
+		if (memberAccess && functionType && functionType->hasBoundFirstArgument())
+		{
+			VariableDeclaration const* parameter = callee->parameters().empty() ? nullptr : callee->parameters().front().get();
+			if (parameter && directWrites.writtenThrough.count(parameter))
 				noteRoot(memberAccess->expression(), /*_requireSteps=*/false);
+			parameterOffset = 1;
+		}
+		for (size_t i = 0; i < _call.arguments().size() && i + parameterOffset < callee->parameters().size(); ++i)
+		{
+			VariableDeclaration const* parameter = callee->parameters()[i + parameterOffset].get();
+			if (directWrites.writtenThrough.count(parameter))
+				noteRoot(*_call.arguments()[i], /*_requireSteps=*/false);
+		}
 		return true;
 	}
 };
@@ -4587,6 +4619,53 @@ std::string storageRefInternalEntryName(FunctionDefinition const& _function)
 	return exportedFunctionName(_function) + "__storage_ref";
 }
 
+VariableDeclaration const* storageRefRootParameter(Expression const& _expression)
+{
+	if (auto const* identifier = dynamic_cast<Identifier const*>(&_expression))
+	{
+		auto const* declaration
+			= dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
+		return isStorageRefParameter(declaration) ? declaration : nullptr;
+	}
+	if (auto const* member = dynamic_cast<MemberAccess const*>(&_expression))
+		return storageRefRootParameter(member->expression());
+	if (auto const* index = dynamic_cast<IndexAccess const*>(&_expression))
+		return storageRefRootParameter(index->baseExpression());
+	if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_expression))
+		if (!tuple->isInlineArray() && tuple->components().size() == 1 && tuple->components().front())
+			return storageRefRootParameter(*tuple->components().front());
+	return nullptr;
+}
+
+struct ResidualStorageRefArgumentScanner: ASTConstVisitor
+{
+	std::set<VariableDeclaration const*> parameters;
+
+	bool visit(FunctionCall const& _call) override
+	{
+		FunctionDefinition const* target = nullptr;
+		if (auto const* identifier = dynamic_cast<Identifier const*>(&_call.expression()))
+			target = dynamic_cast<FunctionDefinition const*>(identifier->annotation().referencedDeclaration);
+		else if (auto const* member = dynamic_cast<MemberAccess const*>(&_call.expression()))
+			target = dynamic_cast<FunctionDefinition const*>(member->annotation().referencedDeclaration);
+		if (target && hasSingleStorageReferenceReturn(*target))
+			for (auto const& argument: _call.arguments())
+				if (VariableDeclaration const* parameter = storageRefRootParameter(*argument))
+					parameters.insert(parameter);
+		return true;
+	}
+};
+
+bool storageRefParameterFeedsResidualReference(
+	FunctionDefinition const& _function, VariableDeclaration const* _parameter)
+{
+	if (!isStorageRefParameter(_parameter))
+		return false;
+	ResidualStorageRefArgumentScanner scanner;
+	_function.body().accept(scanner);
+	return scanner.parameters.count(_parameter) != 0;
+}
+
 bool storageRefParameterIsWrittenThrough(
 	FunctionDefinition const& _function, VariableDeclaration const* _parameter)
 {
@@ -4608,7 +4687,8 @@ bool isStructuralStorageRefParameter(FunctionDefinition const& _function, Variab
 {
 	return isStorageRefParameter(_parameter)
 		   && (functionNeedsAllStructuralStorageRefs(_function)
-			   || storageRefParameterIsWrittenThrough(_function, _parameter));
+			   || storageRefParameterIsWrittenThrough(_function, _parameter)
+			   || storageRefParameterFeedsResidualReference(_function, _parameter));
 }
 
 FunctionDefinition const* calledFunctionDefinition(FunctionCall const& _call)
@@ -4851,7 +4931,7 @@ std::optional<Json> exportStorageRefValue(Expression const& _expr)
 		if (auto reference = exportOrderedStorageRefValueUse(*call))
 			return reference;
 		if (auto const* function = calledFunctionDefinition(*call))
-			if (isResidualStorageRefFunction(*function))
+			if (hasSingleStorageReferenceReturn(*function))
 			{
 				StorageRefValueExpressionScope scope;
 				return exportExpr(*call);
@@ -5868,7 +5948,9 @@ lowerInternalCalleeAndArgs(FunctionCall const& _call, FunctionDefinition const& 
 		VariableDeclaration const* parameter = _resolvedImpl.parameters()[parameterIndex].get();
 		if (isStructuralStorageRefParameter(_resolvedImpl, parameter))
 		{
-			auto reference = exportStorageRefValue(argument);
+			auto reference = exportOrderedStorageRefValueUse(argument);
+			if (!reference)
+				reference = exportStorageRefValue(argument);
 			if (!reference)
 				throw UnsupportedSolCore(
 					"Structural storage-reference argument did not resolve to an exact typed path.");
@@ -5876,6 +5958,14 @@ lowerInternalCalleeAndArgs(FunctionCall const& _call, FunctionDefinition const& 
 		}
 		if (!isStorageRefParameter(parameter))
 			return std::nullopt;
+		if (hasResidualStorageRefRoot(argument))
+		{
+			auto reference = exportStorageRefValue(argument);
+			if (!reference)
+				throw UnsupportedSolCore(
+					"Storage-reference local argument did not resolve to an exact typed projection.");
+			return reference;
+		}
 		return exportResolvedStorageRefUse(argument);
 	};
 	auto exportUnspecializedArgs = [&]()
@@ -6036,7 +6126,9 @@ std::optional<Json> exportUsingForCall(FunctionCall const& _call, MemberAccess c
 		VariableDeclaration const* parameter = function->parameters()[parameterIndex].get();
 		if (isStructuralStorageRefParameter(*function, parameter))
 		{
-			auto reference = exportStorageRefValue(argument);
+			auto reference = exportOrderedStorageRefValueUse(argument);
+			if (!reference)
+				reference = exportStorageRefValue(argument);
 			if (!reference)
 				throw UnsupportedSolCore(
 					"Attached structural storage-reference receiver did not resolve "
@@ -6044,8 +6136,19 @@ std::optional<Json> exportUsingForCall(FunctionCall const& _call, MemberAccess c
 			return std::move(*reference);
 		}
 		if (isStorageRefParameter(parameter))
+		{
+			if (hasResidualStorageRefRoot(argument))
+			{
+				auto reference = exportStorageRefValue(argument);
+				if (!reference)
+					throw UnsupportedSolCore(
+						"Attached storage-reference local argument did not resolve "
+						"to an exact typed projection.");
+				return std::move(*reference);
+			}
 			if (auto rootedArgument = exportResolvedStorageRefUse(argument))
 				return std::move(*rootedArgument);
+		}
 		return exportExpr(argument);
 	};
 	result["args"].emplace_back(exportBoundArgument(_memberAccess.expression(), 0));
