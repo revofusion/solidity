@@ -3401,6 +3401,139 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_struct_member_indirect_call_uses_close
 	BOOST_CHECK_EQUAL(call["table"].get<std::string>(), solcore["internal_fn_tables"][0]["id"].get<std::string>());
 }
 
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_typed_identity_reinterpret)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+				library ArraysLike {
+					function sort(
+						uint256[] memory array,
+						function(uint256, uint256) pure returns (bool) comp
+					) internal pure returns (uint256[] memory) {
+						_quickSort(0, array.length, comp);
+						return array;
+					}
+					function sort(
+						address[] memory array,
+						function(address, address) pure returns (bool) comp
+					) internal pure returns (address[] memory) {
+						function(uint256, uint256) pure returns (bool) casted = _castToUint256Comp(comp);
+						casted(0, 0);
+						return array;
+					}
+					function sort(
+						bytes32[] memory array,
+						function(bytes32, bytes32) pure returns (bool) comp
+					) internal pure returns (bytes32[] memory) {
+						function(uint256, uint256) pure returns (bool) casted = _castToUint256Comp(comp);
+						casted(0, 0);
+						return array;
+					}
+					function _quickSort(
+						uint256 begin,
+						uint256 end,
+						function(uint256, uint256) pure returns (bool) comp
+					) private pure {
+						if (begin < end && comp(begin, end))
+							_quickSort(begin + 1, end, comp);
+					}
+					function _castToUint256Comp(
+						function(address, address) pure returns (bool) input
+					) private pure returns (function(uint256, uint256) pure returns (bool) output) {
+						assembly { output := input }
+					}
+					function _castToUint256Comp(
+						function(bytes32, bytes32) pure returns (bool) input
+					) private pure returns (function(uint256, uint256) pure returns (bool) output) {
+						assembly { output := input }
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "ArraysLike");
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE(solcore.is_object());
+	BOOST_CHECK(!solcore.value("unsupported", false));
+	BOOST_REQUIRE_EQUAL(solcore["internal_functions"].size(), 6u);
+	for (std::string const& name: {
+				"sort_uint256_memory_function_uint256_uint256_pure_returns_bool"s,
+				"sort_address_memory_function_address_address_pure_returns_bool"s,
+				"sort_bytes32_memory_function_bytes32_bytes32_pure_returns_bool"s,
+				"_quickSort"s,
+				"_castToUint256Comp_function_address_address_pure_returns_bool"s,
+				"_castToUint256Comp_function_bytes32_bytes32_pure_returns_bool"s})
+	{
+		Json const* function = findExportedFunction(solcore["internal_functions"], name);
+		BOOST_REQUIRE(function != nullptr);
+		BOOST_CHECK_EQUAL(function->at("body")["kind"].get<std::string>(), "block");
+		BOOST_CHECK_EQUAL(function->at("body").dump().find("\"kind\":\"unsupported_body\""), std::string::npos);
+	}
+
+	auto checkCast = [&](std::string const& name, std::string const& sourceScalar)
+	{
+		Json const* cast = findExportedFunction(solcore["internal_functions"], name);
+		BOOST_REQUIRE(cast != nullptr);
+		Json const* fact = nullptr;
+		for (Json const& statement: cast->at("body")["statements"])
+			if (statement.value("kind", ""s) == "internal_fn_reinterpret")
+				fact = &statement;
+		BOOST_REQUIRE(fact != nullptr);
+		BOOST_CHECK_EQUAL(fact->at("semantics").get<std::string>(), "identity_code_pointer");
+		BOOST_CHECK_EQUAL(
+			fact->at("sourceDeclarationId").get<std::string>(),
+			cast->at("params")[0]["sourceDeclarationId"].get<std::string>());
+		BOOST_CHECK_EQUAL(fact->at("sourceType")["params"][0]["type"].get<std::string>(), sourceScalar);
+		BOOST_CHECK_EQUAL(fact->at("sourceType")["params"][1]["type"].get<std::string>(), sourceScalar);
+		BOOST_CHECK_EQUAL(fact->at("targetType")["params"][0]["type"].get<std::string>(), "u256");
+		BOOST_CHECK_EQUAL(fact->at("targetType")["params"][1]["type"].get<std::string>(), "u256");
+		BOOST_CHECK_NE(
+			fact->at("sourceTable").get<std::string>(),
+			fact->at("targetTable").get<std::string>());
+		BOOST_CHECK_EQUAL(cast->at("body").dump().find("\"kind\":\"inline_assembly\""), std::string::npos);
+	};
+	checkCast("_castToUint256Comp_function_address_address_pure_returns_bool", "address");
+	checkCast("_castToUint256Comp_function_bytes32_bytes32_pure_returns_bool", "bytes32");
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_fnptr_nonidentity_reinterpret_fails_closed)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract BadCast {
+					function run(uint256 x) external pure returns (uint256) {
+						return _apply(_add, x);
+					}
+					function _apply(function(uint256) pure returns (uint256) op, uint256 x)
+						private pure returns (uint256)
+					{
+						return _cast(op)(x);
+					}
+					function _cast(function(uint256) pure returns (uint256) input)
+						private pure returns (function(uint256) pure returns (uint256) output)
+					{
+						assembly { output := add(input, 1) }
+					}
+					function _add(uint256 x) private pure returns (uint256) { return x + 1; }
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "fileA", "BadCast");
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE(solcore.is_object());
+	Json const* cast = findExportedFunction(solcore["internal_functions"], "_cast");
+	BOOST_REQUIRE(cast != nullptr);
+	BOOST_CHECK_EQUAL(cast->at("body")["kind"].get<std::string>(), "unsupported_body");
+	BOOST_CHECK_NE(
+		cast->at("body")["error"].get<std::string>().find("outside its closed candidate table"),
+		std::string::npos);
+	BOOST_CHECK_EQUAL(cast->at("body").dump().find("internal_fn_reinterpret"), std::string::npos);
+	BOOST_CHECK(solcore["internal_fn_tables"].empty());
+}
+
 BOOST_AUTO_TEST_CASE(solcore_export_fnptr_ignores_unrelated_inline_assembly)
 {
 	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
@@ -3458,11 +3591,13 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_inline_assembly_mutation_fails_closed)
 	Json contractResult = getContractResult(result, "fileA", "FnPtrAssemblyMutation");
 	Json const& solcore = contractResult["solcore"];
 	BOOST_REQUIRE(solcore.is_object());
-	BOOST_REQUIRE(solcore.value("unsupported", false));
+	Json const* apply = findExportedFunction(solcore["internal_functions"], "_apply");
+	BOOST_REQUIRE(apply != nullptr);
+	BOOST_CHECK_EQUAL(apply->at("body")["kind"].get<std::string>(), "unsupported_body");
 	BOOST_CHECK_NE(
-		solcore.value("reason", std::string{}).find("outside its closed candidate table"),
+		apply->at("body")["error"].get<std::string>().find("outside its closed candidate table"),
 		std::string::npos);
-	BOOST_CHECK(!solcore.contains("functions"));
+	BOOST_CHECK(solcore["internal_fn_tables"].empty());
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_fnptr_raw_storage_assembly_fails_closed)
@@ -3486,11 +3621,19 @@ BOOST_AUTO_TEST_CASE(solcore_export_fnptr_raw_storage_assembly_fails_closed)
 	Json contractResult = getContractResult(result, "fileA", "FnPtrRawStorageMutation");
 	Json const& solcore = contractResult["solcore"];
 	BOOST_REQUIRE(solcore.is_object());
-	BOOST_REQUIRE(solcore.value("unsupported", false));
-	BOOST_CHECK_NE(
-		solcore.value("reason", std::string{}).find("outside its closed candidate table"),
-		std::string::npos);
-	BOOST_CHECK(!solcore.contains("functions"));
+	for (std::string const& name: {"arm"s, "callIt"s})
+	{
+		Json const* function = findExportedFunction(solcore["functions"], name);
+		BOOST_REQUIRE(function != nullptr);
+		BOOST_CHECK_EQUAL(function->at("body")["kind"].get<std::string>(), "unsupported_body");
+		BOOST_CHECK_NE(
+			function->at("body")["error"].get<std::string>().find("outside its closed candidate table"),
+			std::string::npos);
+	}
+	Json const* corruptRawSlot = findExportedFunction(solcore["functions"], "corruptRawSlot");
+	BOOST_REQUIRE(corruptRawSlot != nullptr);
+	BOOST_CHECK_EQUAL(corruptRawSlot->at("body")["kind"].get<std::string>(), "block");
+	BOOST_CHECK(solcore["internal_fn_tables"].empty());
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_tags_verified_oz_checkpoints_queries)

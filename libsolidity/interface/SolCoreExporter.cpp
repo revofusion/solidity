@@ -11476,6 +11476,82 @@ Json exportYulStmt(yul::Statement const& _stmt, yul::Dialect const& _dialect)
 }
 
 // --- End Yul AST export functions ---
+// Additive SolCore statement schema for the only assembly code-pointer cast
+// admitted by the exporter:
+//
+//   {
+//     "kind": "internal_fn_reinterpret",
+//     "semantics": "identity_code_pointer",
+//     "sourceDeclarationId": "<parameter AST id>",
+//     "targetDeclarationId": "<return-parameter AST id>",
+//     "sourceType": <internal_function>,
+//     "targetType": <internal_function>,
+//     "sourceTable": "<closed source table id>",
+//     "targetTable": "<closed target table id>"
+//   }
+//
+// Both declarations and both function types come from solc's typed AST.  The
+// Yul is accepted only when it is exactly `output := input` between the sole
+// input and sole return parameter of one function.  This preserves the code
+// pointer while making the type/table transition explicit; no consumer has to
+// inspect Yul or infer a cast from helper names.
+std::optional<Json> exportInternalFnIdentityReinterpret(InlineAssembly const& _assembly)
+{
+	yul::Block const& root = _assembly.operations().root();
+	if (root.statements.size() != 1)
+		return std::nullopt;
+	auto const* assignment = std::get_if<yul::Assignment>(&root.statements.front());
+	if (!assignment || assignment->variableNames.size() != 1 || !assignment->value)
+		return std::nullopt;
+	auto const* rhs = std::get_if<yul::Identifier>(assignment->value.get());
+	if (!rhs)
+		return std::nullopt;
+
+	auto const& references = _assembly.annotation().externalReferences;
+	if (references.size() != 2)
+		return std::nullopt;
+	auto lhsReference = references.find(&assignment->variableNames.front());
+	auto rhsReference = references.find(rhs);
+	if (lhsReference == references.end() || rhsReference == references.end()
+		|| !lhsReference->second.suffix.empty() || !rhsReference->second.suffix.empty())
+		return std::nullopt;
+	auto const* targetDeclaration
+		= dynamic_cast<VariableDeclaration const*>(lhsReference->second.declaration);
+	auto const* sourceDeclaration
+		= dynamic_cast<VariableDeclaration const*>(rhsReference->second.declaration);
+	if (!sourceDeclaration || !targetDeclaration || sourceDeclaration == targetDeclaration
+		|| sourceDeclaration->scope() != targetDeclaration->scope()
+		|| !sourceDeclaration->isCallableOrCatchParameter() || sourceDeclaration->isReturnParameter()
+		|| !targetDeclaration->isReturnParameter())
+		return std::nullopt;
+	auto const* function = dynamic_cast<FunctionDefinition const*>(sourceDeclaration->scope());
+	if (!function || function->parameters().size() != 1 || function->returnParameters().size() != 1
+		|| function->parameters().front().get() != sourceDeclaration
+		|| function->returnParameters().front().get() != targetDeclaration)
+		return std::nullopt;
+
+	auto const* sourceType = dynamic_cast<FunctionType const*>(sourceDeclaration->annotation().type);
+	auto const* targetType = dynamic_cast<FunctionType const*>(targetDeclaration->annotation().type);
+	if (!sourceType || !targetType || sourceType->kind() != FunctionType::Kind::Internal
+		|| targetType->kind() != FunctionType::Kind::Internal)
+		return std::nullopt;
+
+	Json sourceWireType = exportResolvedType(sourceType);
+	Json targetWireType = exportResolvedType(targetType);
+	InternalFnTableRecord const& sourceTable = registerInternalFnTable(*sourceType, sourceWireType);
+	InternalFnTableRecord const& targetTable = registerInternalFnTable(*targetType, targetWireType);
+	Json result = Json::object();
+	result["kind"] = "internal_fn_reinterpret";
+	result["semantics"] = "identity_code_pointer";
+	result["sourceDeclarationId"] = std::to_string(sourceDeclaration->id());
+	result["targetDeclarationId"] = std::to_string(targetDeclaration->id());
+	result["sourceType"] = std::move(sourceWireType);
+	result["targetType"] = std::move(targetWireType);
+	result["sourceTable"] = sourceTable.tableId;
+	result["targetTable"] = targetTable.tableId;
+	return result;
+}
+
 
 Json exportStmtDispatch(Statement const& _stmt)
 {
@@ -12331,15 +12407,25 @@ Json exportStmtDispatch(Statement const& _stmt)
 	if (auto const* asmStmt = dynamic_cast<InlineAssembly const*>(&_stmt))
 	{
 		// Yul can manufacture or mutate a function code pointer only if the
-		// assembly can reach a Solidity value that carries one. The compiler's
-		// externalReferences map is the producer-owned link for locals,
-		// parameters, and storage references; unrelated assembly elsewhere in
-		// the hierarchy cannot affect an ephemeral typed value.
-		internalFnContractContainsAssembly = true;
+		// assembly can reach a Solidity value that carries one. The one
+		// exception is a structurally verified identity reinterpretation:
+		// export it as a typed table transition instead of opaque Yul.
+		bool touchesInternalFnValue = false;
 		for (auto const& entry: asmStmt->annotation().externalReferences)
 			if (auto const* declaration = dynamic_cast<VariableDeclaration const*>(entry.second.declaration))
 				if (typeContainsInternalFnValue(declaration->annotation().type))
-					internalFnAssemblyTouchesValue = true;
+					touchesInternalFnValue = true;
+		if (touchesInternalFnValue)
+		{
+			if (auto reinterpretation = exportInternalFnIdentityReinterpret(*asmStmt))
+				return std::move(*reinterpretation);
+			// Any other variant remains opaque and poisons every closed table
+			// that depends on it during finalization below.  This preserves the
+			// existing fail-closed behavior for arbitrary code-pointer writes.
+			internalFnAssemblyTouchesValue = true;
+		}
+
+		internalFnContractContainsAssembly = true;
 		Json result = Json::object();
 		result["kind"] = "inline_assembly";
 		result["body"] = exportYulBlock(asmStmt->operations().root(), asmStmt->dialect());
