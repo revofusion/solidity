@@ -3409,7 +3409,12 @@ Json exportHoistedUnaryMutation(UnaryOperation const& _unary);
 Json exportHoistedAssignExpr(Assignment const& _assignment);
 std::optional<Json> exportStorageRefValue(Expression const& _expr);
 bool hasResidualStorageRefRoot(Expression const& _expr);
+bool isStorageReferenceType(Type const* _type);
 Json storageRefWireType(Type const* _referentType);
+std::optional<StorageRefTarget> resolveStorageRefCallRoot(
+	FunctionCall const& _call,
+	ASTNode const& _snapshotOwner,
+	std::vector<Json>& _snapshots);
 
 
 /// Static selector node for `abi.encodeCall`'s first argument when it names a
@@ -3626,11 +3631,19 @@ Json pinExpressionOnce(
 	if (memoIt != parent->memo.end())
 		return localExpr(memoIt->second);
 
+	bool storageRefValue = _storageRefValue;
+	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
+	{
+		std::vector<Json> probeSnapshots;
+		auto probe = resolveStorageRefCallRoot(*call, *call, probeSnapshots);
+		storageRefValue = storageRefValue || (probe && probe->snapshotAsTypedCall);
+	}
+
 	Json value;
 	std::vector<Json> nested;
 	{
 		HoistScopeGuard childScope({&_expr});
-		if (_storageRefValue)
+		if (storageRefValue)
 		{
 			auto reference = exportStorageRefValue(_expr);
 			if (!reference)
@@ -3655,7 +3668,7 @@ Json pinExpressionOnce(
 	letStmt["kind"] = "let";
 	letStmt["sourceDeclarationId"] = Json();
 	letStmt["name"] = tempName;
-	letStmt["type"] = _storageRefValue ? storageRefWireType(type) : exportResolvedType(type);
+	letStmt["type"] = storageRefValue ? storageRefWireType(type) : exportResolvedType(type);
 	letStmt["value"] = std::move(value);
 	parent->statements.emplace_back(std::move(letStmt));
 	parent->memo.emplace(static_cast<int64_t>(_expr.id()), tempName);
@@ -3702,7 +3715,12 @@ void pinAssignmentLValueChildren(Expression const& _lvalue, std::string const& _
 	}
 	if (evalOrderRelevant(_lvalue))
 	{
-		if (hasResidualStorageRefRoot(_lvalue))
+		// The compiler-resolved storage location is authoritative. Calls such
+		// as `getStringSlot(store)` may not yet be registered as residual roots
+		// at this early LHS snapshot point, but their annotated result is still
+		// a first-class storage reference and must take the typed-reference pin.
+		if (isStorageReferenceType(_lvalue.annotation().type)
+			|| hasResidualStorageRefRoot(_lvalue))
 			(void) pinExpressionOnce(_lvalue, _label, nullptr, /*_storageRefValue=*/true);
 		else
 			(void) captureMeasuredOrderChild(_lvalue, _label);
@@ -4573,6 +4591,13 @@ exportResolvedStorageRefUse(Expression const& _expr, StorageRefKeySnapshotMode _
 	auto target = resolveStorageRefPathRec(_expr, _expr, snapshots);
 	if (!target)
 		return std::nullopt;
+	if (target->snapshotAsTypedCall)
+	{
+		// The assembly helper reinterprets its captured root slot as a different
+		// storage referent. Alias-read substitution would return the caller
+		// root's type; retain the ordinary typed internal call instead.
+		return std::nullopt;
+	}
 	if (!snapshots.empty())
 	{
 		if (!activeHoistScope || !activeHoistScope->allowed)
@@ -11041,7 +11066,14 @@ struct HoistRootConflictScanner: ASTConstVisitor
 		case HoistCallClass::Inert:
 			break;
 		case HoistCallClass::InternalView:
-			if (!viewCalleeCannotTouchDecl(*callee, decl, visited, 8))
+			// A pure/view callee can never reach the caller's PLAIN STACK
+			// local (frame-private) and performs no state writes, so its
+			// once-hoisted evaluation is observation-equivalent regardless
+			// of its body (witness: solady `lnWad(w = lnWad(w))`, whose
+			// assembly-bodied pure callee defeated the body walk). The body
+			// walk remains required in strict mode, where `decl` is state
+			// or storage-located and a view callee could READ it.
+			if (strict && !viewCalleeCannotTouchDecl(*callee, decl, visited, 8))
 				conflict = true;
 			break;
 		case HoistCallClass::Blocking:
