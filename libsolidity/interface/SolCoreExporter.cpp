@@ -3257,19 +3257,23 @@ Json exportField(VariableDeclaration const& _decl)
 	return result;
 }
 
-/// Struct MEMBER export for `type_decls`: `exportField` plus an additive
-/// `storageSlot` — the member's slot offset within the struct's OWN storage
-/// frame (relative to the struct's first slot), from solc's own layout
-/// (`StructType::storageOffsetsOfMember`), never re-derived downstream. Same
-/// "slot within the parent frame" meaning as the `storageSlot` on contract
-/// storage fields (whose parent frame is the contract's slot space). Emitted
-/// only when the member starts at intra-slot byte offset 0 (slot-aligned);
-/// a packed member is not slot-addressable on its own, omits the field, and
-/// consumers must refuse slot projection rather than guess. Load-bearing for
-/// the E4a library slot-word convention (`return d.m;` in a public library
-/// function returning `mapping(...) storage` is slot arithmetic
-/// `slot(d) + offset(m)`); reference-typed members (mapping/array/struct)
-/// always own whole slots, so the members E4a projects always carry it.
+/// Struct MEMBER export for `type_decls`: `exportField` plus three additive
+/// placement facts from solc's own layout, never re-derived downstream:
+///   - `storageSlot` — the member's slot offset within the struct's OWN
+///     storage frame (relative to the struct's first slot), from
+///     `StructType::storageOffsetsOfMember`. Same "slot within the parent
+///     frame" meaning as the `storageSlot` on contract storage fields.
+///     Emitted for EVERY laid-out member, packed or not; consumers needing a
+///     slot-addressable member must additionally require `byteOffset == 0`
+///     (load-bearing for the E4a library slot-word convention, whose
+///     reference-typed members always own whole slots and so always carry
+///     offset 0).
+///   - `byteOffset` — the member's intra-slot byte offset, low end first
+///     (`storageOffsetsOfMember`'s second component).
+///   - `byteWidth` — the bytes the member occupies within its slot
+///     (`Type::storageBytes`; 32 for full-slot and reference-typed members).
+/// All three are omitted together when solc has no layout for the member;
+/// consumers fail closed on absence.
 Json exportStructMemberField(StructDefinition const& _structDef, VariableDeclaration const& _member)
 {
 	Json result = exportField(_member);
@@ -3278,14 +3282,16 @@ Json exportStructMemberField(StructDefinition const& _structDef, VariableDeclara
 		if (auto const* structType = TypeProvider::structType(_structDef, DataLocation::Storage))
 		{
 			auto const& offsets = structType->storageOffsetsOfMember(_member.name());
-			if (offsets.second == 0)
-				result["storageSlot"] = offsets.first.str();
+			result["storageSlot"] = offsets.first.str();
+			result["byteOffset"] = static_cast<int>(offsets.second);
+			if (auto const* memberType = structType->members(nullptr).memberType(_member.name()))
+				result["byteWidth"] = static_cast<int>(memberType->storageBytes());
 		}
 	}
 	catch (...)
 	{
 		// Layout unavailable (error type, unnameable member, ...): omit the
-		// field; consumers fail closed on absence.
+		// fields; consumers fail closed on absence.
 	}
 	return result;
 }
