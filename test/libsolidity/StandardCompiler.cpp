@@ -1977,6 +1977,62 @@ BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
 	BOOST_CHECK_EQUAL(origins["entries"][0]["originId"].get<std::string>(), "state:balances");
 }
 
+BOOST_AUTO_TEST_CASE(solcore_export_inline_assembly_constant_capture_declaration)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.0;
+				contract C {
+					uint256 internal constant WAD = 1e18;
+
+					function scale(uint256 x) external pure returns (uint256) {
+						uint256 z;
+						assembly {
+							z := div(x, WAD)
+						}
+						return z;
+					}
+				}
+			)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+
+	Json contractResult = getContractResult(result, "fileA", "C");
+	BOOST_REQUIRE(contractResult["solcore"].is_object());
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE(solcore["functions"].is_array());
+	BOOST_REQUIRE(solcore["functions"].size() == 1);
+	Json const& statements = solcore["functions"][0]["body"]["statements"];
+	BOOST_REQUIRE(statements.is_array());
+	BOOST_REQUIRE(statements.size() >= 3);
+
+	Json const& constant = statements[0];
+	BOOST_CHECK_EQUAL(constant["kind"].get<std::string>(), "let");
+	BOOST_CHECK_EQUAL(constant["name"].get<std::string>(), "WAD");
+	BOOST_REQUIRE(constant["sourceDeclarationId"].is_string());
+	BOOST_CHECK(!constant["sourceDeclarationId"].get<std::string>().empty());
+	BOOST_CHECK_EQUAL(constant["type"].get<std::string>(), "u256");
+	BOOST_CHECK_EQUAL(constant["value"]["kind"].get<std::string>(), "u256");
+	BOOST_CHECK_EQUAL(constant["value"]["value"].get<std::string>(), "1000000000000000000");
+
+	Json const* assembly = nullptr;
+	for (Json const& statement: statements)
+		if (statement.value("kind", ""s) == "inline_assembly")
+			assembly = &statement;
+	BOOST_REQUIRE(assembly);
+
+	Json const* capture = nullptr;
+	for (Json const& local: (*assembly)["interface"]["locals"])
+		if (local.value("name", ""s) == "WAD")
+			capture = &local;
+	BOOST_REQUIRE(capture);
+	BOOST_CHECK_EQUAL(
+		capture->at("declarationId").get<std::string>(),
+		constant["sourceDeclarationId"].get<std::string>());
+	BOOST_CHECK_EQUAL(capture->at("type").get<std::string>(), "u256");
+	BOOST_CHECK_EQUAL(capture->at("access").get<std::string>(), "read");
+}
+
 // Regression coverage for the stack-scoped enum-qualification index in
 // SolCoreExporter (enumNameNeedsQualification): qualification must trigger
 // exactly when a DIFFERENT enum definition shares the bare name anywhere in

@@ -13674,6 +13674,62 @@ std::vector<FunctionDefinition const*> collectOutOfLinearizationCallees(Contract
 	return collected;
 }
 
+/// Solidity constants are normally substituted at expression-use sites and
+/// therefore do not otherwise have a runtime declaration in SolCore. Inline
+/// assembly is different: solc's externalReferences interface names the exact
+/// VariableDeclaration ID, and the frontend validates that ID against the
+/// declarations visible at the assembly statement. Preserve each captured
+/// constant as an initializer-backed lexical binding instead of asking the
+/// consumer to reconstruct it from a name or fabricate a value.
+std::vector<VariableDeclaration const*> inlineAssemblyConstantDeclarations(FunctionDefinition const& _function)
+{
+	struct Collector: ASTConstVisitor
+	{
+		std::map<std::string, VariableDeclaration const*> declarations;
+
+		bool visit(InlineAssembly const& _assembly) override
+		{
+			for (auto const& entry: _assembly.annotation().externalReferences)
+			{
+				auto const* declaration
+					= dynamic_cast<VariableDeclaration const*>(entry.second.declaration);
+				if (!declaration || !declaration->isConstant())
+					continue;
+				if (!declaration->value())
+					throw UnsupportedSolCore(
+						"Inline assembly references constant '" + declaration->name()
+						+ "' without a compiler-resolved initializer.");
+
+				std::string declarationId = std::to_string(declaration->id());
+				auto [it, inserted] = declarations.emplace(declarationId, declaration);
+				if (!inserted && it->second != declaration)
+					throw UnsupportedSolCore(
+						"Inline assembly constant declaration ID is not unique.");
+			}
+			return true;
+		}
+	};
+
+	Collector collector;
+	_function.body().accept(collector);
+	for (auto const& modifierInvocation: _function.modifiers())
+	{
+		ModifierDefinition const* modifierDefinition
+			= resolveModifierDefinition(_function, *modifierInvocation);
+		if (modifierDefinition && modifierDefinition->isImplemented())
+			modifierDefinition->body().accept(collector);
+	}
+
+	std::vector<VariableDeclaration const*> result;
+	result.reserve(collector.declarations.size());
+	for (auto const& [declarationId, declaration]: collector.declarations)
+	{
+		(void) declarationId;
+		result.push_back(declaration);
+	}
+	return result;
+}
+
 Json exportBody(FunctionDefinition const& _function)
 {
 	// Save and clear per-function namespaced storage aliases
@@ -13772,6 +13828,24 @@ Json exportBody(FunctionDefinition const& _function)
 		}
 		body = exportStmt(_function.body());
 		body = expandModifiers(_function, std::move(body));
+		auto assemblyConstants = inlineAssemblyConstantDeclarations(_function);
+		if (!assemblyConstants.empty())
+		{
+			Json statements = Json::array();
+			for (VariableDeclaration const* declaration: assemblyConstants)
+			{
+				Json binding = Json::object();
+				binding["kind"] = "let";
+				binding["sourceDeclarationId"] = std::to_string(declaration->id());
+				binding["name"] = declaration->name();
+				binding["type"] = exportTypeName(declaration->typeName());
+				binding["value"] = exportExpr(*declaration->value());
+				statements.emplace_back(std::move(binding));
+			}
+			for (auto const& statement: body["statements"])
+				statements.emplace_back(statement);
+			body["statements"] = std::move(statements);
+		}
 	}
 	catch (...)
 	{
