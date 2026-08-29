@@ -4976,6 +4976,21 @@ struct StorageRefValueExpressionScope
 
 std::optional<Json> exportStorageRefValue(Expression const& _expr)
 {
+	// Assignment-LHS snapshot invariant: an assembly `.slot` helper whose
+	// return referent differs from its captured root must remain the actual
+	// typed pure call. Check before the active-hoist memo: that memo deliberately
+	// aliases the call to its resolved caller root and would recreate the
+	// ill-typed `StorageRef<root> : StorageRef<return>` Let.
+	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
+	{
+		std::vector<Json> probeSnapshots;
+		auto probe = resolveStorageRefCallRoot(*call, *call, probeSnapshots);
+		if (probe && probe->snapshotAsTypedCall)
+		{
+			StorageRefValueExpressionScope scope;
+			return exportExpr(*call);
+		}
+	}
 	if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_expr))
 		if (!tuple->isInlineArray() && tuple->components().size() == 1 && tuple->components().front())
 			return exportStorageRefValue(*tuple->components().front());
@@ -12704,7 +12719,22 @@ Json exportStmtDispatch(Statement const& _stmt)
 				bool const plainStackLocal = mutatedDecl && !mutatedDecl->isStateVariable()
 					&& mutatedDecl->referenceLocation() != VariableDeclaration::Location::Storage
 					&& namespacedStorageAliases.count(mutatedDecl->name()) == 0;
-				bool otherIndependent = other && isSideEffectFreeExpr(*other);
+				// The independent operand may be side-effect-free directly or a
+				// pure elementary-type conversion of one (the witness family
+				// compares against `uint256(0)`); the cast neither reads nor
+				// writes anything its argument does not.
+				auto sideEffectFreeOrPureCast = [](Expression const& _expr) -> Expression const* {
+					if (isSideEffectFreeExpr(_expr))
+						return &_expr;
+					if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
+						if (*call->annotation().kind == FunctionCallKind::TypeConversion
+							&& call->arguments().size() == 1
+							&& isSideEffectFreeExpr(*call->arguments().front()))
+							return call->arguments().front().get();
+					return nullptr;
+				};
+				Expression const* otherCore = other ? sideEffectFreeOrPureCast(*other) : nullptr;
+				bool otherIndependent = otherCore != nullptr;
 				if (otherIndependent)
 				{
 					struct DeclRefScanner: ASTConstVisitor
@@ -12719,12 +12749,37 @@ Json exportStmtDispatch(Statement const& _stmt)
 							return !found;
 						}
 					} scanner{mutatedDecl};
-					other->accept(scanner);
+					otherCore->accept(scanner);
 					otherIndependent = !scanner.found;
 				}
 				bool const integerFamily = commonType
 					&& (dynamic_cast<IntegerType const*>(commonType) || dynamic_cast<RationalNumberType const*>(commonType));
-				if (mutation && kind && plainStackLocal && otherIndependent && integerFamily)
+				// `continue` transfers to the CONDITION, whose embedded
+				// mutation still runs on the EVM; the desugared form places
+				// the mutation at the body tail, which `continue` would skip.
+				// Refuse the transform when the body contains a continue
+				// bound to THIS loop (inner loops own their own continues);
+				// `break` needs no guard — it exits without evaluating the
+				// condition, exactly like the desugared tail-skip.
+				struct LoopContinueScanner: ASTConstVisitor
+				{
+					bool found = false;
+					unsigned depth = 0;
+					bool visit(WhileStatement const&) override { ++depth; return true; }
+					void endVisit(WhileStatement const&) override { --depth; }
+					bool visit(ForStatement const&) override { ++depth; return true; }
+					void endVisit(ForStatement const&) override { --depth; }
+					bool visit(Continue const&) override
+					{
+						if (depth == 0)
+							found = true;
+						return false;
+					}
+				} continueScanner;
+				whileStmt->body().accept(continueScanner);
+				bool const noOwnContinue = !continueScanner.found;
+				if (mutation && kind && plainStackLocal && otherIndependent && integerFamily
+					&& noOwnContinue)
 				{
 					Json condition = Json::object();
 					condition["kind"] = kind;
