@@ -2737,7 +2737,10 @@ BOOST_AUTO_TEST_CASE(solcore_export_inline_assembly_rejects_unrepresentable_alia
 				pragma solidity >=0.8.28;
 				contract LengthAlias {
 					function readLength(bytes calldata data) external pure returns (uint256 output) {
-						assembly { output := data.length }
+						assembly {
+							let word := calldataload(data.offset)
+							output := add(word, data.length)
+						}
 					}
 				}
 			)"}}));
@@ -2757,16 +2760,22 @@ BOOST_AUTO_TEST_CASE(solcore_export_inline_assembly_rejects_unrepresentable_alia
 	Json const& lengthLocals = (*lengthAssembly)["interface"]["locals"];
 	BOOST_REQUIRE(lengthLocals.is_array());
 	bool sawLength = false;
+	bool sawOffset = false;
 	for (Json const& row: lengthLocals)
-		if (row.value("name", ""s) == "data" && row.value("suffix", ""s) == "length")
+		if (
+			row.value("name", ""s) == "data"
+			&& (row.value("suffix", ""s) == "length" || row.value("suffix", ""s) == "offset")
+		)
 		{
 			BOOST_CHECK_EQUAL(row.value("access", ""s), "read");
 			BOOST_REQUIRE(row["type"].is_object());
 			BOOST_CHECK_EQUAL(row["type"].value("kind", ""s), "array");
 			BOOST_CHECK_EQUAL(row["type"].value("element", ""s), "u8");
-			sawLength = true;
+			sawLength |= row.value("suffix", ""s) == "length";
+			sawOffset |= row.value("suffix", ""s) == "offset";
 		}
 	BOOST_CHECK(sawLength);
+	BOOST_CHECK(sawOffset);
 
 	Json aliasInput = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Alias.sol", R"(
 				pragma solidity >=0.8.28;
@@ -4103,6 +4112,18 @@ BOOST_AUTO_TEST_CASE(solcore_export_assembly_derived_raw_slot_storage_pointer)
 					}
 				}
 
+				library ReinterpretSlot {
+					struct StringSlot { string value; }
+					function getStringSlot(string storage store)
+						internal pure returns (StringSlot storage result)
+					{
+						assembly ("memory-safe") { result.slot := store.slot }
+					}
+					function assign(string storage store, string memory value) internal {
+						getStringSlot(store).value = value;
+					}
+				}
+
 				contract Guard {
 					using StorageSlot for bytes32;
 					uint256 constant NOT_ENTERED = 1;
@@ -4133,6 +4154,19 @@ BOOST_AUTO_TEST_CASE(solcore_export_assembly_derived_raw_slot_storage_pointer)
 	BOOST_CHECK_NE(constructor.find("\"kind\":\"storage_ref_raw_slot\""), std::string::npos);
 	BOOST_CHECK_NE(constructor.find("\"kind\":\"storage_ref_field\""), std::string::npos);
 	BOOST_CHECK_NE(constructor.find("\"kind\":\"storage_ref_set\""), std::string::npos);
+
+	Json reinterpret = getContractResult(result, "fileA", "ReinterpretSlot")["solcore"];
+	Json const* assign = nullptr;
+	for (Json const& function: reinterpret["functions"])
+		if (function.value("name", ""s) == "assign")
+			assign = &function;
+	BOOST_REQUIRE(assign != nullptr);
+	std::string assignBody = (*assign)["body"].dump();
+	BOOST_CHECK_NE(
+		assignBody.find("__solcore_evalorder_assignment_lhs_base"),
+		std::string::npos);
+	BOOST_CHECK_NE(assignBody.find("\"function\":\"getStringSlot\""), std::string::npos);
+	BOOST_CHECK_NE(assignBody.find("\"kind\":\"internal_call\""), std::string::npos);
 
 	Json negative = getContractResult(result, "fileA", "Negative")["solcore"];
 	BOOST_REQUIRE_EQUAL(

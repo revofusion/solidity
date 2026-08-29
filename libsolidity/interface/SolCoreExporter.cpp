@@ -912,6 +912,7 @@ struct StorageRefTarget
 	RootKind rootKind = RootKind::StateField;
 	Type const* rootType = nullptr; ///< Exact typed root for residual structural references.
 	Json rawSlot; ///< RootKind::RawSlot: exact caller-context slot-word expression.
+	bool snapshotAsTypedCall = false; ///< Raw-slot reinterpretation: pin the pure helper call, not a differently typed root alias.
 
 	StorageRefTarget() = default;
 	StorageRefTarget(
@@ -931,6 +932,7 @@ struct StorageRefTarget
 bool storageRefTargetsEqual(StorageRefTarget const& _lhs, StorageRefTarget const& _rhs)
 {
 	if (_lhs.root != _rhs.root || _lhs.rootKind != _rhs.rootKind || _lhs.steps.size() != _rhs.steps.size()
+		|| _lhs.snapshotAsTypedCall != _rhs.snapshotAsTypedCall
 		|| (_lhs.rootKind == StorageRefTarget::RootKind::RawSlot && _lhs.rawSlot != _rhs.rawSlot))
 		return false;
 	for (size_t i = 0; i < _lhs.steps.size(); ++i)
@@ -4013,6 +4015,12 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 			throw UnsupportedSolCore(
 				"Assembly-assigned storage-pointer return `" + returnSlot->name()
 				+ ".slot` depends on a captured storage slot whose caller path is unresolved.");
+		// A `.slot` return may reinterpret the caller root as a different
+		// storage referent (ShortStrings' string -> StringSlot). Pinning the
+		// resolved root as the callee return type would create an ill-typed
+		// alias; retain the pure helper call as the typed snapshot value.
+		target->snapshotAsTypedCall
+			= slotParameter->annotation().type != returnSlot->annotation().type;
 		return target;
 	}
 	if (!rhsOrigin->suffix.empty())
@@ -4927,12 +4935,21 @@ Json storageRefFromTarget(StorageRefTarget const& _target)
 /// committing the resolver's path snapshots and mutations exactly once.
 /// This is deliberately narrower than [exportResolvedStorageRefUse]: callers
 /// need the reference identity itself, not a value read through that path.
-std::optional<Json> exportOrderedStorageRefValueUse(Expression const& _expr)
+std::optional<Json>
+exportOrderedStorageRefValueUse(Expression const& _expr, bool* _snapshotAsTypedCall = nullptr)
 {
 	std::vector<Json> snapshots;
 	auto target = resolveStorageRefPathRec(_expr, _expr, snapshots);
 	if (!target)
 		return std::nullopt;
+	if (target->snapshotAsTypedCall)
+	{
+		if (_snapshotAsTypedCall)
+			*_snapshotAsTypedCall = true;
+		// The actual pure call owns evaluation and its correctly typed return;
+		// path-resolution snapshots would duplicate that evaluation.
+		return Json::object();
+	}
 	if (!snapshots.empty())
 	{
 		if (!activeHoistScope || !activeHoistScope->allowed)
@@ -5063,8 +5080,16 @@ std::optional<Json> exportStorageRefValue(Expression const& _expr)
 
 	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
 	{
-		if (auto reference = exportOrderedStorageRefValueUse(*call))
+		bool snapshotAsTypedCall = false;
+		if (auto reference = exportOrderedStorageRefValueUse(*call, &snapshotAsTypedCall))
+		{
+			if (snapshotAsTypedCall)
+			{
+				StorageRefValueExpressionScope scope;
+				return exportExpr(*call);
+			}
 			return reference;
+		}
 		if (auto const* function = calledFunctionDefinition(*call))
 			if (hasSingleStorageReferenceReturn(*function))
 			{
@@ -11311,29 +11336,35 @@ private:
 				+ "' has no compiler-owned variable declaration and carrier type.");
 
 		// Invariant: suffix admission is producer-typed. Solidity exposes
-		// `.length` to inline assembly only for dynamically-sized calldata
-		// bytes/string references. Memory `.length` does not type-check in solc,
-		// while storage and ordinary arrays remain outside this closed shape.
+		// `.length` and `.offset` to inline assembly for dynamically-sized
+		// calldata bytes/string references. Memory suffixes do not type-check in
+		// solc, while ordinary calldata arrays remain outside this closed shape;
+		// non-calldata `.offset` retains the existing storage-layout admission.
 		auto const* arrayType = dynamic_cast<ArrayType const*>(variable->annotation().type);
-		bool const isCalldataBytesStringLength =
-			reference->second.suffix == "length"
-			&& arrayType
-			&& arrayType->location() == DataLocation::CallData
+		bool const isCalldataArray =
+			arrayType && arrayType->location() == DataLocation::CallData;
+		bool const isCalldataBytesString =
+			isCalldataArray
 			&& arrayType->isDynamicallySized()
 			&& arrayType->isByteArrayOrString();
+		bool const isCalldataBytesStringLength =
+			reference->second.suffix == "length" && isCalldataBytesString;
+		bool const isRepresentableOffset =
+			reference->second.suffix == "offset"
+			&& (!isCalldataArray || isCalldataBytesString);
 		std::string suffix;
 		if (reference->second.suffix.empty())
 			suffix = "none";
 		else if (
 			reference->second.suffix == "slot"
-			|| reference->second.suffix == "offset"
+			|| isRepresentableOffset
 			|| isCalldataBytesStringLength)
 			suffix = reference->second.suffix;
 		else
 			throw UnsupportedSolCore(
 				"Inline assembly external reference '" + _identifier.name.str()
 				+ "' uses unsupported suffix '." + reference->second.suffix
-				+ "'; only none, .slot, .offset, and calldata bytes/string .length are representable.");
+				+ "'; only none, .slot, non-calldata .offset, and calldata bytes/string .offset/.length are representable.");
 
 		std::string declarationId = std::to_string(variable->id());
 		auto declaration = m_declarations.find(declarationId);
@@ -12619,6 +12650,102 @@ Json exportStmtDispatch(Statement const& _stmt)
 	if (auto const* whileStmt = dynamic_cast<WhileStatement const*>(&_stmt))
 	{
 		Json result = Json::object();
+		// A do-while whose condition embeds exactly one PREFIX ++/-- of a
+		// plain stack local desugars structurally: the condition evaluates
+		// once per iteration AFTER the body, so appending the mutation as a
+		// statement and comparing the plain local afterwards is
+		// observation-equivalent for every legacy evaluation order PROVIDED
+		// the other operand is side-effect-free and independent of the
+		// mutated local (witness family: solady `do { ... } while (--i != 0)`
+		// / `while (--i != c)`; FixedPointMathLib::lambertW0Wad). Checked or
+		// unchecked semantics ride on exportUnaryMutation, the same
+		// statement-position lowering `--i;` uses. Every other mutating
+		// condition falls through to the established fail-closed refusal in
+		// requireHoistScopeAllowed.
+		if (whileStmt->isDoWhile())
+			if (auto const* cond = dynamic_cast<BinaryOperation const*>(&whileStmt->condition()))
+			{
+				auto comparisonKind = [&](Token _op, Type const* _commonType) -> char const* {
+					auto const* integerType = dynamic_cast<IntegerType const*>(_commonType);
+					bool const signedType = integerType && integerType->isSigned();
+					switch (_op)
+					{
+					case Token::Equal: return "u256_eq";
+					case Token::NotEqual: return "u256_ne";
+					case Token::LessThan: return signedType ? "i256_lt" : "u256_lt";
+					case Token::LessThanOrEqual: return signedType ? "i256_le" : "u256_le";
+					case Token::GreaterThan: return signedType ? "i256_gt" : "u256_gt";
+					case Token::GreaterThanOrEqual: return signedType ? "i256_ge" : "u256_ge";
+					default: return nullptr;
+					}
+				};
+				auto prefixMutation = [](Expression const& _operand) -> UnaryOperation const* {
+					auto const* unary = dynamic_cast<UnaryOperation const*>(&_operand);
+					if (unary && unary->isPrefixOperation()
+						&& (unary->getOperator() == Token::Inc || unary->getOperator() == Token::Dec))
+						return unary;
+					return nullptr;
+				};
+				UnaryOperation const* mutation = prefixMutation(cond->leftExpression());
+				Expression const* other = mutation ? &cond->rightExpression() : nullptr;
+				if (!mutation)
+				{
+					mutation = prefixMutation(cond->rightExpression());
+					other = mutation ? &cond->leftExpression() : nullptr;
+				}
+				Type const* commonType = cond->annotation().commonType;
+				char const* kind = comparisonKind(cond->getOperator(), commonType);
+				auto const* mutatedIdent = mutation
+					? dynamic_cast<Identifier const*>(&mutation->subExpression())
+					: nullptr;
+				auto const* mutatedDecl = mutatedIdent
+					? dynamic_cast<VariableDeclaration const*>(mutatedIdent->annotation().referencedDeclaration)
+					: nullptr;
+				bool const plainStackLocal = mutatedDecl && !mutatedDecl->isStateVariable()
+					&& mutatedDecl->referenceLocation() != VariableDeclaration::Location::Storage
+					&& namespacedStorageAliases.count(mutatedDecl->name()) == 0;
+				bool otherIndependent = other && isSideEffectFreeExpr(*other);
+				if (otherIndependent)
+				{
+					struct DeclRefScanner: ASTConstVisitor
+					{
+						VariableDeclaration const* decl;
+						bool found = false;
+						explicit DeclRefScanner(VariableDeclaration const* _decl): decl(_decl) {}
+						bool visit(Identifier const& _ident) override
+						{
+							if (_ident.annotation().referencedDeclaration == decl)
+								found = true;
+							return !found;
+						}
+					} scanner{mutatedDecl};
+					other->accept(scanner);
+					otherIndependent = !scanner.found;
+				}
+				bool const integerFamily = commonType
+					&& (dynamic_cast<IntegerType const*>(commonType) || dynamic_cast<RationalNumberType const*>(commonType));
+				if (mutation && kind && plainStackLocal && otherIndependent && integerFamily)
+				{
+					Json condition = Json::object();
+					condition["kind"] = kind;
+					Json mutatedRead = exportExpr(mutation->subExpression());
+					Json otherValue = exportExpr(*other);
+					condition["lhs"] = (&cond->leftExpression() == static_cast<Expression const*>(other))
+						? std::move(otherValue) : std::move(mutatedRead);
+					condition["rhs"] = (&cond->leftExpression() == static_cast<Expression const*>(other))
+						? exportExpr(mutation->subExpression()) : exportExpr(*other);
+					Json bodyBlock = Json::object();
+					bodyBlock["kind"] = "block";
+					bodyBlock["statements"] = Json::array();
+					bodyBlock["statements"].emplace_back(exportStmt(whileStmt->body()));
+					bodyBlock["statements"].emplace_back(
+						exportUnaryMutation(mutation->subExpression(), mutation->getOperator()));
+					result["kind"] = "do_while";
+					result["cond"] = std::move(condition);
+					result["body"] = std::move(bodyBlock);
+					return result;
+				}
+			}
 		if (whileStmt->isDoWhile())
 			result["kind"] = "do_while";
 		else
