@@ -3384,6 +3384,12 @@ std::string runtimeFieldForMagicMember(std::string const& _base, std::string con
 		if (_member == "sig")
 			return "msgSig";
 	}
+	// Invariant: transaction origin is producer-resolved environment data.
+	// The exporter owns the exact `tx.origin` identity and emits the same
+	// first-class state_get shape as `msg.sender`; consumers never infer it
+	// from a declaration name or constrain it to the immediate caller.
+	if (_base == "tx" && _member == "origin")
+		return "origin";
 	if (_base == "block")
 	{
 		if (_member == "timestamp")
@@ -3715,7 +3721,11 @@ struct CallEvaluation
 /// captured when any participant is order-observable, so no expression can be
 /// duplicated by later field-specific lowering.
 CallEvaluation
-exportCallEvaluation(FunctionCall const& _call, Expression const& _target, FunctionCallOptions const* _options)
+exportCallEvaluation(
+	FunctionCall const& _call,
+	Expression const& _target,
+	FunctionCallOptions const* _options,
+	FunctionType const* _calleeType = nullptr)
 {
 	bool observable = evalOrderRelevant(_target);
 	if (_options)
@@ -3723,6 +3733,30 @@ exportCallEvaluation(FunctionCall const& _call, Expression const& _target, Funct
 			observable = observable || evalOrderRelevant(*option);
 	for (auto const& argument: _call.arguments())
 		observable = observable || evalOrderRelevant(*argument);
+
+	// Destination parameter type per SOURCE-order argument, from the callee's
+	// compiler-resolved FunctionType. A pinned literal argument must carry the
+	// DECLARED parameter type: its own annotation is a rational constant with
+	// no wire representation, and deriving a mobile type here would re-derive
+	// what the producer already resolved. Positional calls map by index; named
+	// calls map through the callee's parameter names. Any shape this cannot
+	// map exactly (arity mismatch, unknown name) keeps the typeless pin, whose
+	// rational-type export stays fail-closed.
+	auto destinationType = [&](size_t sourceIndex) -> Type const* {
+		if (!_calleeType)
+			return nullptr;
+		auto const& parameterTypes = _calleeType->parameterTypes();
+		if (_call.names().empty())
+			return sourceIndex < parameterTypes.size() ? parameterTypes[sourceIndex] : nullptr;
+		auto const& parameterNames = _calleeType->parameterNames();
+		if (sourceIndex >= _call.names().size() || parameterNames.size() != parameterTypes.size())
+			return nullptr;
+		auto const& argumentName = *_call.names()[sourceIndex];
+		for (size_t parameterIndex = 0; parameterIndex < parameterNames.size(); ++parameterIndex)
+			if (parameterNames[parameterIndex] == argumentName)
+				return parameterTypes[parameterIndex];
+		return nullptr;
+	};
 
 	CallEvaluation result;
 	result.target = observable ? pinExpressionOnce(_target, "call_target") : exportExpr(_target);
@@ -3735,7 +3769,7 @@ exportCallEvaluation(FunctionCall const& _call, Expression const& _target, Funct
 		}
 	for (size_t i = 0; i < _call.arguments().size(); ++i)
 		result.arguments.emplace_back(
-			observable ? pinExpressionOnce(*_call.arguments()[i], "call_arg_" + std::to_string(i))
+			observable ? pinExpressionOnce(*_call.arguments()[i], "call_arg_" + std::to_string(i), destinationType(i))
 					   : exportExpr(*_call.arguments()[i]));
 	return result;
 }
@@ -3832,17 +3866,24 @@ Json exportStorageRefSnapshotValue(Expression const& _expr, std::vector<Json>& _
 
 	return value;
 }
-/// Resolve the compiler-owned provenance established by the canonical
-/// StorageSlot assembly helper:
+/// Resolve the closed assembly storage-pointer-return shapes:
 ///
 ///     function getXSlot(bytes32 slot) internal pure
 ///         returns (XSlot storage result)
 ///     { assembly { result.slot := slot } }
 ///
-/// The Yul assignment and both of its external-reference declarations are
-/// checked structurally.  The caller argument is evaluated exactly once at
-/// the reference-creation point and becomes the word carried by the raw-slot
-/// root.  No helper name, wrapper member name, or struct offset is guessed.
+/// and the storage-pointer identity used by ShortStrings:
+///
+///     function fallback(string storage store)
+///         returns (string storage result)
+///     { assembly { result.slot := store.slot } }
+///
+/// Invariant: the exporter owns slot-word provenance.  Admission requires the
+/// RHS to be one exact compiler external reference, optionally copied through
+/// Yul identifier-only moves.  A bare value parameter is snapshotted as a raw
+/// slot word; a captured storage parameter's `.slot` carries the caller's
+/// structurally resolved storage path. Arithmetic, calls, literals, unknown
+/// locals, mixed suffixes, and every other statement shape fail closed.
 std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 	FunctionDefinition const& _callee,
 	std::map<VariableDeclaration const*, Expression const*> const& _paramBinding,
@@ -3860,36 +3901,124 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 	auto const* assembly = dynamic_cast<InlineAssembly const*>(body.statements().front().get());
 	if (!assembly)
 		return std::nullopt;
-	yul::Block const& root = assembly->operations().root();
-	if (root.statements.size() != 1)
-		return std::nullopt;
-	auto const* assignment = std::get_if<yul::Assignment>(&root.statements.front());
-	if (!assignment || assignment->variableNames.size() != 1 || !assignment->value)
-		return std::nullopt;
+
 	auto const& references = assembly->annotation().externalReferences;
-	auto lhsReference = references.find(&assignment->variableNames.front());
-	if (lhsReference == references.end() || lhsReference->second.declaration != returnSlot
-		|| lhsReference->second.suffix != "slot")
+	using ExternalIdentifierInfo = InlineAssemblyAnnotation::ExternalIdentifierInfo;
+	std::map<std::string, ExternalIdentifierInfo const*> moveOrigins;
+	auto exactOrigin = [&](yul::Identifier const& _identifier) -> ExternalIdentifierInfo const*
+	{
+		auto external = references.find(&_identifier);
+		if (external != references.end())
+			return &external->second;
+		auto local = moveOrigins.find(_identifier.name.str());
+		return local == moveOrigins.end() ? nullptr : local->second;
+	};
+
+	ExternalIdentifierInfo const* rhsOrigin = nullptr;
+	bool sawReturnAssignment = false;
+	bool sawNonMove = false;
+	yul::Block const& root = assembly->operations().root();
+	for (yul::Statement const& statement: root.statements)
+	{
+		if (auto const* declaration = std::get_if<yul::VariableDeclaration>(&statement))
+		{
+			if (declaration->variables.size() != 1)
+			{
+				sawNonMove = true;
+				continue;
+			}
+			std::string const name = declaration->variables.front().name.str();
+			auto const* rhs = declaration->value
+				? std::get_if<yul::Identifier>(declaration->value.get())
+				: nullptr;
+			auto const* origin = rhs ? exactOrigin(*rhs) : nullptr;
+			if (origin)
+				moveOrigins[name] = origin;
+			else
+				moveOrigins.erase(name);
+			if (declaration->value && !origin)
+				sawNonMove = true;
+			continue;
+		}
+
+		auto const* assignment = std::get_if<yul::Assignment>(&statement);
+		if (!assignment || assignment->variableNames.size() != 1)
+		{
+			sawNonMove = true;
+			continue;
+		}
+		yul::Identifier const& lhs = assignment->variableNames.front();
+		auto lhsReference = references.find(&lhs);
+		bool const assignsReturnSlot =
+			lhsReference != references.end()
+			&& lhsReference->second.declaration == returnSlot
+			&& lhsReference->second.suffix == "slot";
+		auto const* rhs = assignment->value
+			? std::get_if<yul::Identifier>(assignment->value.get())
+			: nullptr;
+		if (assignsReturnSlot)
+		{
+			if (sawReturnAssignment || !rhs)
+				throw UnsupportedSolCore(
+					"Assembly-assigned storage-pointer return `" + returnSlot->name()
+					+ ".slot` has a slot expression that is not a single compiler-owned Solidity value; "
+					  "raw-slot provenance is unresolvable.");
+			sawReturnAssignment = true;
+			rhsOrigin = exactOrigin(*rhs);
+			if (!rhsOrigin)
+				throw UnsupportedSolCore(
+					"Assembly-assigned storage-pointer return `" + returnSlot->name()
+					+ ".slot` has no exact compiler-owned slot-word provenance.");
+			continue;
+		}
+
+		if (lhsReference != references.end())
+		{
+			sawNonMove = true;
+			continue;
+		}
+		auto const* origin = rhs ? exactOrigin(*rhs) : nullptr;
+		if (origin)
+			moveOrigins[lhs.name.str()] = origin;
+		else
+			moveOrigins.erase(lhs.name.str());
+		if (!origin)
+			sawNonMove = true;
+	}
+
+	if (!sawReturnAssignment)
 		return std::nullopt;
-	auto const* rhs = std::get_if<yul::Identifier>(assignment->value.get());
-	if (!rhs)
-		throw UnsupportedSolCore(
-			"Assembly-assigned storage-pointer return `" + returnSlot->name()
-			+ ".slot` has a slot expression that is not a single compiler-owned Solidity value; "
-			  "raw-slot provenance is unresolvable.");
-	auto rhsReference = references.find(rhs);
-	if (rhsReference == references.end() || !rhsReference->second.suffix.empty())
+	if (sawNonMove || !rhsOrigin)
 		throw UnsupportedSolCore(
 			"Assembly-assigned storage-pointer return `" + returnSlot->name()
 			+ ".slot` has no exact compiler-owned slot-word provenance.");
+
 	auto const* slotParameter
-		= dynamic_cast<VariableDeclaration const*>(rhsReference->second.declaration);
+		= dynamic_cast<VariableDeclaration const*>(rhsOrigin->declaration);
 	auto argument = slotParameter ? _paramBinding.find(slotParameter) : _paramBinding.end();
 	if (argument == _paramBinding.end() || !argument->second)
 		throw UnsupportedSolCore(
 			"Assembly-assigned storage-pointer return `" + returnSlot->name()
 			+ ".slot` depends on a value that is not an exactly bound helper parameter; "
 			  "raw-slot provenance is unresolvable.");
+
+	if (rhsOrigin->suffix == "slot")
+	{
+		if (!isStorageRefParameter(slotParameter))
+			throw UnsupportedSolCore(
+				"Assembly-assigned storage-pointer return `" + returnSlot->name()
+				+ ".slot` has no exact compiler-owned slot-word provenance.");
+		auto target = resolveStorageRefPathRec(*argument->second, _snapshotOwner, _snapshots);
+		if (!target)
+			throw UnsupportedSolCore(
+				"Assembly-assigned storage-pointer return `" + returnSlot->name()
+				+ ".slot` depends on a captured storage slot whose caller path is unresolved.");
+		return target;
+	}
+	if (!rhsOrigin->suffix.empty())
+		throw UnsupportedSolCore(
+			"Assembly-assigned storage-pointer return `" + returnSlot->name()
+			+ ".slot` has no exact compiler-owned slot-word provenance.");
 
 	std::string tempName = storageRefKeyTempName(_snapshotOwner, _snapshots.size());
 	Json letStmt = Json::object();
@@ -5008,7 +5137,8 @@ exportExternalContractCall(FunctionCall const& _call, MemberAccess const& _membe
 		throw UnsupportedSolCore(
 			"High-level external call has no compiler-resolved call-expression function type.");
 	auto const* options = dynamic_cast<FunctionCallOptions const*>(&_call.expression());
-	CallEvaluation evaluation = exportCallEvaluation(_call, _memberAccess.expression(), options);
+	CallEvaluation evaluation
+		= exportCallEvaluation(_call, _memberAccess.expression(), options, callType);
 
 	Json callExpr = Json::object();
 	callExpr["target"] = std::move(evaluation.target);
@@ -8299,6 +8429,29 @@ Json exportExpr(Expression const& _expr)
 								decodeTypes.emplace_back(typeType->actualType()->toString(true));
 							}
 							result["decode_types"] = decodeTypes;
+							// Producer-authored ABI descriptors for the SAME type
+							// list, so struct decodes need no downstream re-parse
+							// of type-name strings. Emitted per entry through the
+							// exact descriptor exporter calls/events use; a type
+							// the descriptor exporter cannot express omits the
+							// field, and the frontend fails closed on absence with
+							// the type named (exactly as before this field).
+							try
+							{
+								Json decodeAbi = Json::array();
+								for (auto const& component: typesTuple->components())
+								{
+									auto const* typeType
+										= dynamic_cast<TypeType const*>(component->annotation().type);
+									decodeAbi.emplace_back(exportAbiDescriptor(
+										"", typeType->actualType(), false));
+								}
+								result["decode_abi"] = std::move(decodeAbi);
+							}
+							catch (UnsupportedSolCore const&)
+							{
+								// fall through without decode_abi
+							}
 							return result;
 						}
 
@@ -10292,7 +10445,10 @@ Json exportResolvedType(Type const* _type, bool _storage)
 	default:
 		break;
 	}
-	throw UnsupportedSolCore("Unsupported resolved type in SolCore exporter.");
+	throw UnsupportedSolCore(
+		"Unsupported resolved type in SolCore exporter: " +
+		_type->humanReadableName() + " (category " +
+		std::to_string(static_cast<int>(_type->category())) + ")");
 }
 
 Json typedDefaultValueForResolvedType(Type const* _type, bool _storage = false)
@@ -11154,16 +11310,30 @@ private:
 				"Inline assembly external reference '" + _identifier.name.str()
 				+ "' has no compiler-owned variable declaration and carrier type.");
 
+		// Invariant: suffix admission is producer-typed. Solidity exposes
+		// `.length` to inline assembly only for dynamically-sized calldata
+		// bytes/string references. Memory `.length` does not type-check in solc,
+		// while storage and ordinary arrays remain outside this closed shape.
+		auto const* arrayType = dynamic_cast<ArrayType const*>(variable->annotation().type);
+		bool const isCalldataBytesStringLength =
+			reference->second.suffix == "length"
+			&& arrayType
+			&& arrayType->location() == DataLocation::CallData
+			&& arrayType->isDynamicallySized()
+			&& arrayType->isByteArrayOrString();
 		std::string suffix;
 		if (reference->second.suffix.empty())
 			suffix = "none";
-		else if (reference->second.suffix == "slot" || reference->second.suffix == "offset")
+		else if (
+			reference->second.suffix == "slot"
+			|| reference->second.suffix == "offset"
+			|| isCalldataBytesStringLength)
 			suffix = reference->second.suffix;
 		else
 			throw UnsupportedSolCore(
 				"Inline assembly external reference '" + _identifier.name.str()
 				+ "' uses unsupported suffix '." + reference->second.suffix
-				+ "'; only none, .slot, and .offset are representable.");
+				+ "'; only none, .slot, .offset, and calldata bytes/string .length are representable.");
 
 		std::string declarationId = std::to_string(variable->id());
 		auto declaration = m_declarations.find(declarationId);
@@ -14994,6 +15164,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 
 	Json callEnvFields = Json::array();
 	callEnvFields.emplace_back(Json{{"name", "msgSender"}, {"type", "address"}});
+	callEnvFields.emplace_back(Json{{"name", "origin"}, {"type", "address"}});
 	callEnvFields.emplace_back(Json{{"name", "msgValue"}, {"type", "u256"}});
 	callEnvFields.emplace_back(Json{{"name", "blockTimestamp"}, {"type", "u256"}});
 	callEnvFields.emplace_back(Json{{"name", "blockNumber"}, {"type", "u256"}});

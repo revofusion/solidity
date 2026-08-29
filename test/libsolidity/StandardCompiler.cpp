@@ -2733,10 +2733,45 @@ BOOST_AUTO_TEST_CASE(solcore_export_inline_assembly_producer_interface)
 
 BOOST_AUTO_TEST_CASE(solcore_export_inline_assembly_rejects_unrepresentable_alias_and_operation)
 {
+	Json lengthInput = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Length.sol", R"(
+				pragma solidity >=0.8.28;
+				contract LengthAlias {
+					function readLength(bytes calldata data) external pure returns (uint256 output) {
+						assembly { output := data.length }
+					}
+				}
+			)"}}));
+	Json lengthResult = compile(lengthInput.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(lengthResult));
+	Json const& lengthSolcore
+		= getContractResult(lengthResult, "Length.sol", "LengthAlias")["solcore"];
+	BOOST_REQUIRE(lengthSolcore["functions"].is_array());
+	BOOST_REQUIRE_EQUAL(lengthSolcore["functions"].size(), 1u);
+	Json const& lengthStatements = lengthSolcore["functions"][0]["body"]["statements"];
+	BOOST_REQUIRE(lengthStatements.is_array());
+	Json const* lengthAssembly = nullptr;
+	for (Json const& statement: lengthStatements)
+		if (statement.value("kind", ""s) == "inline_assembly")
+			lengthAssembly = &statement;
+	BOOST_REQUIRE(lengthAssembly != nullptr);
+	Json const& lengthLocals = (*lengthAssembly)["interface"]["locals"];
+	BOOST_REQUIRE(lengthLocals.is_array());
+	bool sawLength = false;
+	for (Json const& row: lengthLocals)
+		if (row.value("name", ""s) == "data" && row.value("suffix", ""s) == "length")
+		{
+			BOOST_CHECK_EQUAL(row.value("access", ""s), "read");
+			BOOST_REQUIRE(row["type"].is_object());
+			BOOST_CHECK_EQUAL(row["type"].value("kind", ""s), "array");
+			BOOST_CHECK_EQUAL(row["type"].value("element", ""s), "u8");
+			sawLength = true;
+		}
+	BOOST_CHECK(sawLength);
+
 	Json aliasInput = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Alias.sol", R"(
 				pragma solidity >=0.8.28;
 				contract BadAlias {
-					function bad(bytes calldata data) external pure returns (uint256 output) {
+					function bad(uint256[] calldata data) external pure returns (uint256 output) {
 						assembly { output := data.length }
 					}
 				}
