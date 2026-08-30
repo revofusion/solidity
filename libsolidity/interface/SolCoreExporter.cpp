@@ -11246,6 +11246,78 @@ bool inlineAssemblyOperationIs(
 	return std::find(_candidates.begin(), _candidates.end(), _operation) != _candidates.end();
 }
 
+/// Per-function map from a bytes4 LOCAL variable declaration to its
+/// statically resolvable initializer expression, for staticExternalCalls
+/// selector resolution. A local's initializer lives on its enclosing
+/// VariableDeclarationStatement (VariableDeclaration::value() is null for
+/// locals), so the collector cannot recover it from the declaration alone.
+/// Populated by a whole-function pre-pass in exportBody; a declaration is
+/// dropped (fail-closed) when ANY Solidity-level assignment or Yul-level
+/// assembly assignment anywhere in the exported bodies targets it, so the
+/// value observed by the assembly block is provably the initializer.
+std::map<VariableDeclaration const*, Expression const*> activeSelectorLocalInitializers;
+
+class SelectorLocalInitializerScanner: public ASTConstVisitor
+{
+public:
+	bool visit(VariableDeclarationStatement const& _statement) override
+	{
+		if (_statement.declarations().size() == 1 && _statement.declarations().front() && _statement.initialValue())
+		{
+			VariableDeclaration const& declaration = *_statement.declarations().front();
+			auto const* fixedBytes =
+				dynamic_cast<FixedBytesType const*>(declaration.annotation().type);
+			if (fixedBytes && fixedBytes->numBytes() == 4)
+				activeSelectorLocalInitializers[&declaration] = _statement.initialValue();
+		}
+		return true;
+	}
+
+	bool visit(Assignment const& _assignment) override
+	{
+		dropAssignedDeclarations(_assignment.leftHandSide());
+		return true;
+	}
+
+	bool visit(InlineAssembly const& _assembly) override
+	{
+		// A Yul-level `local := ...` writes the Solidity local through the
+		// external-reference map; drop every declaration such an assignment
+		// (or multi-assignment) targets.
+		auto const& references = _assembly.annotation().externalReferences;
+		yul::forEach<yul::Assignment const>(
+			_assembly.operations().root(),
+			[&](yul::Assignment const& _yulAssignment) {
+				for (yul::Identifier const& name: _yulAssignment.variableNames)
+				{
+					auto reference = references.find(&name);
+					if (reference == references.end())
+						continue;
+					if (auto const* declaration =
+						dynamic_cast<VariableDeclaration const*>(reference->second.declaration))
+						activeSelectorLocalInitializers.erase(declaration);
+				}
+			});
+		return true;
+	}
+
+private:
+	void dropAssignedDeclarations(Expression const& _lhs)
+	{
+		if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_lhs))
+		{
+			for (auto const& component: tuple->components())
+				if (component)
+					dropAssignedDeclarations(*component);
+			return;
+		}
+		if (auto const* identifier = dynamic_cast<Identifier const*>(&_lhs))
+			if (auto const* declaration =
+				dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration))
+				activeSelectorLocalInitializers.erase(declaration);
+	}
+};
+
 /// Collects the producer-owned interface of one inline assembly block.
 ///
 /// The Yul walker is deliberately driven by the exact dialect attached to the
@@ -11449,9 +11521,21 @@ private:
 			variable && variable->annotation().type
 				? dynamic_cast<FixedBytesType const*>(variable->annotation().type)
 				: nullptr;
-		if (!fixedBytes || fixedBytes->numBytes() != 4 || !variable->value())
+		if (!fixedBytes || fixedBytes->numBytes() != 4)
 			return std::nullopt;
-		return soliditySelectorHex(*variable->value());
+		// State constants carry their initializer on the declaration; a LOCAL
+		// carries it on the declaring statement, recovered (and reassignment-
+		// invalidated) by SelectorLocalInitializerScanner in exportBody.
+		Expression const* initializer = variable->value().get();
+		if (!initializer)
+		{
+			auto local = activeSelectorLocalInitializers.find(variable);
+			if (local != activeSelectorLocalInitializers.end())
+				initializer = local->second;
+		}
+		if (!initializer)
+			return std::nullopt;
+		return soliditySelectorHex(*initializer);
 	}
 
 	bool isBuiltin(yul::FunctionCall const& _call, std::string_view _name) const
@@ -14571,6 +14655,22 @@ Json exportBody(FunctionDefinition const& _function)
 	auto savedAliases = namespacedStorageAliases;
 	namespacedStorageAliases.clear();
 
+	// Selector-local initializers for staticExternalCalls: same whole-scope
+	// discipline as the storage-ref pre-passes below (function body AND every
+	// resolved modifier body), same save/restore pattern as the aliases above.
+	auto savedSelectorInitializers = activeSelectorLocalInitializers;
+	activeSelectorLocalInitializers.clear();
+	{
+		SelectorLocalInitializerScanner selectorScanner;
+		_function.body().accept(selectorScanner);
+		for (auto const& modifierInvocation: _function.modifiers())
+		{
+			ModifierDefinition const* modifierDefinition = resolveModifierDefinition(_function, *modifierInvocation);
+			if (modifierDefinition && modifierDefinition->isImplemented())
+				modifierDefinition->body().accept(selectorScanner);
+		}
+	}
+
 	// General storage-reference-variable alias tracking (Phase 1a): fresh
 	// per-function state, plus the whole-function rebind pre-pass (see the
 	// deviation note on storageRefAliasTargets above).
@@ -14684,6 +14784,7 @@ Json exportBody(FunctionDefinition const& _function)
 	catch (...)
 	{
 		namespacedStorageAliases = savedAliases;
+		activeSelectorLocalInitializers = savedSelectorInitializers;
 		// Capture a diagnostic reason where we can (UnsupportedSolCore
 		// carries a human-readable message; anything else is opaque).
 		std::string reason = "unknown export failure";
@@ -14722,6 +14823,7 @@ Json exportBody(FunctionDefinition const& _function)
 	if (!body.is_object() || body.value("kind", ""s) != "block")
 	{
 		namespacedStorageAliases = savedAliases;
+		activeSelectorLocalInitializers = savedSelectorInitializers;
 		return body;
 	}
 
@@ -14843,6 +14945,7 @@ Json exportBody(FunctionDefinition const& _function)
 		}
 	}
 	namespacedStorageAliases = savedAliases;
+	activeSelectorLocalInitializers = savedSelectorInitializers;
 	return body;
 }
 
