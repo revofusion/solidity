@@ -18,6 +18,7 @@
 
 #include <libsolidity/interface/SolCoreExporter.h>
 
+#include <libsolidity/analysis/ConstantEvaluator.h>
 #include <libsolidity/ast/AST.h>
 #include <libsolidity/ast/ASTAnnotations.h>
 #include <libsolidity/ast/TypeProvider.h>
@@ -33,8 +34,10 @@
 #include <libsolutil/Visitor.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -11261,6 +11264,13 @@ public:
 			m_localFunctions.insert(_function.name.str());
 		});
 
+		// OpenZeppelin SafeERC20 v5.4 is the motivating witness: _safeTransfer
+		// materializes transfer.selector and its two ABI words with mstore,
+		// then issues call(gas(), token, 0, 0, 0x44, 0, 0x20).
+		// Preserve that exact producer fact only; every uncertain shape is
+		// intentionally represented by absence from staticExternalCalls.
+		collectStaticExternalCalls(root);
+
 		// ASTWalker recursively visits nested blocks, conditions, switches,
 		// loops, and local Yul function bodies. Assignment is overridden below
 		// so its external identifiers receive the correct LHS/RHS access.
@@ -11318,6 +11328,7 @@ public:
 		result["environmentReads"] = stringSetJson(m_environmentReads);
 		result["effects"] = stringSetJson(m_effects);
 		result["operations"] = stringSetJson(m_operations);
+		result["staticExternalCalls"] = m_staticExternalCalls;
 		return result;
 	}
 
@@ -11339,6 +11350,352 @@ private:
 		for (std::string const& value: _values)
 			result.emplace_back(value);
 		return result;
+	}
+
+	struct MemoryPrefix
+	{
+		std::map<u256, yul::Expression const*> stores;
+		bool unknownWrite = false;
+	};
+
+	static std::optional<u256> yulNumber(yul::Expression const& _expression)
+	{
+		auto const* literal = std::get_if<yul::Literal>(&_expression);
+		if (
+			!literal
+			|| literal->kind != yul::LiteralKind::Number
+			|| literal->value.unlimited())
+			return std::nullopt;
+		return literal->value.value();
+	}
+
+	static std::optional<std::string> selectorHex(u256 const& _selector)
+	{
+		if (_selector > 0xffffffff)
+			return std::nullopt;
+		static constexpr char hexDigits[] = "0123456789abcdef";
+		std::string result(8, '0');
+		uint32_t value = _selector.convert_to<uint32_t>();
+		for (size_t i = 0; i < result.size(); ++i)
+		{
+			result[result.size() - i - 1] = hexDigits[value & 0xf];
+			value >>= 4;
+		}
+		return result;
+	}
+
+	static std::optional<std::string> soliditySelectorHex(Expression const& _initializer)
+	{
+		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_initializer))
+			if (memberAccess->memberName() == "selector")
+				if (auto const* functionType =
+					dynamic_cast<FunctionType const*>(memberAccess->expression().annotation().type))
+				{
+					try
+					{
+						std::string selector = functionType->externalIdentifierHex();
+						if (selector.size() != 8)
+							return std::nullopt;
+						for (char& digit: selector)
+						{
+							if (digit >= 'A' && digit <= 'F')
+								digit = static_cast<char>(digit - 'A' + 'a');
+							else if (!((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f')))
+								return std::nullopt;
+						}
+						return selector;
+					}
+					catch (...)
+					{
+						return std::nullopt;
+					}
+				}
+
+		if (!dynamic_cast<Literal const*>(&_initializer))
+			return std::nullopt;
+		auto value = ConstantEvaluator::tryEvaluate(_initializer);
+		if (!std::holds_alternative<rational>(value.value))
+			return std::nullopt;
+		rational const& number = std::get<rational>(value.value);
+		if (number.denominator() != 1 || number.numerator() < 0 || number.numerator() > 0xffffffff)
+			return std::nullopt;
+		return selectorHex(u256(number.numerator().convert_to<uint32_t>()));
+	}
+
+	std::optional<std::string> externalLocalName(yul::Identifier const& _identifier) const
+	{
+		auto reference = m_externalReferences.find(&_identifier);
+		if (reference == m_externalReferences.end() || !reference->second.suffix.empty())
+			return std::nullopt;
+		if (!dynamic_cast<VariableDeclaration const*>(reference->second.declaration))
+			return std::nullopt;
+		return _identifier.name.str();
+	}
+
+	std::optional<std::string> selectorWordHex(yul::Expression const& _expression) const
+	{
+		if (auto literal = yulNumber(_expression))
+			return selectorHex(*literal);
+
+		auto const* identifier = std::get_if<yul::Identifier>(&_expression);
+		if (!identifier)
+			return std::nullopt;
+		auto reference = m_externalReferences.find(identifier);
+		if (reference == m_externalReferences.end() || !reference->second.suffix.empty())
+			return std::nullopt;
+		auto const* variable =
+			dynamic_cast<VariableDeclaration const*>(reference->second.declaration);
+		auto const* fixedBytes =
+			variable && variable->annotation().type
+				? dynamic_cast<FixedBytesType const*>(variable->annotation().type)
+				: nullptr;
+		if (!fixedBytes || fixedBytes->numBytes() != 4 || !variable->value())
+			return std::nullopt;
+		return soliditySelectorHex(*variable->value());
+	}
+
+	bool isBuiltin(yul::FunctionCall const& _call, std::string_view _name) const
+	{
+		return yul::resolveBuiltinFunction(_call.functionName, m_dialect)
+			&& yul::resolveFunctionName(_call.functionName, m_dialect) == _name;
+	}
+
+	bool isZeroLiteral(yul::Expression const& _expression) const
+	{
+		auto value = yulNumber(_expression);
+		return value && *value == 0;
+	}
+
+	std::optional<std::string> maskedAddressRoot(yul::Expression const& _expression) const
+	{
+		auto const* andCall = std::get_if<yul::FunctionCall>(&_expression);
+		if (!andCall || !isBuiltin(*andCall, "and") || andCall->arguments.size() != 2)
+			return std::nullopt;
+		auto const* root = std::get_if<yul::Identifier>(&andCall->arguments[0]);
+		auto const* shrCall = std::get_if<yul::FunctionCall>(&andCall->arguments[1]);
+		if (
+			!root
+			|| !shrCall
+			|| !isBuiltin(*shrCall, "shr")
+			|| shrCall->arguments.size() != 2)
+			return std::nullopt;
+		auto shift = yulNumber(shrCall->arguments[0]);
+		auto const* notCall = std::get_if<yul::FunctionCall>(&shrCall->arguments[1]);
+		if (
+			!shift
+			|| *shift != 96
+			|| !notCall
+			|| !isBuiltin(*notCall, "not")
+			|| notCall->arguments.size() != 1
+			|| !isZeroLiteral(notCall->arguments[0]))
+			return std::nullopt;
+		return externalLocalName(*root);
+	}
+
+	std::optional<Json> staticArgument(
+		u256 const& _byteOffset,
+		yul::Expression const& _expression) const
+	{
+		std::optional<std::string> source = maskedAddressRoot(_expression);
+		std::string abiType = "address";
+		if (!source)
+		{
+			auto const* identifier = std::get_if<yul::Identifier>(&_expression);
+			if (!identifier)
+				return std::nullopt;
+			source = externalLocalName(*identifier);
+			abiType = "uint256";
+		}
+		if (!source || _byteOffset > std::numeric_limits<uint64_t>::max())
+			return std::nullopt;
+
+		Json result = Json::object();
+		result["byteOffset"] = _byteOffset.convert_to<uint64_t>();
+		result["source"] = *source;
+		result["abiType"] = std::move(abiType);
+		return result;
+	}
+
+	void tryDecodeStaticExternalCall(
+		yul::FunctionCall const& _call,
+		MemoryPrefix const& _prefix)
+	{
+		std::string operation(yul::resolveFunctionName(_call.functionName, m_dialect));
+		bool const isCall = operation == "call";
+		bool const isStaticCall = operation == "staticcall";
+		if (
+			(!isCall && !isStaticCall)
+			|| !yul::resolveBuiltinFunction(_call.functionName, m_dialect)
+			|| _call.arguments.size() != (isCall ? 7 : 6)
+			|| _prefix.unknownWrite)
+			return;
+
+		size_t const targetIndex = 1;
+		size_t const valueIndex = 2;
+		size_t const inputOffsetIndex = isCall ? 3 : 2;
+		size_t const inputSizeIndex = isCall ? 4 : 3;
+		auto const* targetIdentifier =
+			std::get_if<yul::Identifier>(&_call.arguments[targetIndex]);
+		auto target = targetIdentifier
+			? externalLocalName(*targetIdentifier)
+			: std::nullopt;
+		auto inputOffset = yulNumber(_call.arguments[inputOffsetIndex]);
+		auto inputSize = yulNumber(_call.arguments[inputSizeIndex]);
+		if (
+			!target
+			|| (isCall && !isZeroLiteral(_call.arguments[valueIndex]))
+			|| !inputOffset
+			|| !inputSize
+			|| *inputSize < 4
+			|| (*inputSize - 4) % 32 != 0
+			|| *inputOffset > std::numeric_limits<uint64_t>::max())
+			return;
+		u256 const inputEnd = *inputOffset + *inputSize;
+		if (inputEnd < *inputOffset)
+			return;
+
+		auto selectorStore = _prefix.stores.find(*inputOffset);
+		if (selectorStore == _prefix.stores.end())
+			return;
+		auto selector = selectorWordHex(*selectorStore->second);
+		if (!selector)
+			return;
+
+		std::set<u256> expectedStoreOffsets{*inputOffset};
+		Json arguments = Json::array();
+		for (u256 offset = *inputOffset + 4; offset < inputEnd; offset += 32)
+		{
+			auto store = _prefix.stores.find(offset);
+			if (store == _prefix.stores.end())
+				return;
+			auto argument = staticArgument(offset - *inputOffset, *store->second);
+			if (!argument)
+				return;
+			expectedStoreOffsets.insert(offset);
+			arguments.emplace_back(std::move(*argument));
+		}
+
+		for (auto const& [offset, value]: _prefix.stores)
+		{
+			(void)value;
+			u256 const storeEnd = offset + 32;
+			if (storeEnd < offset)
+				return;
+			if (
+				offset < inputEnd
+				&& storeEnd > *inputOffset
+				&& !expectedStoreOffsets.count(offset))
+				return;
+		}
+
+		Json result = Json::object();
+		result["op"] = operation;
+		result["target"] = *target;
+		if (isCall)
+			result["valueZero"] = true;
+		result["selectorHex"] = *selector;
+		result["args"] = std::move(arguments);
+		result["argsComplete"] = true;
+		m_staticExternalCalls.emplace_back(std::move(result));
+	}
+
+	bool scanExpressionForStaticCall(
+		yul::Expression const& _expression,
+		MemoryPrefix const& _prefix)
+	{
+		auto const* call = std::get_if<yul::FunctionCall>(&_expression);
+		if (!call)
+			return false;
+		std::string operation(yul::resolveFunctionName(call->functionName, m_dialect));
+		bool const isExternalCall =
+			yul::resolveBuiltinFunction(call->functionName, m_dialect)
+			&& (operation == "call" || operation == "staticcall");
+		if (isExternalCall)
+			tryDecodeStaticExternalCall(*call, _prefix);
+		bool found = isExternalCall;
+		for (yul::Expression const& argument: call->arguments)
+			found = scanExpressionForStaticCall(argument, _prefix) || found;
+		return found;
+	}
+
+	void recordMemoryStore(yul::Statement const& _statement, MemoryPrefix& _prefix)
+	{
+		auto const* expressionStatement = std::get_if<yul::ExpressionStatement>(&_statement);
+		auto const* call = expressionStatement
+			? std::get_if<yul::FunctionCall>(&expressionStatement->expression)
+			: nullptr;
+		if (!call)
+			return;
+		std::string operation(yul::resolveFunctionName(call->functionName, m_dialect));
+		if (!yul::resolveBuiltinFunction(call->functionName, m_dialect))
+			return;
+		if (operation == "mstore")
+		{
+			if (call->arguments.size() != 2)
+			{
+				_prefix.unknownWrite = true;
+				return;
+			}
+			auto offset = yulNumber(call->arguments[0]);
+			if (!offset)
+			{
+				_prefix.unknownWrite = true;
+				return;
+			}
+			_prefix.stores[*offset] = &call->arguments[1];
+		}
+		else if (inlineAssemblyOperationIs(
+			operation,
+			{"mstore8", "calldatacopy", "codecopy", "extcodecopy",
+				"returndatacopy", "mcopy", "datacopy"}))
+			_prefix.unknownWrite = true;
+	}
+
+	void collectStaticExternalCalls(yul::Block const& _block)
+	{
+		MemoryPrefix prefix;
+		bool collecting = true;
+		for (yul::Statement const& statement: _block.statements)
+		{
+			bool foundCall = false;
+			if (collecting)
+			{
+				if (auto const* expression = std::get_if<yul::ExpressionStatement>(&statement))
+					foundCall = scanExpressionForStaticCall(expression->expression, prefix);
+				else if (auto const* assignment = std::get_if<yul::Assignment>(&statement))
+					foundCall = assignment->value
+						&& scanExpressionForStaticCall(*assignment->value, prefix);
+				else if (auto const* declaration = std::get_if<yul::VariableDeclaration>(&statement))
+					foundCall = declaration->value
+						&& scanExpressionForStaticCall(*declaration->value, prefix);
+			}
+
+			bool const branch =
+				std::holds_alternative<yul::If>(statement)
+				|| std::holds_alternative<yul::ForLoop>(statement)
+				|| std::holds_alternative<yul::Switch>(statement)
+				|| std::holds_alternative<yul::Block>(statement);
+			if (collecting && !foundCall && !branch)
+				recordMemoryStore(statement, prefix);
+			if (foundCall || branch)
+				collecting = false;
+
+			if (auto const* function = std::get_if<yul::FunctionDefinition>(&statement))
+				collectStaticExternalCalls(function->body);
+			else if (auto const* conditional = std::get_if<yul::If>(&statement))
+				collectStaticExternalCalls(conditional->body);
+			else if (auto const* loop = std::get_if<yul::ForLoop>(&statement))
+			{
+				collectStaticExternalCalls(loop->pre);
+				collectStaticExternalCalls(loop->body);
+				collectStaticExternalCalls(loop->post);
+			}
+			else if (auto const* switchStatement = std::get_if<yul::Switch>(&statement))
+				for (yul::Case const& switchCase: switchStatement->cases)
+					collectStaticExternalCalls(switchCase.body);
+			else if (auto const* block = std::get_if<yul::Block>(&statement))
+				collectStaticExternalCalls(*block);
+		}
 	}
 
 	void operator()(yul::Identifier const& _identifier) override
@@ -11559,6 +11916,7 @@ private:
 	std::set<std::string> m_environmentReads;
 	std::set<std::string> m_effects;
 	std::set<std::string> m_operations;
+	Json m_staticExternalCalls = Json::array();
 };
 
 Json exportInlineAssemblyInterface(InlineAssembly const& _assembly)
