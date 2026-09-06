@@ -3330,6 +3330,9 @@ Json exportConstructorDisposition(ContractDefinition const& _contract)
 			result["function"] = "constructor";
 			result["paramsAbi"] = Json::array();
 			result["sourceLocation"] = sourceLocation(_contract.location());
+			// This initializer executes inherited work without a source constructor.
+			// Retain the AST-owned fact separately from its exported body identity.
+			result["synthesizedFrom"] = exportedContractId(_contract);
 		}
 		else
 			result["kind"] = "implicit";
@@ -8280,7 +8283,10 @@ Json exportExpr(Expression const& _expr)
 					result["constructorArgAbi"] = std::move(constructorArgAbi);
 					Json constructorJson = Json::object();
 					constructorJson["contractId"] = targetContractId;
-					constructorJson["function"] = constructor ? Json("constructor") : Json();
+					constructorJson["function"]
+						= result["constructorDisposition"]["kind"] == "exported"
+							  ? result["constructorDisposition"]["function"]
+							  : Json();
 					constructorJson["payable"]
 						= constructor && constructor->stateMutability() == StateMutability::Payable;
 					constructorJson["argTypes"] = Json::array();

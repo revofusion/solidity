@@ -5708,6 +5708,7 @@ BOOST_AUTO_TEST_CASE(solcore_export_constructor_deployment_semantics)
 		solcore["constructorDisposition"].is_object(), "explicit constructor disposition should be required");
 	Json const& disposition = solcore["constructorDisposition"];
 	BOOST_CHECK_EQUAL(disposition["kind"].get<std::string>(), "exported");
+	BOOST_CHECK(!disposition.contains("synthesizedFrom"));
 	BOOST_CHECK_EQUAL(
 		disposition["declarationId"].get<std::string>(), solcore["constructor"]["declarationId"].get<std::string>());
 	BOOST_CHECK_EQUAL(disposition["function"].get<std::string>(), solcore["constructor"]["name"].get<std::string>());
@@ -5747,10 +5748,69 @@ BOOST_AUTO_TEST_CASE(solcore_export_implicit_constructor_disposition)
 	BOOST_CHECK(!solcore.value("unsupported", false));
 	BOOST_REQUIRE(solcore["constructorDisposition"].is_object());
 	BOOST_CHECK_EQUAL(solcore["constructorDisposition"]["kind"].get<std::string>(), "implicit");
+	BOOST_CHECK(!solcore["constructorDisposition"].contains("synthesizedFrom"));
 	BOOST_CHECK_MESSAGE(
 		!solcore.contains("constructor"), "an AST-proven implicit constructor must not fabricate a body");
 	BOOST_REQUIRE(solcore["immutables"].is_array());
 	BOOST_CHECK(solcore["immutables"].empty());
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_synthesized_inherited_constructor_origin)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore", "abi"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract Base {
+					uint256 public seed;
+					constructor(uint256 initialSeed) { seed = initialSeed; }
+				}
+				contract Derived is Base(7) {}
+				contract Explicit is Base(7) { constructor() {} }
+				contract Factory {
+					function deploy() external { new Derived(); }
+				}
+			)"}}));
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json derived = getContractResult(result, "fileA", "Derived");
+	Json const& solcore = derived["solcore"];
+	BOOST_REQUIRE(solcore.is_object());
+	BOOST_REQUIRE(!solcore.value("unsupported", false));
+	Json const& disposition = solcore["constructorDisposition"];
+	BOOST_CHECK_EQUAL(disposition["kind"].get<std::string>(), "exported");
+	BOOST_CHECK_EQUAL(disposition["synthesizedFrom"].get<std::string>(), "fileA:Derived");
+	BOOST_CHECK(disposition["paramsAbi"].empty());
+	BOOST_REQUIRE(solcore["constructor"].is_object());
+	BOOST_CHECK_EQUAL(
+		disposition["declarationId"].get<std::string>(), solcore["constructor"]["declarationId"].get<std::string>());
+	bool initializesSeed = false;
+	auto visit = [&](auto const& self, Json const& node) -> void {
+		if (node.is_object() && node.value("kind", ""s) == "storage_set" && node.value("field", ""s) == "seed")
+			initializesSeed = true;
+		if (node.is_object() || node.is_array())
+			for (Json const& child: node)
+				self(self, child);
+	};
+	visit(visit, solcore["constructor"]["body"]);
+	BOOST_CHECK(initializesSeed);
+	for (Json const& entry: derived["abi"])
+		BOOST_CHECK(entry.value("type", ""s) != "constructor");
+
+	Json explicitResult = getContractResult(result, "fileA", "Explicit");
+	BOOST_CHECK(!explicitResult["solcore"]["constructorDisposition"].contains("synthesizedFrom"));
+	bool explicitAbi = false;
+	for (Json const& entry: explicitResult["abi"])
+		explicitAbi = explicitAbi || entry.value("type", ""s) == "constructor";
+	BOOST_CHECK(explicitAbi);
+
+	Json factory = getContractResult(result, "fileA", "Factory");
+	BOOST_REQUIRE(!factory["solcore"].value("unsupported", false));
+	Json const* deploy = findExportedFunction(factory["solcore"]["functions"], "deploy");
+	BOOST_REQUIRE(deploy != nullptr);
+	Json const& deployment = deploy->at("body")["statements"][0]["value"];
+	BOOST_CHECK(deployment["constructorDisposition"] == disposition);
+	BOOST_CHECK_EQUAL(deployment["constructor"]["function"].get<std::string>(), "constructor");
+	BOOST_CHECK_EQUAL(deployment["constructor"]["payable"].get<bool>(), false);
+	BOOST_CHECK(deployment["constructorArgAbi"].empty());
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_immutable_declarations_and_access_identity)
