@@ -355,6 +355,9 @@ public:
 	/// @returns the runtime object for the contract.
 	virtual evmasm::LinkerObject const& runtimeObject(std::string const& _contractName) const override;
 
+	/// @returns the cached object before library linking, or nullptr if no assembly was generated.
+	evmasm::LinkerObject const* unlinkedObject(std::string const& _contractName, bool _runtime = false) const;
+
 	/// @returns normal contract assembly items
 	evmasm::AssemblyItems const* assemblyItems(std::string const& _contractName) const;
 

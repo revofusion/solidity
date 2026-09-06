@@ -1082,6 +1082,14 @@ evmasm::LinkerObject const& CompilerStack::runtimeObject(std::string const& _con
 	return contract(_contractName).runtimeObject;
 }
 
+evmasm::LinkerObject const* CompilerStack::unlinkedObject(std::string const& _contractName, bool _runtime) const
+{
+	solAssert(m_stackState == CompilationSuccessful, "Compilation was not successful.");
+	Contract const& compiledContract = contract(_contractName);
+	auto const& assembly = _runtime ? compiledContract.evmRuntimeAssembly : compiledContract.evmAssembly;
+	return assembly ? &assembly->assemble() : nullptr;
+}
+
 /// TODO: cache this string
 std::string CompilerStack::assemblyString(std::string const& _contractName, StringMap const& _sourceCodes) const
 {

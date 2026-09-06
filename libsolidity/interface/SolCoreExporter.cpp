@@ -28,8 +28,8 @@
 
 #include <libyul/AST.h>
 #include <libyul/Dialect.h>
-#include <libyul/optimiser/ASTWalker.h>
 #include <libyul/Utilities.h>
+#include <libyul/optimiser/ASTWalker.h>
 
 #include <libsolutil/Visitor.h>
 
@@ -213,6 +213,15 @@ static thread_local std::map<FunctionDefinition const*, bool> fnPtrCalleeAdmissi
 std::string exportedFunctionName(FunctionDefinition const& _function);
 std::string exportedContractId(ContractDefinition const& _contract);
 Json exportAbiDescriptor(std::string const& _name, Type const* _solidityType, bool _forLibrary);
+Json exportResolvedType(Type const* _type, bool _storage = false, bool _respectResolvedLocation = true);
+Json exportTypeName(TypeName const& _typeName, bool _storage);
+Json dataLocationEntry(Type const* _type);
+Json dataLocationEntry(VariableDeclaration const& _decl);
+Json runtimeCallAuthority(
+	std::string const& _runtimeKind, std::vector<Type const*> const& _inputs, Type const* _result);
+Json storageRefWireType(Type const* _referentType);
+bool isResidualStorageRefFunction(FunctionDefinition const& _function);
+bool isStructuralStorageRefParameter(FunctionDefinition const& _function, VariableDeclaration const* _parameter);
 /// One producer-proven arm of a closed internal-function candidate table.
 /// The identity is structural (source unit + declaring scope + resolved
 /// function signature), never reconstructed downstream from an exported name.
@@ -220,6 +229,7 @@ struct InternalFnCandidateRecord
 {
 	std::string identity;
 	std::string tag;
+	std::string declarationId;
 	std::string functionName;
 	std::string declarationContractId;
 	std::string targetContractId;
@@ -303,9 +313,10 @@ InternalFnCandidateRecord const& registerInternalFnCandidate(
 	if (!targetType)
 		throw UnsupportedSolCore("Internal function candidate has no compiler-resolved internal function type.");
 	std::string declarationContractId = internalFnContractId(_declaration);
+	std::string declarationId = std::to_string(_declaration.id());
 	std::string targetContractId = internalFnContractId(_target);
-	std::string identity = declarationContractId + "|" + _declaration.name() + "|" + targetContractId + "|"
-						   + _target.name() + "|" + targetType->richIdentifier();
+	std::string identity = declarationId + "|" + declarationContractId + "|" + _declaration.name() + "|"
+						   + targetContractId + "|" + _target.name() + "|" + targetType->richIdentifier();
 	std::string tag = stableInternalFnTag("candidate:" + _fnType.richIdentifier() + "|" + identity);
 	auto existingIdentity = table.tagByIdentity.find(identity);
 	if (existingIdentity != table.tagByIdentity.end())
@@ -319,6 +330,7 @@ InternalFnCandidateRecord const& registerInternalFnCandidate(
 	InternalFnCandidateRecord candidate{
 		identity,
 		tag,
+		declarationId,
 		functionName,
 		declarationContractId,
 		targetContractId,
@@ -379,8 +391,7 @@ bool contractHasAggregateInternalFnValue(ContractDefinition const& _contract)
 		{
 			Type const* type = _declaration.annotation().type;
 			auto const* directFnType = dynamic_cast<FunctionType const*>(type);
-			bool const directInternalFn
-				= directFnType && directFnType->kind() == FunctionType::Kind::Internal;
+			bool const directInternalFn = directFnType && directFnType->kind() == FunctionType::Kind::Internal;
 			if (!directInternalFn && typeContainsInternalFnValue(type))
 				found = true;
 			return !found;
@@ -430,10 +441,7 @@ private:
 /// Record checkedness explicitly on every arithmetic node whose semantics
 /// differ between checked and unchecked Solidity contexts. Consumers reject
 /// missing/null metadata rather than guessing checked execution.
-void markUncheckedContext(Json& _result)
-{
-	_result["unchecked"] = inUncheckedBlock;
-}
+void markUncheckedContext(Json& _result) { _result["unchecked"] = inUncheckedBlock; }
 
 // --- Side-effect hoisting for mutating sub-expressions ---
 //
@@ -519,6 +527,7 @@ struct HoistScopeGuard
 			return std::move(_stmt);
 		Json block = Json::object();
 		block["kind"] = "block";
+		block["_solcoreSyntheticSequence"] = true;
 		block["statements"] = Json::array();
 		for (auto& hoisted: m_scope.statements)
 			block["statements"].emplace_back(std::move(hoisted));
@@ -557,10 +566,7 @@ void tagUnsignedArithWidth(Json& _result, Type const* _operationType)
 		_result["bits"] = static_cast<int>(8 * fixedBytes->numBytes());
 		return;
 	}
-	if (
-		_operationType
-		&& _operationType->category() == Type::Category::RationalNumber
-	)
+	if (_operationType && _operationType->category() == Type::Category::RationalNumber)
 	{
 		// Untyped integer constant expressions are exact rationals in solc's
 		// AST. Their SolCore carrier is the full word; any contextual narrow
@@ -642,9 +648,7 @@ bool enumNameNeedsQualification(EnumDefinition const& _enumDef)
 				forEachEnumDefinition(
 					activeCompilerStack->ast(sourceName),
 					[&](EnumDefinition const& candidate)
-					{
-						enumIdentitiesByName[candidate.name()].insert(enumDefinitionIdentity(candidate));
-					});
+					{ enumIdentitiesByName[candidate.name()].insert(enumDefinitionIdentity(candidate)); });
 			}
 			catch (...)
 			{
@@ -899,6 +903,9 @@ struct StorageRefStep
 	} kind;
 	std::string field;	 ///< Kind::Field: struct member / flattened field name.
 	std::string keyTemp; ///< Kind::MappingKey / ArrayIndex: snapshot temp local name.
+	Type const* containerType = nullptr;
+	Type const* indexType = nullptr;
+	Type const* resultType = nullptr;
 };
 
 struct StorageRefTarget
@@ -914,8 +921,9 @@ struct StorageRefTarget
 	std::vector<StorageRefStep> steps; ///< Access steps in order, outermost first.
 	RootKind rootKind = RootKind::StateField;
 	Type const* rootType = nullptr; ///< Exact typed root for residual structural references.
-	Json rawSlot; ///< RootKind::RawSlot: exact caller-context slot-word expression.
-	bool snapshotAsTypedCall = false; ///< Raw-slot reinterpretation: pin the pure helper call, not a differently typed root alias.
+	Json rawSlot;					///< RootKind::RawSlot: exact caller-context slot-word expression.
+	bool snapshotAsTypedCall
+		= false; ///< Raw-slot reinterpretation: pin the pure helper call, not a differently typed root alias.
 
 	StorageRefTarget() = default;
 	StorageRefTarget(
@@ -923,13 +931,11 @@ struct StorageRefTarget
 		std::vector<StorageRefStep> _steps,
 		RootKind _rootKind = RootKind::StateField,
 		Type const* _rootType = nullptr,
-		Json _rawSlot = Json{}):
-		root(std::move(_root)),
-		steps(std::move(_steps)),
-		rootKind(_rootKind),
-		rootType(_rootType),
-		rawSlot(std::move(_rawSlot))
-	{}
+		Json _rawSlot = Json{})
+		: root(std::move(_root)), steps(std::move(_steps)), rootKind(_rootKind), rootType(_rootType),
+		  rawSlot(std::move(_rawSlot))
+	{
+	}
 };
 
 bool storageRefTargetsEqual(StorageRefTarget const& _lhs, StorageRefTarget const& _rhs)
@@ -1229,6 +1235,8 @@ Json aliasReadJson(StorageRefTarget const& _target)
 		{
 			next["kind"] = "internal_call";
 			next["function"] = "storage_array_slot_get";
+			next["authority"]
+				= runtimeCallAuthority("storage_array_slot_get", {step.containerType, step.indexType}, step.resultType);
 			next["args"] = Json::array();
 			next["args"].emplace_back(std::move(current));
 			next["args"].emplace_back(localExpr(step.keyTemp));
@@ -1295,7 +1303,7 @@ FunctionCall const* storageArrayPushLValueRoot(Expression const& _lhs)
 /// [P0 fail-closed: no silently dropped storage writes]
 ///
 /// Several assignment lowerings below emit a DISCARDED `expr` statement
-/// (`array_set_expr` / `struct_update` / `generic_assign` / `tuple_assign`)
+/// (`array_set_expr` / `mapping_set_expr` / `struct_update` / `generic_assign`)
 /// rather than a real `storage_set`/`storage_map_set`/`array_set`. Those are
 /// only sound because the generator's writeback pass re-roots them into a
 /// genuine read-modify-write storage update — and it can only do that when
@@ -1312,6 +1320,11 @@ FunctionCall const* storageArrayPushLValueRoot(Expression const& _lhs)
 /// alone: state variables, tracked aliases, and storage parameters have
 /// dedicated exact models, while an untracked storage local is caught by the
 /// write-through oracle. Memory/calldata roots remain ordinary value updates.
+FunctionDefinition const*
+resolveWriteOracleCallTarget(Expression const& _callee, ContractDefinition const* _mostDerivedContract);
+bool isKnownStorageSlotHelperOracle(FunctionDefinition const& _function);
+bool isDisjointConstantSlotArgument(FunctionCall const& _call);
+
 void requireLoweredStorageWriteRootOrThrow(Expression const& _lhs, std::string const& _shape)
 {
 	Expression const* root = peelLValueRoot(_lhs);
@@ -1329,6 +1342,9 @@ void requireLoweredStorageWriteRootOrThrow(Expression const& _lhs, std::string c
 	{
 		if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
 			if (namespacedGetterPrefix(*callee))
+				return;
+		if (FunctionDefinition const* target = resolveWriteOracleCallTarget(call->expression(), activeExportContract))
+			if (isKnownStorageSlotHelperOracle(*target) && isDisjointConstantSlotArgument(*call))
 				return;
 		if (exportResolvedStorageRefUse(*call))
 			return;
@@ -1382,9 +1398,29 @@ void requireLoweredStorageWriteRootOrThrow(Expression const& _lhs, std::string c
 struct StorageRefWriteThroughScanner: ASTConstVisitor
 {
 	std::set<VariableDeclaration const*> writtenThrough;
+	std::map<VariableDeclaration const*, VariableDeclaration const*> localAliasRoots;
 	bool followCalls = true;
 
 	explicit StorageRefWriteThroughScanner(bool _followCalls = true): followCalls(_followCalls) {}
+
+	/// Record a direct storage-local binding to the parameter at the root of its
+	/// initializer. Writes through the local must make that parameter structural
+	/// too; otherwise the body would emit first-class reference operations rooted
+	/// at an ordinary value parameter.
+	void noteLocalAlias(VariableDeclaration const* _local, Expression const& _initializer)
+	{
+		if (!_local || _local->isStateVariable()
+			|| _local->referenceLocation() != VariableDeclaration::Location::Storage)
+			return;
+		auto const* ident = dynamic_cast<Identifier const*>(peelLValueRoot(_initializer));
+		if (!ident)
+			return;
+		auto const* root = dynamic_cast<VariableDeclaration const*>(ident->annotation().referencedDeclaration);
+		if (isStorageRefParameter(root))
+			localAliasRoots[_local] = root;
+		else if (auto it = localAliasRoots.find(root); it != localAliasRoots.end())
+			localAliasRoots[_local] = it->second;
+	}
 
 	/// Record `_lhs`'s peeled root when it is a storage-located local/parameter
 	/// declaration. `_requireSteps` distinguishes an assignment (which must
@@ -1402,7 +1438,19 @@ struct StorageRefWriteThroughScanner: ASTConstVisitor
 		if (!decl || decl->isStateVariable())
 			return;
 		if (decl->referenceLocation() == VariableDeclaration::Location::Storage)
+		{
 			writtenThrough.insert(decl);
+			if (auto it = localAliasRoots.find(decl); it != localAliasRoots.end())
+				writtenThrough.insert(it->second);
+		}
+	}
+
+	bool visit(VariableDeclarationStatement const& _statement) override
+	{
+		if (_statement.initialValue())
+			for (auto const& declaration: _statement.declarations())
+				noteLocalAlias(declaration.get(), *_statement.initialValue());
+		return true;
 	}
 
 	bool visit(Assignment const& _assignment) override
@@ -1459,7 +1507,8 @@ struct StorageRefWriteThroughScanner: ASTConstVisitor
 		auto const* functionType = dynamic_cast<FunctionType const*>(_call.expression().annotation().type);
 		if (memberAccess && functionType && functionType->hasBoundFirstArgument())
 		{
-			VariableDeclaration const* parameter = callee->parameters().empty() ? nullptr : callee->parameters().front().get();
+			VariableDeclaration const* parameter
+				= callee->parameters().empty() ? nullptr : callee->parameters().front().get();
 			if (parameter && directWrites.writtenThrough.count(parameter))
 				noteRoot(memberAccess->expression(), /*_requireSteps=*/false);
 			parameterOffset = 1;
@@ -1550,6 +1599,15 @@ struct StorageRefShrinkScanner: ASTConstVisitor
 		return std::nullopt;
 	}
 
+	static bool pathContainsIndex(Expression const& _expr)
+	{
+		if (dynamic_cast<IndexAccess const*>(&_expr))
+			return true;
+		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_expr))
+			return pathContainsIndex(memberAccess->expression());
+		return false;
+	}
+
 	void noteShrink(Expression const& _base)
 	{
 		if (auto rootName = stateVarRootName(_base))
@@ -1578,8 +1636,9 @@ struct StorageRefShrinkScanner: ASTConstVisitor
 
 	bool visit(Assignment const& _assignment) override
 	{
-		if (isStorageLocated(_assignment.leftHandSide().annotation().type))
-			noteShrink(_assignment.leftHandSide());
+		Expression const& target = _assignment.leftHandSide();
+		if (isStorageLocated(target.annotation().type) && !pathContainsIndex(target))
+			noteShrink(target);
 		return true;
 	}
 };
@@ -1957,110 +2016,7 @@ Json canonicalStringTypedLiteral(std::string const& _value)
 // Do not infer this tag from the exported function name: a library with a
 // matching name/signature is not an OpenZeppelin Checkpoints declaration unless
 // its resolved AST declaration also belongs to one of the canonical OZ sources.
-bool isKnownOzCheckpointsQuery(FunctionDefinition const& _function)
-{
-	auto const* library = dynamic_cast<ContractDefinition const*>(_function.scope());
-	if (!library || !library->isLibrary() || _function.annotation().contract != library || !_function.isOrdinary()
-		|| !_function.isImplemented() || _function.visibility() != Visibility::Internal
-		|| _function.stateMutability() != StateMutability::View)
-		return false;
 
-	std::string const sourceName = library->sourceUnitName();
-	bool const legacySource = sourceName == "@openzeppelin/contracts/utils/Checkpoints.sol"
-							  || sourceName == "@openzeppelin/contracts-upgradeable/utils/CheckpointsUpgradeable.sol";
-	bool const modernSource = sourceName == "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
-	bool const upgradeableSource = sourceName == "@openzeppelin/contracts-upgradeable/utils/CheckpointsUpgradeable.sol";
-	std::string const expectedLibraryName = upgradeableSource ? "CheckpointsUpgradeable" : "Checkpoints";
-	if ((!legacySource && !modernSource) || library->name() != expectedLibraryName
-		|| library->fullyQualifiedName() != sourceName + ":" + expectedLibraryName)
-		return false;
-
-	auto const& sourceUnit = library->sourceUnit();
-	auto hasExpectedSourceLocation = [&sourceName](ASTNode const& _node)
-	{ return _node.location().sourceName && *_node.location().sourceName == sourceName; };
-	if (&sourceUnit != &_function.sourceUnit() || !sourceUnit.location().sourceName
-		|| *sourceUnit.location().sourceName != sourceName || !hasExpectedSourceLocation(sourceUnit)
-		|| !hasExpectedSourceLocation(*library) || !hasExpectedSourceLocation(_function)
-		|| !sourceUnit.location().contains(library->location())
-		|| !sourceUnit.location().contains(_function.location()))
-		return false;
-
-	auto const& parameters = _function.parameters();
-	auto const& returns = _function.returnParameters();
-	if (parameters.empty() || parameters.front()->referenceLocation() != VariableDeclaration::Location::Storage
-		|| returns.size() != 1)
-		return false;
-
-	auto const* selfType = dynamic_cast<StructType const*>(parameters.front()->type());
-	if (!selfType)
-		return false;
-	StructDefinition const& selfStruct = selfType->structDefinition();
-	if (selfStruct.scope() != library || &selfStruct.sourceUnit() != &sourceUnit
-		|| selfStruct.sourceUnitName() != sourceName || !hasExpectedSourceLocation(selfStruct)
-		|| !sourceUnit.location().contains(selfStruct.location()))
-		return false;
-
-	unsigned keyBits = 0;
-	unsigned valueBits = 0;
-	bool const isHistory = selfStruct.name() == "History" && legacySource;
-	if (isHistory)
-	{
-		keyBits = 32;
-		valueBits = 224;
-	}
-	else if (selfStruct.name() == "Trace224")
-	{
-		keyBits = 32;
-		valueBits = 224;
-	}
-	else if (selfStruct.name() == "Trace208" && modernSource)
-	{
-		keyBits = 48;
-		valueBits = 208;
-	}
-	else if (selfStruct.name() == "Trace256" && modernSource)
-	{
-		keyBits = 256;
-		valueBits = 256;
-	}
-	else if (selfStruct.name() == "Trace160")
-	{
-		keyBits = 96;
-		valueBits = 160;
-	}
-	else
-		return false;
-
-	auto isUnsignedInteger = [](Type const* _type, unsigned _bits)
-	{
-		auto const* integer = dynamic_cast<IntegerType const*>(_type);
-		return integer && !integer->isSigned() && integer->numBits() == _bits;
-	};
-
-	std::string const& functionName = _function.name();
-	if (functionName == "latest")
-		return parameters.size() == 1
-			   && (isHistory ? (isUnsignedInteger(returns.front()->type(), 224)
-								|| isUnsignedInteger(returns.front()->type(), 256))
-							 : isUnsignedInteger(returns.front()->type(), valueBits));
-	if (functionName == "length")
-		return parameters.size() == 1 && isUnsignedInteger(returns.front()->type(), 256);
-	if (functionName != "lowerLookup" && functionName != "upperLookup" && functionName != "upperLookupRecent")
-		return false;
-	return parameters.size() == 2 && isUnsignedInteger(parameters[1]->type(), keyBits)
-		   && isUnsignedInteger(returns.front()->type(), valueBits);
-}
-
-void addInternalLibraryCallContractId(Json& _result, FunctionDefinition const& _function)
-{
-	auto const* library = dynamic_cast<ContractDefinition const*>(_function.scope());
-	if (!library || !library->isLibrary())
-		return;
-
-	_result["contractId"] = exportedContractId(*library);
-	if (isKnownOzCheckpointsQuery(_function))
-		_result["runtimeKind"] = "oz_checkpoints_query";
-}
 
 std::string solcoreDeployedCodeSize(ContractDefinition const& _contract)
 {
@@ -2284,21 +2240,129 @@ std::optional<Json> exportStorageGetterResolution(
 		return std::nullopt;
 	return exportStorageGetterResolution(_compilerStack, _contract, *stateVar, keyArgOrder);
 }
+Json declaredTypeNameCarrierBase(VariableDeclaration const& _declaration)
+{
+	Json location = dataLocationEntry(_declaration);
+	bool const storage = location.is_string() && location.get<std::string>() == "storage";
+	return exportTypeName(_declaration.typeName(), storage);
+}
 
-Json exportResolvedType(Type const* _type, bool _storage = false);
+Json declaredVariableCarrier(VariableDeclaration const& _declaration)
+{
+	Json carrier = declaredTypeNameCarrierBase(_declaration);
+	Json location = dataLocationEntry(_declaration);
+	if (location.is_string() && location.get<std::string>() == "memory")
+	{
+		Json memoryRef = Json::object();
+		memoryRef["kind"] = "memory_ref";
+		memoryRef["referent"] = std::move(carrier);
+		return memoryRef;
+	}
+	return carrier;
+}
+Json effectiveDeclarationParameterCarrier(
+	FunctionDefinition const& _function, VariableDeclaration const& _parameter, bool _rawSlot = false)
+{
+	if (isStructuralStorageRefParameter(_function, &_parameter))
+		return _rawSlot ? Json("u256") : storageRefWireType(_parameter.annotation().type);
+	return declaredVariableCarrier(_parameter);
+}
+
+Json effectiveDeclarationReturnCarrier(VariableDeclaration const& _return)
+{
+	Json location = dataLocationEntry(_return);
+	if (location.is_string() && location.get<std::string>() == "storage")
+		return storageRefWireType(_return.annotation().type);
+	return declaredVariableCarrier(_return);
+}
+
+Json effectiveDeclarationResultCarrier(FunctionDefinition const& _function)
+{
+	if (_function.returnParameters().empty())
+		return Json("unit");
+	if (_function.returnParameters().size() == 1)
+		return effectiveDeclarationReturnCarrier(*_function.returnParameters().front());
+	Json tupleType = Json::object();
+	tupleType["kind"] = "tuple";
+	tupleType["elements"] = Json::array();
+	for (auto const& parameter: _function.returnParameters())
+		tupleType["elements"].emplace_back(effectiveDeclarationReturnCarrier(*parameter));
+	return tupleType;
+}
+
+
+Json sourceCallAuthority(
+	FunctionDefinition const& _function,
+	std::optional<std::string> _selectedTargetContractId = std::nullopt,
+	std::optional<size_t> _effectiveArity = std::nullopt)
+{
+	Json authority = Json::object();
+	authority["kind"] = "source";
+	authority["declarationId"] = std::to_string(_function.id());
+	authority["declarationContractId"] = internalFnContractId(_function);
+	authority["targetContractId"] = _selectedTargetContractId.value_or(
+		activeExportContract && dynamic_cast<ContractDefinition const*>(_function.scope())
+			? exportedContractId(*activeExportContract)
+			: internalFnContractId(_function));
+	authority["argTypes"] = Json::array();
+	size_t eraseCount = _effectiveArity && *_effectiveArity < _function.parameters().size()
+							? _function.parameters().size() - *_effectiveArity
+							: 0;
+	for (auto const& parameter: _function.parameters())
+	{
+		auto const* fnType = dynamic_cast<FunctionType const*>(parameter->annotation().type);
+		if (eraseCount > 0 && fnType && fnType->kind() == FunctionType::Kind::Internal)
+		{
+			--eraseCount;
+			continue;
+		}
+		authority["argTypes"].emplace_back(effectiveDeclarationParameterCarrier(_function, *parameter));
+	}
+	if (eraseCount != 0)
+		throw UnsupportedSolCore(
+			"Specialized source-call authority could not identify every erased declaration parameter.");
+	authority["resultType"] = effectiveDeclarationResultCarrier(_function);
+	return authority;
+}
+
+Json runtimeCallAuthority(std::string const& _runtimeKind, std::vector<Type const*> const& _inputs, Type const* _result)
+{
+	Json authority = Json::object();
+	authority["kind"] = "runtime";
+	authority["runtimeKind"] = _runtimeKind;
+	authority["inputTypes"] = Json::array();
+	for (Type const* input: _inputs)
+		authority["inputTypes"].emplace_back(exportResolvedType(input));
+	authority["resultType"] = _result ? exportResolvedType(_result) : Json("unit");
+	return authority;
+}
+
+char const* aggregateSetRuntimeKind(Type const* _baseType)
+{
+	if (dynamic_cast<MappingType const*>(_baseType))
+		return "mapping_set_expr";
+	if (dynamic_cast<ArrayType const*>(_baseType))
+		return "array_set_expr";
+	throw UnsupportedSolCore("Aggregate index assignment requires an exact mapping or array carrier.");
+}
+
+Type const* aggregateIndexCarrierType(IndexAccess const& _access)
+{
+	Type const* baseType = _access.baseExpression().annotation().type;
+	if (auto const* mappingType = dynamic_cast<MappingType const*>(baseType))
+		return mappingType->keyType();
+	if (dynamic_cast<ArrayType const*>(baseType) || dynamic_cast<FixedBytesType const*>(baseType))
+		return TypeProvider::uint256();
+	throw UnsupportedSolCore("Index access requires an exact mapping key or array index carrier.");
+}
+
 
 Json exportByteHelperArgumentType(Type const* _type)
 {
-	if (
-		_type
-		&& (
-			_type->category() == Type::Category::StringLiteral
-			|| (
-				_type->category() == Type::Category::Array
-				&& dynamic_cast<ArrayType const*>(_type)->isByteArrayOrString()
-			)
-		)
-	)
+	if (_type
+		&& (_type->category() == Type::Category::StringLiteral
+			|| (_type->category() == Type::Category::Array
+				&& dynamic_cast<ArrayType const*>(_type)->isByteArrayOrString())))
 	{
 		Json byteArrayType = Json::object();
 		byteArrayType["kind"] = "named";
@@ -2326,22 +2390,71 @@ std::optional<Json> exportReturnType(TypePointers const& _returns)
 	return tupleType;
 }
 
+/// ABI `internalType` identity aligned with the exact nominal carrier emitted
+/// by [exportResolvedType]. Solc's ordinary spelling omits the source scope for
+/// file-level structs and enums, so it is ambiguous when another declaration
+/// in the compiler stack has the same bare name. Preserve the ordinary spelling
+/// when it is already unique; otherwise carry the exporter's collision-free
+/// identity through every enclosing array dimension.
+std::string exportedAbiInternalType(Type const& _type)
+{
+	if (auto const* structType = dynamic_cast<StructType const*>(&_type))
+	{
+		StructDefinition const& definition = structType->structDefinition();
+		std::string const exported = exportedStructName(definition);
+		return exported == definition.name() ? _type.toString(true) : "struct " + exported;
+	}
+	if (auto const* enumType = dynamic_cast<EnumType const*>(&_type))
+	{
+		EnumDefinition const& definition = enumType->enumDefinition();
+		std::string const exported = exportedEnumName(definition);
+		return exported == definition.name() ? _type.toString(true) : "enum " + exported;
+	}
+	if (auto const* arrayType = dynamic_cast<ArrayType const*>(&_type))
+	{
+		Type const* baseType = arrayType->baseType();
+		if (!baseType)
+			throw UnsupportedSolCore("Compiler-resolved ABI array lost its base type.");
+		std::string const exportedBase = exportedAbiInternalType(*baseType);
+		if (exportedBase == baseType->toString(true))
+			return _type.toString(true);
+		return exportedBase + (arrayType->isDynamicallySized() ? "[]" : "[" + arrayType->length().str() + "]");
+	}
+	if (auto const* mappingType = dynamic_cast<MappingType const*>(&_type))
+	{
+		Type const* keyType = mappingType->keyType();
+		Type const* valueType = mappingType->valueType();
+		if (!keyType || !valueType)
+			throw UnsupportedSolCore("Compiler-resolved ABI mapping lost its key or value type.");
+		std::string const exportedKey = exportedAbiInternalType(*keyType);
+		std::string const exportedValue = exportedAbiInternalType(*valueType);
+		if (exportedKey == keyType->toString(true) && exportedValue == valueType->toString(true))
+			return _type.toString(true);
+		return "mapping(" + exportedKey + " => " + exportedValue + ")";
+	}
+	return _type.toString(true);
+}
+
+
 Json exportAbiDescriptor(
-	std::string const& _name,
-	Type const* _encodingType,
-	Type const* _solidityType,
-	bool _forLibrary)
+	std::string const& _name, Type const* _encodingType, Type const* _solidityType, bool _forLibrary)
 {
 	if (!_encodingType || !_solidityType)
 		throw UnsupportedSolCore("ABI descriptor requires compiler-resolved encoding and Solidity types.");
 
 	Json result = Json::object();
 	result["name"] = _name;
-	result["internalType"] = _solidityType->toString(true);
+	result["internalType"] = exportedAbiInternalType(*_solidityType);
 	result["components"] = Json::array();
+	if (_forLibrary)
+	{
+		std::string selectorType = _encodingType->signatureInExternalFunction(true);
+		if (_encodingType->dataStoredIn(DataLocation::Storage))
+			selectorType += " storage";
+		result["selectorType"] = std::move(selectorType);
+	}
 
-	bool const libraryStoragePointer
-		= _forLibrary && _encodingType->dataStoredIn(DataLocation::Storage);
+	bool const libraryStoragePointer = _forLibrary && _encodingType->dataStoredIn(DataLocation::Storage);
 	if (_encodingType->isValueType() || libraryStoragePointer)
 	{
 		// A library's interface type deliberately retains nominal enums for
@@ -2373,16 +2486,10 @@ Json exportAbiDescriptor(
 		// Inside a wire-encoded array the elements are encoded inline; the
 		// library-only storage-pointer spelling applies to top-level
 		// parameters only (storage aggregates never reach this branch).
-		Json element = exportAbiDescriptor(
-			"",
-			arrayType->baseType(),
-			solidityArrayType->baseType(),
-			false);
+		Json element = exportAbiDescriptor("", arrayType->baseType(), solidityArrayType->baseType(), false);
 		if (!element["type"].is_string() || !element["components"].is_array())
 			throw UnsupportedSolCore("Compiler-resolved ABI array element has a malformed descriptor.");
-		std::string suffix = arrayType->isDynamicallySized()
-								 ? "[]"
-								 : "[" + arrayType->length().str() + "]";
+		std::string suffix = arrayType->isDynamicallySized() ? "[]" : "[" + arrayType->length().str() + "]";
 		result["type"] = element["type"].get<std::string>() + suffix;
 		result["components"] = std::move(element["components"]);
 		return result;
@@ -2391,10 +2498,7 @@ Json exportAbiDescriptor(
 	if (auto const* structType = dynamic_cast<StructType const*>(_encodingType))
 	{
 		auto const* solidityStructType = dynamic_cast<StructType const*>(_solidityType);
-		if (
-			!solidityStructType
-			|| &structType->structDefinition() != &solidityStructType->structDefinition()
-		)
+		if (!solidityStructType || &structType->structDefinition() != &solidityStructType->structDefinition())
 			throw UnsupportedSolCore("Compiler-resolved ABI tuple lost its Solidity struct identity.");
 		result["type"] = "tuple";
 		for (auto const& member: solidityStructType->structDefinition().members())
@@ -2411,11 +2515,8 @@ Json exportAbiDescriptor(
 			if (!encodingMemberType)
 				throw UnsupportedSolCore(
 					"ABI struct member '" + member->name() + "' has no compiler-resolved external type.");
-			result["components"].emplace_back(exportAbiDescriptor(
-				member->name(),
-				encodingMemberType,
-				solidityMemberType,
-				false));
+			result["components"].emplace_back(
+				exportAbiDescriptor(member->name(), encodingMemberType, solidityMemberType, false));
 		}
 		return result;
 	}
@@ -2430,11 +2531,8 @@ Json exportAbiDescriptor(
 		{
 			if (!tupleType->components()[i] || !solidityTupleType->components()[i])
 				throw UnsupportedSolCore("Compiler-resolved ABI tuple contains an omitted component.");
-			result["components"].emplace_back(exportAbiDescriptor(
-				"",
-				tupleType->components()[i],
-				solidityTupleType->components()[i],
-				false));
+			result["components"].emplace_back(
+				exportAbiDescriptor("", tupleType->components()[i], solidityTupleType->components()[i], false));
 		}
 		return result;
 	}
@@ -2484,8 +2582,7 @@ FunctionAbiDescriptors exportFunctionAbiDescriptors(FunctionType const& _funType
 	FunctionTypePointer interfaceType = _funType.interfaceFunctionType();
 	if (!interfaceType)
 		throw UnsupportedSolCore(
-			"Function '" + _funType.declaration().name()
-			+ "' has no compiler-resolved external ABI type.");
+			"Function '" + _funType.declaration().name() + "' has no compiler-resolved external ABI type.");
 
 	bool forLibrary = false;
 	if (auto const* contract = dynamic_cast<ContractDefinition const*>(_funType.declaration().scope()))
@@ -2501,19 +2598,12 @@ FunctionAbiDescriptors exportFunctionAbiDescriptors(FunctionType const& _funType
 				+ "' has inconsistent compiler-resolved ABI parameter metadata.");
 		Json descriptors = Json::array();
 		for (size_t i = 0; i < _names.size(); ++i)
-			descriptors.emplace_back(exportAbiDescriptor(
-				_names[i],
-				_encodingTypes[i],
-				_solidityTypes[i],
-				forLibrary));
+			descriptors.emplace_back(exportAbiDescriptor(_names[i], _encodingTypes[i], _solidityTypes[i], forLibrary));
 		return descriptors;
 	};
 
 	return FunctionAbiDescriptors{
-		exportList(
-			interfaceType->parameterNames(),
-			interfaceType->parameterTypes(),
-			_funType.parameterTypes()),
+		exportList(interfaceType->parameterNames(), interfaceType->parameterTypes(), _funType.parameterTypes()),
 		exportList(
 			interfaceType->returnParameterNames(),
 			interfaceType->returnParameterTypes(),
@@ -2551,10 +2641,7 @@ Json exportForeignMethodSummary(FunctionTypePointer const& _funType)
 	return method;
 }
 
-Json exportRevertPayload(
-	FunctionCall const& _call,
-	bool _unconditionalPayload,
-	bool _includeRuntimeArgs = true);
+Json exportRevertPayload(FunctionCall const& _call, bool _unconditionalPayload, bool _includeRuntimeArgs = true);
 
 Json exportDispatchEntry(FunctionTypePointer const& _funType, FunctionDefinition const* _functionDef = nullptr)
 {
@@ -2562,10 +2649,18 @@ Json exportDispatchEntry(FunctionTypePointer const& _funType, FunctionDefinition
 		throw UnsupportedSolCore("Dispatch entry has no compiler-resolved function type.");
 	FunctionAbiDescriptors abi = exportFunctionAbiDescriptors(*_funType);
 	Json entry = Json::object();
+	entry["declarationId"] = std::to_string(_funType->declaration().id());
+	bool implemented = false;
+	if (_functionDef)
+		implemented = _functionDef->isImplemented();
+	else if (auto const* variable = dynamic_cast<VariableDeclaration const*>(&_funType->declaration()))
+		implemented = variable->isStateVariable();
+	entry["implemented"] = implemented;
 	entry["abiFunction"] = _funType->declaration().name();
 	entry["function"] = _functionDef ? exportedFunctionName(*_functionDef) : _funType->declaration().name();
 	entry["signature"] = _funType->externalSignature();
 	entry["selector"] = _funType->externalIdentifierHex();
+	entry["stateMutability"] = stateMutabilityToString(_funType->stateMutability());
 	entry["paramsAbi"] = std::move(abi.params);
 	entry["returnsAbi"] = std::move(abi.returns);
 	if (auto returnType = exportReturnType(_funType->returnParameterTypes()))
@@ -2581,6 +2676,19 @@ Json exportDispatchEntry(FunctionTypePointer const& _funType, FunctionDefinition
 			Json location = retParam ? dataLocationEntry(*retParam) : Json();
 			if (!location.is_null())
 				anyLocation = true;
+			returnLocations.emplace_back(std::move(location));
+		}
+		if (anyLocation)
+			entry["returnLocations"] = std::move(returnLocations);
+	}
+	else
+	{
+		Json returnLocations = Json::array();
+		bool anyLocation = false;
+		for (auto const* returnType: _funType->returnParameterTypes())
+		{
+			Json location = dataLocationEntry(returnType);
+			anyLocation = anyLocation || !location.is_null();
 			returnLocations.emplace_back(std::move(location));
 		}
 		if (anyLocation)
@@ -2748,12 +2856,35 @@ Json exportForeignContractSummary(CompilerStack const& _compilerStack, std::stri
 				"Foreign contract '" + contract.name()
 				+ "' has an interface entry without a compiler-resolved function type.");
 		methods.emplace_back(exportForeignMethodSummary(functionType));
-		dispatchEntries.emplace_back(exportDispatchEntry(
-			functionType, dynamic_cast<FunctionDefinition const*>(&functionType->declaration())));
+		dispatchEntries.emplace_back(
+			exportDispatchEntry(functionType, dynamic_cast<FunctionDefinition const*>(&functionType->declaration())));
 	}
 	summary["methods"] = methods;
 	summary["dispatch_entries"] = dispatchEntries;
 	return summary;
+}
+
+FunctionType const&
+resolveExternalDispatchType(ContractDefinition const& _targetContract, FunctionType const& _staticType)
+{
+	std::string const selector = _staticType.externalIdentifierHex();
+	FunctionType const* selected = nullptr;
+	for (auto const& [entrySelector, candidate]: _targetContract.interfaceFunctions())
+	{
+		(void) entrySelector;
+		if (!candidate || candidate->externalIdentifierHex() != selector)
+			continue;
+		if (selected)
+			throw UnsupportedSolCore(
+				"External selector '" + selector + "' has multiple exact dispatch targets in contract '"
+				+ _targetContract.name() + "'.");
+		selected = &*candidate;
+	}
+	if (!selected)
+		throw UnsupportedSolCore(
+			"External selector '" + selector + "' has no exact dispatch target in contract '" + _targetContract.name()
+			+ "'.");
+	return *selected;
 }
 
 std::optional<Json> exportKnownExternalTarget(CompilerStack const& _compilerStack, MemberAccess const& _memberAccess)
@@ -2774,19 +2905,20 @@ std::optional<Json> exportKnownExternalTarget(CompilerStack const& _compilerStac
 	target["function"] = _memberAccess.memberName();
 	target["resolutionKind"] = "cross_contract";
 
-	auto const* functionType = dynamic_cast<FunctionType const*>(_memberAccess.annotation().type);
-	if (!functionType)
+	auto const* staticFunctionType = dynamic_cast<FunctionType const*>(_memberAccess.annotation().type);
+	if (!staticFunctionType)
 		throw UnsupportedSolCore(
-			"Known external target '" + _memberAccess.memberName()
-			+ "' has no compiler-resolved function type.");
-	FunctionAbiDescriptors abi = exportFunctionAbiDescriptors(*functionType);
-	target["signature"] = functionType->externalSignature();
-	target["selector"] = functionType->externalIdentifierHex();
-	target["mutability"] = externalMutabilityString(functionType->stateMutability());
+			"Known external target '" + _memberAccess.memberName() + "' has no compiler-resolved function type.");
+	FunctionType const& functionType = resolveExternalDispatchType(*targetContract, *staticFunctionType);
+	FunctionAbiDescriptors abi = exportFunctionAbiDescriptors(functionType);
+	target["signature"] = functionType.externalSignature();
+	target["selector"] = functionType.externalIdentifierHex();
+	target["mutability"] = externalMutabilityString(functionType.stateMutability());
 	target["paramsAbi"] = std::move(abi.params);
 	target["returnsAbi"] = std::move(abi.returns);
-	if (auto const* variableDef
-		= dynamic_cast<VariableDeclaration const*>(_memberAccess.annotation().referencedDeclaration))
+
+	Declaration const& targetDeclaration = functionType.declaration();
+	if (auto const* variableDef = dynamic_cast<VariableDeclaration const*>(&targetDeclaration))
 	{
 		target["selector"] = variableDef->externalIdentifierHex();
 		if (auto resolution = exportStorageGetterResolution(_compilerStack, *targetContract, *variableDef, {}))
@@ -2795,24 +2927,8 @@ std::optional<Json> exportKnownExternalTarget(CompilerStack const& _compilerStac
 			target["resolution"] = *resolution;
 		}
 	}
-	else if (
-		auto const* functionDef
-		= dynamic_cast<FunctionDefinition const*>(_memberAccess.annotation().referencedDeclaration))
+	else if (auto const* functionDef = dynamic_cast<FunctionDefinition const*>(&targetDeclaration))
 	{
-		FunctionType functionType(*functionDef);
-		if (FunctionType const* iface = functionType.interfaceFunctionType())
-		{
-			if (!target.contains("signature"))
-				target["signature"] = iface->externalSignature();
-			if (!target.contains("selector"))
-				target["selector"] = iface->externalIdentifierHex();
-			if (!target.contains("mutability"))
-				target["mutability"] = externalMutabilityString(iface->stateMutability());
-		}
-		else if (!target.contains("mutability"))
-			target["mutability"] = externalMutabilityString(functionDef->stateMutability());
-		if (!target.contains("selector"))
-			target["selector"] = functionDef->externalIdentifierHex();
 		if (auto resolution = exportStorageGetterResolution(_compilerStack, *targetContract, *functionDef))
 		{
 			target["resolutionKind"] = "storage_getter";
@@ -2983,8 +3099,7 @@ Json exportTypeName(TypeName const& _typeName, bool _storage)
 					"refusing to guess the storage layout.");
 			u256 const len = resolvedArrayType->length();
 			if (len > std::numeric_limits<unsigned long>::max())
-				throw UnsupportedSolCore(
-					"Fixed-size array length exceeds the exporter's representable range.");
+				throw UnsupportedSolCore("Fixed-size array length exceeds the exporter's representable range.");
 			result["kind"] = _storage ? "storage_fixed_array" : "fixed_array";
 			result["element"] = element;
 			result["size"] = len.convert_to<unsigned long>();
@@ -3119,34 +3234,35 @@ char const* dataLocationName(DataLocation _loc)
 	return "memory";
 }
 
-/// The wire data-location entry for a declared parameter/return variable:
-/// a location string for reference-typed (and mapping-typed) declarations,
-/// JSON null for value-typed ones (which have no data location). Mapping
+/// The wire data-location entry for a compiler-resolved parameter/return
+/// type: a location string for reference-typed (and mapping-typed) values,
+/// JSON null for value types (which have no data location). Mapping
 /// types are not ReferenceType in solc's hierarchy but are storage-only by
 /// language rule; emitted explicitly so they do not read as location-less.
-Json dataLocationEntry(VariableDeclaration const& _decl)
+Json dataLocationEntry(Type const* _type)
 {
-	if (auto const* type = _decl.annotation().type)
+	if (_type)
 	{
-		if (auto const* refType = dynamic_cast<ReferenceType const*>(type))
+		if (auto const* refType = dynamic_cast<ReferenceType const*>(_type))
 			return Json(dataLocationName(refType->location()));
-		if (type->category() == Type::Category::Mapping)
+		if (_type->category() == Type::Category::Mapping)
 			return Json("storage");
 	}
 	return Json();
 }
 
-Json exportParam(
-	VariableDeclaration const& _decl,
-	bool _abiVisible = false,
-	bool _forLibrary = false)
+Json dataLocationEntry(VariableDeclaration const& _decl)
+{
+	return dataLocationEntry(_decl.annotation().type);
+}
+
+Json exportParam(VariableDeclaration const& _decl, bool _abiVisible = false, bool _forLibrary = false)
 {
 	Json result = Json::object();
 	result["sourceDeclarationId"] = std::to_string(_decl.id());
 	result["name"] = _decl.name().empty() ? ("arg" + std::to_string(stableSyntheticNodeId(_decl))) : _decl.name();
 	Json location = dataLocationEntry(_decl);
-	bool storage = location.is_string() && location.get<std::string>() == "storage";
-	result["type"] = exportTypeName(_decl.typeName(), storage);
+	result["type"] = declaredTypeNameCarrierBase(_decl);
 	if (!location.is_null())
 		result["location"] = std::move(location);
 	if (_abiVisible)
@@ -3194,10 +3310,8 @@ bool inheritedConstructorHasWork(ContractDefinition const& _contract)
 		FunctionDefinition const* baseConstructor = base->constructor();
 		if (!baseConstructor)
 			continue;
-		if (
-			(baseConstructor->isImplemented() && !baseConstructor->body().statements().empty())
-			|| _contract.annotation().baseConstructorArguments.count(baseConstructor) != 0
-		)
+		if ((baseConstructor->isImplemented() && !baseConstructor->body().statements().empty())
+			|| _contract.annotation().baseConstructorArguments.count(baseConstructor) != 0)
 			return true;
 	}
 	return false;
@@ -3370,8 +3484,7 @@ Json exportEvent(EventDefinition const& _event)
 	std::string compilerSignature = eventSoliditySignature(_event);
 	if (compilerSignature.empty() || compilerSignature != descriptorSignature)
 		throw UnsupportedSolCore(
-			"Event '" + _event.name()
-			+ "' has inconsistent compiler-resolved signature and ABI descriptors.");
+			"Event '" + _event.name() + "' has inconsistent compiler-resolved signature and ABI descriptors.");
 	result["signature"] = std::move(descriptorSignature);
 	return result;
 }
@@ -3395,12 +3508,16 @@ std::string runtimeFieldForMagicMember(std::string const& _base, std::string con
 	// from a declaration name or constrain it to the immediate caller.
 	if (_base == "tx" && _member == "origin")
 		return "origin";
+	if (_base == "tx" && _member == "gasprice")
+		return "gasPrice";
 	if (_base == "block")
 	{
 		if (_member == "timestamp")
 			return "blockTimestamp";
 		if (_member == "number")
 			return "blockNumber";
+		if (_member == "basefee")
+			return "baseFee";
 		if (_member == "chainid")
 			return "chainId";
 	}
@@ -3408,16 +3525,15 @@ std::string runtimeFieldForMagicMember(std::string const& _base, std::string con
 }
 
 Json exportExpr(Expression const& _expr);
+Json exportDirectAssignment(Expression const& _lhs, Json const& _value);
 Json exportHoistedUnaryMutation(UnaryOperation const& _unary);
 Json exportHoistedAssignExpr(Assignment const& _assignment);
 std::optional<Json> exportStorageRefValue(Expression const& _expr);
 bool hasResidualStorageRefRoot(Expression const& _expr);
 bool isStorageReferenceType(Type const* _type);
 Json storageRefWireType(Type const* _referentType);
-std::optional<StorageRefTarget> resolveStorageRefCallRoot(
-	FunctionCall const& _call,
-	ASTNode const& _snapshotOwner,
-	std::vector<Json>& _snapshots);
+std::optional<StorageRefTarget>
+resolveStorageRefCallRoot(FunctionCall const& _call, ASTNode const& _snapshotOwner, std::vector<Json>& _snapshots);
 
 
 /// Static selector node for `abi.encodeCall`'s first argument when it names a
@@ -3688,6 +3804,26 @@ Json captureMeasuredOrderChild(Expression const& _expr, std::string const& _labe
 	return pinExpressionOnce(_expr, _label);
 }
 
+void appendDiscardedMeasuredExpression(Expression const& _expr)
+{
+	HoistScope* parent = activeHoistScope;
+	if (!parent || !parent->allowed)
+		throw UnsupportedSolCore("Measured discarded tuple component requires a once-evaluated statement context.");
+	Json value;
+	std::vector<Json> nested;
+	{
+		HoistScopeGuard childScope({&_expr});
+		value = exportExpr(_expr);
+		nested = childScope.takeStatements();
+	}
+	for (Json& statement: nested)
+		parent->statements.emplace_back(std::move(statement));
+	Json discarded = Json::object();
+	discarded["kind"] = "expr";
+	discarded["value"] = std::move(value);
+	parent->statements.emplace_back(std::move(discarded));
+}
+
 /// Materialize the executable children of an assignment lvalue in the order
 /// used by the compiler's legacy Assignment/IndexAccess visitors: after the
 /// RHS, tuple components are visited left-to-right and an index visits its
@@ -3700,8 +3836,7 @@ void pinAssignmentLValueChildren(Expression const& _lvalue, std::string const& _
 		if (!tuple->isInlineArray())
 			for (size_t i = 0; i < tuple->components().size(); ++i)
 				if (tuple->components()[i])
-					pinAssignmentLValueChildren(
-						*tuple->components()[i], _label + "_tuple_" + std::to_string(i));
+					pinAssignmentLValueChildren(*tuple->components()[i], _label + "_tuple_" + std::to_string(i));
 		return;
 	}
 	if (auto const* index = dynamic_cast<IndexAccess const*>(&_lvalue))
@@ -3722,9 +3857,12 @@ void pinAssignmentLValueChildren(Expression const& _lvalue, std::string const& _
 		// as `getStringSlot(store)` may not yet be registered as residual roots
 		// at this early LHS snapshot point, but their annotated result is still
 		// a first-class storage reference and must take the typed-reference pin.
-		if (isStorageReferenceType(_lvalue.annotation().type)
-			|| hasResidualStorageRefRoot(_lvalue))
+		if (isStorageReferenceType(_lvalue.annotation().type) || hasResidualStorageRefRoot(_lvalue))
+		{
+			if (exportResolvedStorageRefUse(_lvalue))
+				return;
 			(void) pinExpressionOnce(_lvalue, _label, nullptr, /*_storageRefValue=*/true);
+		}
 		else
 			(void) captureMeasuredOrderChild(_lvalue, _label);
 	}
@@ -3743,8 +3881,7 @@ struct CallEvaluation
 /// FunctionCallOptions::names/options in source order. Every participant is
 /// captured when any participant is order-observable, so no expression can be
 /// duplicated by later field-specific lowering.
-CallEvaluation
-exportCallEvaluation(
+CallEvaluation exportCallEvaluation(
 	FunctionCall const& _call,
 	Expression const& _target,
 	FunctionCallOptions const* _options,
@@ -3765,7 +3902,8 @@ exportCallEvaluation(
 	// calls map through the callee's parameter names. Any shape this cannot
 	// map exactly (arity mismatch, unknown name) keeps the typeless pin, whose
 	// rational-type export stays fail-closed.
-	auto destinationType = [&](size_t sourceIndex) -> Type const* {
+	auto destinationType = [&](size_t sourceIndex) -> Type const*
+	{
 		if (!_calleeType)
 			return nullptr;
 		auto const& parameterTypes = _calleeType->parameterTypes();
@@ -3939,8 +4077,101 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 
 	ExternalIdentifierInfo const* rhsOrigin = nullptr;
 	bool sawReturnAssignment = false;
-	bool sawNonMove = false;
 	yul::Block const& root = assembly->operations().root();
+	auto yulCall = [&](yul::Expression const& _expr, std::string const& _name) -> yul::FunctionCall const*
+	{
+		auto const* call = std::get_if<yul::FunctionCall>(&_expr);
+		if (!call || yul::resolveFunctionName(call->functionName, assembly->dialect()) != _name)
+			return nullptr;
+		return call;
+	};
+	auto yulLiteralIs = [&](yul::Expression const& _expr, std::string const& _value)
+	{
+		auto const* literal = std::get_if<yul::Literal>(&_expr);
+		if (!literal)
+			return false;
+		try
+		{
+			return bigint(yul::formatLiteral(*literal)) == bigint(_value);
+		}
+		catch (...)
+		{
+			return false;
+		}
+	};
+	auto mstoreValue = [&](yul::Statement const& _statement, std::string const& _offset)
+		-> yul::Expression const*
+	{
+		auto const* expressionStatement = std::get_if<yul::ExpressionStatement>(&_statement);
+		if (!expressionStatement)
+			return nullptr;
+		auto const* call = yulCall(expressionStatement->expression, "mstore");
+		if (!call || call->arguments.size() != 2 || !yulLiteralIs(call->arguments[0], _offset))
+			return nullptr;
+		return &call->arguments[1];
+	};
+	if (root.statements.size() == 3)
+	{
+		yul::Expression const* seedExpr = mstoreValue(root.statements[0], "4");
+		yul::Expression const* slotExpr = mstoreValue(root.statements[1], "0");
+		auto const* assignment = std::get_if<yul::Assignment>(&root.statements[2]);
+		auto const* hashCall = assignment && assignment->value
+			? yulCall(*assignment->value, "keccak256")
+			: nullptr;
+		bool const exactHashWindow = hashCall && hashCall->arguments.size() == 2
+									 && yulLiteralIs(hashCall->arguments[0], "0")
+									 && yulLiteralIs(hashCall->arguments[1], "36");
+		bool assignsReturnSlot = false;
+		if (assignment && assignment->variableNames.size() == 1)
+		{
+			auto lhsReference = references.find(&assignment->variableNames.front());
+			assignsReturnSlot = lhsReference != references.end()
+								&& lhsReference->second.declaration == returnSlot
+								&& lhsReference->second.suffix == "slot";
+		}
+		auto const* seedIdentifier = seedExpr ? std::get_if<yul::Identifier>(seedExpr) : nullptr;
+		auto const* slotIdentifier = slotExpr ? std::get_if<yul::Identifier>(slotExpr) : nullptr;
+		auto seedReference = seedIdentifier ? references.find(seedIdentifier) : references.end();
+		auto slotReference = slotIdentifier ? references.find(slotIdentifier) : references.end();
+		if (
+			assignsReturnSlot && exactHashWindow && seedReference != references.end()
+			&& slotReference != references.end() && slotReference->second.suffix == "slot"
+			&& seedReference->second.suffix.empty())
+		{
+			auto const* slotParameter
+				= dynamic_cast<VariableDeclaration const*>(slotReference->second.declaration);
+			auto const* seedDeclaration
+				= dynamic_cast<VariableDeclaration const*>(seedReference->second.declaration);
+			auto argument = slotParameter ? _paramBinding.find(slotParameter) : _paramBinding.end();
+			if (
+				argument == _paramBinding.end() || !argument->second || !isStorageRefParameter(slotParameter)
+				|| !seedDeclaration || !seedDeclaration->isConstant() || !seedDeclaration->value())
+				throw UnsupportedSolCore(
+					"Assembly-assigned storage-pointer return scratch hash lacks exact parameter or constant provenance.");
+			auto reference = exportStorageRefValue(*argument->second);
+			if (!reference)
+				throw UnsupportedSolCore(
+					"Assembly-assigned storage-pointer return scratch hash has an unresolved storage-reference argument.");
+			Json helper = Json::object();
+			helper["kind"] = "internal_call";
+			helper["function"] = "storage_ref_keccak_slot__" + std::to_string(returnSlot->id());
+			Json authority = Json::object();
+			authority["kind"] = "runtime";
+			authority["runtimeKind"] = helper["function"];
+			authority["inputTypes"] = Json::array(
+				{storageRefWireType(slotParameter->annotation().type), exportResolvedType(seedDeclaration->annotation().type)});
+			authority["resultType"] = "u256";
+			helper["authority"] = std::move(authority);
+			helper["args"] = Json::array({std::move(*reference), exportExpr(*seedDeclaration->value())});
+			StorageRefTarget target;
+			target.rootKind = StorageRefTarget::RootKind::RawSlot;
+			target.rootType = returnSlot->annotation().type;
+			target.rawSlot = std::move(helper);
+			return target;
+		}
+	}
+
+	bool sawNonMove = false;
 	for (yul::Statement const& statement: root.statements)
 	{
 		if (auto const* declaration = std::get_if<yul::VariableDeclaration>(&statement))
@@ -3951,9 +4182,7 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 				continue;
 			}
 			std::string const name = declaration->variables.front().name.str();
-			auto const* rhs = declaration->value
-				? std::get_if<yul::Identifier>(declaration->value.get())
-				: nullptr;
+			auto const* rhs = declaration->value ? std::get_if<yul::Identifier>(declaration->value.get()) : nullptr;
 			auto const* origin = rhs ? exactOrigin(*rhs) : nullptr;
 			if (origin)
 				moveOrigins[name] = origin;
@@ -3972,13 +4201,10 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 		}
 		yul::Identifier const& lhs = assignment->variableNames.front();
 		auto lhsReference = references.find(&lhs);
-		bool const assignsReturnSlot =
-			lhsReference != references.end()
-			&& lhsReference->second.declaration == returnSlot
-			&& lhsReference->second.suffix == "slot";
-		auto const* rhs = assignment->value
-			? std::get_if<yul::Identifier>(assignment->value.get())
-			: nullptr;
+		bool const assignsReturnSlot = lhsReference != references.end()
+									   && lhsReference->second.declaration == returnSlot
+									   && lhsReference->second.suffix == "slot";
+		auto const* rhs = assignment->value ? std::get_if<yul::Identifier>(assignment->value.get()) : nullptr;
 		if (assignsReturnSlot)
 		{
 			if (sawReturnAssignment || !rhs)
@@ -4016,8 +4242,7 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 			"Assembly-assigned storage-pointer return `" + returnSlot->name()
 			+ ".slot` has no exact compiler-owned slot-word provenance.");
 
-	auto const* slotParameter
-		= dynamic_cast<VariableDeclaration const*>(rhsOrigin->declaration);
+	auto const* slotParameter = dynamic_cast<VariableDeclaration const*>(rhsOrigin->declaration);
 	auto argument = slotParameter ? _paramBinding.find(slotParameter) : _paramBinding.end();
 	if (argument == _paramBinding.end() || !argument->second)
 		throw UnsupportedSolCore(
@@ -4040,8 +4265,7 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 		// storage referent (ShortStrings' string -> StringSlot). Pinning the
 		// resolved root as the callee return type would create an ill-typed
 		// alias; retain the pure helper call as the typed snapshot value.
-		target->snapshotAsTypedCall
-			= slotParameter->annotation().type != returnSlot->annotation().type;
+		target->snapshotAsTypedCall = slotParameter->annotation().type != returnSlot->annotation().type;
 		return target;
 	}
 	if (!rhsOrigin->suffix.empty())
@@ -4144,7 +4368,12 @@ std::optional<StorageRefTarget> resolveCalleeReturnPath(
 		letStmt["value"] = exportStorageRefSnapshotValue(*keyExpr, _snapshots);
 		_snapshots.emplace_back(letStmt);
 		base->steps.push_back(
-			{isMapping ? StorageRefStep::Kind::MappingKey : StorageRefStep::Kind::ArrayIndex, "", tempName});
+			{isMapping ? StorageRefStep::Kind::MappingKey : StorageRefStep::Kind::ArrayIndex,
+			 "",
+			 tempName,
+			 indexAccess->baseExpression().annotation().type,
+			 aggregateIndexCarrierType(*indexAccess),
+			 indexAccess->annotation().type});
 		return base;
 	}
 	if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_expr))
@@ -4152,7 +4381,13 @@ std::optional<StorageRefTarget> resolveCalleeReturnPath(
 		auto base = resolveCalleeReturnPath(memberAccess->expression(), _paramBinding, _snapshotOwner, _snapshots);
 		if (!base)
 			return std::nullopt;
-		base->steps.push_back({StorageRefStep::Kind::Field, memberAccess->memberName(), ""});
+		base->steps.push_back(
+			{StorageRefStep::Kind::Field,
+			 memberAccess->memberName(),
+			 "",
+			 memberAccess->expression().annotation().type,
+			 nullptr,
+			 memberAccess->annotation().type});
 		return base;
 	}
 	if (auto const* identifier = dynamic_cast<Identifier const*>(&_expr))
@@ -4328,8 +4563,7 @@ resolveStorageRefCallRoot(FunctionCall const& _call, ASTNode const& _snapshotOwn
 			return std::nullopt;
 		paramBinding[callee->parameters()[i].get()] = callerArgs[i];
 	}
-	if (auto rawSlotTarget
-		= resolveAssemblyRawSlotReturnPath(*callee, paramBinding, _snapshotOwner, _snapshots))
+	if (auto rawSlotTarget = resolveAssemblyRawSlotReturnPath(*callee, paramBinding, _snapshotOwner, _snapshots))
 		return rawSlotTarget;
 	for (auto const* arg: callerArgs)
 		if (!isSideEffectFreeExpr(*arg))
@@ -4381,13 +4615,18 @@ resolveStorageRefPathRec(Expression const& _expr, ASTNode const& _snapshotOwner,
 		letStmt["kind"] = "let";
 		letStmt["sourceDeclarationId"] = Json();
 		letStmt["name"] = tempName;
-		Type const* keyType = indexAccess->indexExpression()->annotation().type;
+		Type const* keyType = aggregateIndexCarrierType(*indexAccess);
 		auto simpleKeyType = keyType ? exportSimpleType(*keyType) : std::nullopt;
 		letStmt["type"] = simpleKeyType.has_value() ? *simpleKeyType : Json("u256");
 		letStmt["value"] = exportStorageRefSnapshotValue(*indexAccess->indexExpression(), _snapshots);
 		_snapshots.emplace_back(letStmt);
 		base->steps.push_back(
-			{isMapping ? StorageRefStep::Kind::MappingKey : StorageRefStep::Kind::ArrayIndex, "", tempName});
+			{isMapping ? StorageRefStep::Kind::MappingKey : StorageRefStep::Kind::ArrayIndex,
+			 "",
+			 tempName,
+			 indexAccess->baseExpression().annotation().type,
+			 aggregateIndexCarrierType(*indexAccess),
+			 indexAccess->annotation().type});
 		return base;
 	}
 	if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_expr))
@@ -4416,7 +4655,13 @@ resolveStorageRefPathRec(Expression const& _expr, ASTNode const& _snapshotOwner,
 		auto base = resolveStorageRefPathRec(memberAccess->expression(), _snapshotOwner, _snapshots);
 		if (!base)
 			return std::nullopt;
-		base->steps.push_back({StorageRefStep::Kind::Field, memberAccess->memberName(), ""});
+		base->steps.push_back(
+			{StorageRefStep::Kind::Field,
+			 memberAccess->memberName(),
+			 "",
+			 memberAccess->expression().annotation().type,
+			 nullptr,
+			 memberAccess->annotation().type});
 		return base;
 	}
 	if (auto const* conditional = dynamic_cast<Conditional const*>(&_expr))
@@ -4478,6 +4723,8 @@ resolveStorageRefPathRec(Expression const& _expr, ASTNode const& _snapshotOwner,
 				Json push = Json::object();
 				push["kind"] = "internal_call";
 				push["function"] = "array_push_expr";
+				push["authority"]
+					= runtimeCallAuthority("array_push_expr", {arrayType, arrayType->baseType()}, arrayType);
 				push["args"] = Json::array();
 				push["args"].emplace_back(aliasReadJson(*base));
 				Json defaultValue = Json::object();
@@ -4487,7 +4734,13 @@ resolveStorageRefPathRec(Expression const& _expr, ASTNode const& _snapshotOwner,
 				pushStatement["value"] = std::move(push);
 				_snapshots.emplace_back(std::move(pushStatement));
 
-				base->steps.push_back({StorageRefStep::Kind::ArrayIndex, "", indexName});
+				base->steps.push_back(
+					{StorageRefStep::Kind::ArrayIndex,
+					 "",
+					 indexName,
+					 arrayType,
+					 TypeProvider::uint256(),
+					 arrayType->baseType()});
 				return base;
 			}
 		}
@@ -4552,8 +4805,7 @@ resolveStorageRefInitializer(Expression const& _init, VariableDeclaration const&
 /// the frozen location and Base.ml writes it back through the same path.
 /// Call-returned paths still enforce their own duplication-safe argument rule
 /// inside [resolveStorageRefCallRoot].
-std::optional<Json>
-exportResolvedStorageRefUse(Expression const& _expr, StorageRefKeySnapshotMode _snapshotMode)
+std::optional<Json> exportResolvedStorageRefUse(Expression const& _expr, StorageRefKeySnapshotMode _snapshotMode)
 {
 	bool const snapshotOrderedPath = _snapshotMode == StorageRefKeySnapshotMode::OrderedPath;
 	bool snapshotDirectMappingKey = false;
@@ -4561,12 +4813,10 @@ exportResolvedStorageRefUse(Expression const& _expr, StorageRefKeySnapshotMode _
 	{
 		auto const* index = dynamic_cast<IndexAccess const*>(&_expr);
 		auto const* root = index ? dynamic_cast<Identifier const*>(&index->baseExpression()) : nullptr;
-		auto const* decl = root
-							   ? dynamic_cast<VariableDeclaration const*>(root->annotation().referencedDeclaration)
-							   : nullptr;
-		snapshotDirectMappingKey
-			= index && index->indexExpression() && decl && decl->isStateVariable()
-			  && dynamic_cast<MappingType const*>(index->baseExpression().annotation().type);
+		auto const* decl
+			= root ? dynamic_cast<VariableDeclaration const*>(root->annotation().referencedDeclaration) : nullptr;
+		snapshotDirectMappingKey = index && index->indexExpression() && decl && decl->isStateVariable()
+								   && dynamic_cast<MappingType const*>(index->baseExpression().annotation().type);
 	}
 
 	std::function<bool(Expression const&)> keysAreAdmissible = [&](Expression const& expr) -> bool
@@ -4582,8 +4832,7 @@ exportResolvedStorageRefUse(Expression const& _expr, StorageRefKeySnapshotMode _
 			return !tuple->isInlineArray() && tuple->components().size() == 1 && tuple->components().front()
 				   && keysAreAdmissible(*tuple->components().front());
 		if (auto const* conditional = dynamic_cast<Conditional const*>(&expr))
-			return isSideEffectFreeExpr(conditional->condition())
-				   && keysAreAdmissible(conditional->trueExpression())
+			return isSideEffectFreeExpr(conditional->condition()) && keysAreAdmissible(conditional->trueExpression())
 				   && keysAreAdmissible(conditional->falseExpression());
 		return dynamic_cast<Identifier const*>(&expr) || dynamic_cast<FunctionCall const*>(&expr);
 	};
@@ -4837,8 +5086,7 @@ bool storageRefParameterFeedsResidualReference(
 	return scanner.parameters.count(_parameter) != 0;
 }
 
-bool storageRefParameterIsWrittenThrough(
-	FunctionDefinition const& _function, VariableDeclaration const* _parameter)
+bool storageRefParameterIsWrittenThrough(FunctionDefinition const& _function, VariableDeclaration const* _parameter)
 {
 	if (!isStorageRefParameter(_parameter))
 		return false;
@@ -4963,8 +5211,7 @@ Json storageRefFromTarget(StorageRefTarget const& _target)
 /// committing the resolver's path snapshots and mutations exactly once.
 /// This is deliberately narrower than [exportResolvedStorageRefUse]: callers
 /// need the reference identity itself, not a value read through that path.
-std::optional<Json>
-exportOrderedStorageRefValueUse(Expression const& _expr, bool* _snapshotAsTypedCall = nullptr)
+std::optional<Json> exportOrderedStorageRefValueUse(Expression const& _expr, bool* _snapshotAsTypedCall = nullptr)
 {
 	std::vector<Json> snapshots;
 	auto target = resolveStorageRefPathRec(_expr, _expr, snapshots);
@@ -5150,7 +5397,19 @@ bool hasResidualStorageRefRoot(Expression const& _expr)
 	{
 		auto const* declaration
 			= dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
-		return declaration && storageRefValueLocals.count(declaration);
+		if (!declaration)
+			return false;
+		if (storageRefValueLocals.count(declaration))
+			return true;
+		auto alias = storageRefAliasTargets.find(declaration);
+		if (alias == storageRefAliasTargets.end())
+			return false;
+		if (alias->second.rootKind != StorageRefTarget::RootKind::LocalParameter)
+			return true;
+		return std::any_of(
+			storageRefValueLocals.begin(),
+			storageRefValueLocals.end(),
+			[&](VariableDeclaration const* parameter) { return parameter && parameter->name() == alias->second.root; });
 	}
 	if (auto const* member = dynamic_cast<MemberAccess const*>(&_expr))
 		return hasResidualStorageRefRoot(member->expression());
@@ -5163,8 +5422,15 @@ bool hasResidualStorageRefRoot(Expression const& _expr)
 		return !tuple->isInlineArray() && tuple->components().size() == 1 && tuple->components().front()
 			   && hasResidualStorageRefRoot(*tuple->components().front());
 	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
+	{
+		if (suppressStorageRefCallResolution)
+			return false;
+		std::vector<Json> probeSnapshots;
+		if (auto target = resolveStorageRefCallRoot(*call, *call, probeSnapshots))
+			return target->rootKind != StorageRefTarget::RootKind::StateField || target->snapshotAsTypedCall;
 		if (auto const* function = calledFunctionDefinition(*call))
-			return hasSingleStorageReferenceReturn(*function);
+			return isResidualStorageRefFunction(*function);
+	}
 	return false;
 }
 
@@ -5188,8 +5454,8 @@ char const* externalCallMode(FunctionType const& _callType, bool _sameUnit)
 		return "delegatecall";
 	if (_callType.kind() != FunctionType::Kind::External)
 		throw UnsupportedSolCore(
-			"High-level external call has compiler-resolved function kind '"
-			+ _callType.richIdentifier() + "', not external or delegatecall.");
+			"High-level external call has compiler-resolved function kind '" + _callType.richIdentifier()
+			+ "', not external or delegatecall.");
 	return _callType.stateMutability() <= StateMutability::View ? "staticcall" : "call";
 }
 
@@ -5202,17 +5468,26 @@ exportExternalContractCall(FunctionCall const& _call, MemberAccess const& _membe
 
 	auto const* callType = dynamic_cast<FunctionType const*>(_call.expression().annotation().type);
 	if (!callType)
-		throw UnsupportedSolCore(
-			"High-level external call has no compiler-resolved call-expression function type.");
+		throw UnsupportedSolCore("High-level external call has no compiler-resolved call-expression function type.");
 	auto const* options = dynamic_cast<FunctionCallOptions const*>(&_call.expression());
-	CallEvaluation evaluation
-		= exportCallEvaluation(_call, _memberAccess.expression(), options, callType);
+	CallEvaluation evaluation = exportCallEvaluation(_call, _memberAccess.expression(), options, callType);
 
 	Json callExpr = Json::object();
 	callExpr["target"] = std::move(evaluation.target);
 	callExpr["method"] = _memberAccess.memberName();
-	callExpr["callMode"] = externalCallMode(
-		*callType, isCurrentUnitExternalReceiver(_memberAccess.expression()));
+	bool const sameUnit = isCurrentUnitExternalReceiver(_memberAccess.expression());
+	callExpr["callMode"] = externalCallMode(*callType, sameUnit);
+	if (sameUnit)
+	{
+		if (!activeExportContract)
+			throw UnsupportedSolCore("Same-unit external call has no active target contract.");
+		FunctionType const& dispatchType = resolveExternalDispatchType(*activeExportContract, *callType);
+		auto const* function = dynamic_cast<FunctionDefinition const*>(&dispatchType.declaration());
+		if (!function)
+			throw UnsupportedSolCore("Same-unit external call dispatch target is not a source function declaration.");
+		callExpr["authority"]
+			= sourceCallAuthority(*function, exportedContractId(*activeExportContract), evaluation.arguments.size());
+	}
 	callExpr["args"] = Json::array();
 	for (Json& argument: evaluation.arguments)
 		callExpr["args"].emplace_back(std::move(argument));
@@ -5505,16 +5780,6 @@ std::string flattenedStaticBaseCallName(StaticBaseCallTarget const& _resolved)
 	return alias;
 }
 
-/// Attach the executable coordinate of a statically-bound base call. The
-/// target function is flattened into the current export contract and its
-/// already-disambiguated name is the sibling `function` field.
-void addStaticBaseCallTarget(Json& _result, StaticBaseCallTarget const& _resolved)
-{
-	if (!activeExportContract)
-		throw UnsupportedSolCore("Statically-bound base call has no active export-contract identity.");
-	_result["contractId"] = exportedContractId(*activeExportContract);
-	_result["targetKind"] = _resolved.isSuper ? "super" : "base";
-}
 
 /// The exported callee name for a PLAIN (unqualified-identifier) internal
 /// call — Solidity VIRTUAL dispatch (mirrors ASTNode::resolveFunctionCall's
@@ -5689,8 +5954,7 @@ std::string exportedEventName(EventDefinition const& _event)
 	auto it = exportedEventNames.find(&_event);
 	if (it == exportedEventNames.end())
 		throw UnsupportedSolCore(
-			"Event '" + _event.name()
-			+ "' is outside the compiler-resolved event declaration closure.");
+			"Event '" + _event.name() + "' is outside the compiler-resolved event declaration closure.");
 	return it->second;
 }
 
@@ -6198,8 +6462,7 @@ lowerInternalCalleeAndArgs(FunctionCall const& _call, FunctionDefinition const& 
 		}
 
 		if (orderedArguments.size() != _resolvedImpl.parameters().size())
-			throw UnsupportedSolCore(
-				"Internal call argument count disagrees with its resolved implementation.");
+			throw UnsupportedSolCore("Internal call argument count disagrees with its resolved implementation.");
 
 		Json args = Json::array();
 		for (size_t parameterIndex = 0; parameterIndex < orderedArguments.size(); ++parameterIndex)
@@ -6225,8 +6488,7 @@ lowerInternalCalleeAndArgs(FunctionCall const& _call, FunctionDefinition const& 
 				= "internal_arg_" + std::to_string(parameterIndex) + "_source_" + std::to_string(sourceIndex);
 			VariableDeclaration const* parameter = _resolvedImpl.parameters()[parameterIndex].get();
 			if (!parameter || !parameter->annotation().type)
-				throw UnsupportedSolCore(
-					"Internal call argument lacks a resolved destination parameter type.");
+				throw UnsupportedSolCore("Internal call argument lacks a resolved destination parameter type.");
 			args.emplace_back(pinExpressionOnce(*argument, label, parameter->annotation().type));
 		}
 		return args;
@@ -6323,7 +6585,7 @@ std::optional<Json> exportUsingForCall(FunctionCall const& _call, MemberAccess c
 	result["kind"] = "internal_call";
 	result["function"] = isPublicLibraryStructuralStorageFunction(*function) ? storageRefInternalEntryName(*function)
 																			 : exportedFunctionName(*function);
-	addInternalLibraryCallContractId(result, *function);
+	result["authority"] = sourceCallAuthority(*function, internalFnContractId(*function));
 	result["args"] = Json::array();
 	auto exportBoundArgument = [&](Expression const& argument, size_t parameterIndex) -> Json
 	{
@@ -6587,53 +6849,51 @@ Json exportExpr(Expression const& _expr)
 			// substitutions or persistent-storage fields.
 			if (decl->immutable())
 				return immutableGet(*decl);
-			// Constants retain their source-level initializer substitution.
-			static thread_local int inlineDepth = 0;
-			if (decl->isConstant() && decl->value() && inlineDepth < 3)
+			// Constants retain their source-level initializer substitution.  Track
+			// declarations rather than imposing a nesting-depth cutoff: Solidity
+			// constants form an acyclic initializer graph, and a cutoff used to
+			// misclassify deeper leaves as persistent storage even though constant
+			// declarations are deliberately absent from the Storage schema.
+			static thread_local std::set<VariableDeclaration const*> inlineStack;
+			if (decl->isConstant() && decl->value())
 			{
+				if (inlineStack.count(decl))
+					throw UnsupportedSolCore("Cyclic constant initializer reached SolCore export.");
+				inlineStack.insert(decl);
 				try
 				{
-					++inlineDepth;
+					NarrowBytesWideningScanner::checkFlow(*decl->value(), decl->type());
 					auto result = exportExpr(*decl->value());
-					--inlineDepth;
+					inlineStack.erase(decl);
 					return result;
 				}
 				catch (...)
 				{
-					--inlineDepth;
+					inlineStack.erase(decl);
 					// For file-level / non-state constants that couldn't be inlined
 					// directly (e.g. `IERC20 constant CRV = IERC20(0xD533...)`),
 					// try to extract the literal address from the type-conversion
 					// wrapper: the value is a FunctionCall whose argument is a literal.
-					if (decl->isConstant() && !decl->isStateVariable() && decl->value())
+					if (!decl->isStateVariable())
 					{
 						// Pattern: TypeConversion(Literal) e.g. IERC20(0xD533...)
 						if (auto const* call = dynamic_cast<FunctionCall const*>(decl->value().get()))
-						{
 							if (*call->annotation().kind == FunctionCallKind::TypeConversion
 								&& call->arguments().size() == 1)
-							{
 								try
 								{
-									++inlineDepth;
-									auto inner = exportExpr(*call->arguments().front());
-									--inlineDepth;
-									return inner;
+									return exportExpr(*call->arguments().front());
 								}
 								catch (...)
 								{
-									--inlineDepth;
 								}
-							}
-						}
 						// Pattern: Literal address/number
 						if (auto const* literal = dynamic_cast<Literal const*>(decl->value().get()))
 						{
 							(void) literal;
-							// Already tried above via exportExpr, but try the annotation
+							// Already tried above via exportExpr, but try the annotation.
 							Type const* annType = decl->value()->annotation().type;
 							if (annType)
-							{
 								if (annType->category() == Type::Category::Address
 									|| annType->category() == Type::Category::RationalNumber
 									|| annType->category() == Type::Category::Integer)
@@ -6643,10 +6903,11 @@ Json exportExpr(Expression const& _expr)
 									result["value"] = annType->toString(true);
 									return result;
 								}
-							}
 						}
 					}
-					// Fall through to storage_get / local below
+					throw UnsupportedSolCore(
+						"Constant initializer for '" + decl->name()
+						+ "' has no exact SolCore value lowering.");
 				}
 			}
 			Json result = Json::object();
@@ -7122,6 +7383,8 @@ Json exportExpr(Expression const& _expr)
 				Json result = Json::object();
 				result["kind"] = "internal_call";
 				result["function"] = "extfn_selector";
+				result["authority"] = runtimeCallAuthority(
+					"extfn_selector", {selBase.annotation().type}, memberAccess->annotation().type);
 				result["args"] = Json::array();
 				result["args"].emplace_back(exportExpr(selBase));
 				return result;
@@ -7197,6 +7460,8 @@ Json exportExpr(Expression const& _expr)
 				Json result = Json::object();
 				result["kind"] = "internal_call";
 				result["function"] = "extfn_address";
+				result["authority"] = runtimeCallAuthority(
+					"extfn_address", {memberAccess->expression().annotation().type}, memberAccess->annotation().type);
 				result["args"] = Json::array();
 				result["args"].emplace_back(exportExpr(memberAccess->expression()));
 				return result;
@@ -7228,6 +7493,10 @@ Json exportExpr(Expression const& _expr)
 				Json result = Json::object();
 				result["kind"] = "internal_call";
 				result["function"] = "extfn_pack";
+				result["authority"] = runtimeCallAuthority(
+					"extfn_pack",
+					{memberAccess->expression().annotation().type, TypeProvider::uint256()},
+					memberAccess->annotation().type);
 				result["args"] = Json::array();
 				result["args"].emplace_back(exportExpr(memberAccess->expression()));
 				result["args"].emplace_back(std::move(sel));
@@ -7271,6 +7540,10 @@ Json exportExpr(Expression const& _expr)
 			Json result = Json::object();
 			result["kind"] = "internal_call";
 			result["function"] = "bytesn_get__" + std::to_string(fbType->numBytes());
+			result["authority"] = runtimeCallAuthority(
+				"bytesn_get__" + std::to_string(fbType->numBytes()),
+				{indexAccess->baseExpression().annotation().type, aggregateIndexCarrierType(*indexAccess)},
+				indexAccess->annotation().type);
 			result["args"] = Json::array();
 			result["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
 			result["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
@@ -7315,6 +7588,13 @@ Json exportExpr(Expression const& _expr)
 		Json result = Json::object();
 		result["kind"] = "internal_call";
 		result["function"] = "array_slice";
+		result["authority"] = runtimeCallAuthority(
+			"array_slice",
+			{rangeAccess->baseExpression().annotation().type,
+			 rangeAccess->startExpression() ? rangeAccess->startExpression()->annotation().type
+											: TypeProvider::uint256(),
+			 rangeAccess->endExpression() ? rangeAccess->endExpression()->annotation().type : TypeProvider::uint256()},
+			rangeAccess->annotation().type);
 		result["args"] = Json::array();
 		result["args"].emplace_back(exportExpr(rangeAccess->baseExpression()));
 		if (rangeAccess->startExpression())
@@ -7358,17 +7638,18 @@ Json exportExpr(Expression const& _expr)
 			Json call = Json::object();
 			call["kind"] = "internal_call";
 			call["function"] = exportedFunctionName(*opFn);
+			call["authority"] = sourceCallAuthority(*opFn, internalFnContractId(*opFn));
 			call["args"] = Json::array();
 			call["args"].emplace_back(exportExpr(binary->leftExpression()));
 			call["args"].emplace_back(exportExpr(binary->rightExpression()));
 			return call;
 		}
-		// Built-in short-circuit operators with an order-relevant RHS need a
-		// statement-level result temp whose RHS evaluation lives only inside
-		// the selected branch. Pure RHS expressions retain the compact wire
-		// node below.
+		// Built-in short-circuit operators with an order-relevant operand need a
+		// statement-level result temp. The LHS is always evaluated first; the RHS
+		// is evaluated only in the selected branch. Isolating both positions also
+		// keeps an LHS mutation from being rejected against a later RHS read.
 		if ((binary->getOperator() == Token::And || binary->getOperator() == Token::Or)
-			&& evalOrderRelevant(binary->rightExpression()))
+			&& (evalOrderRelevant(binary->leftExpression()) || evalOrderRelevant(binary->rightExpression())))
 		{
 			if (!activeHoistScope || !activeHoistScope->allowed)
 				throw UnsupportedSolCore(
@@ -7450,6 +7731,10 @@ Json exportExpr(Expression const& _expr)
 			Json call = Json::object();
 			call["kind"] = "internal_call";
 			call["function"] = helper;
+			call["authority"] = runtimeCallAuthority(
+				helper,
+				{binary->leftExpression().annotation().type, binary->rightExpression().annotation().type},
+				binary->annotation().type);
 			call["args"] = Json::array();
 			call["args"].emplace_back(exportExpr(binary->leftExpression()));
 			call["args"].emplace_back(exportExpr(binary->rightExpression()));
@@ -7703,6 +7988,7 @@ Json exportExpr(Expression const& _expr)
 			Json call = Json::object();
 			call["kind"] = "internal_call";
 			call["function"] = exportedFunctionName(*opFn);
+			call["authority"] = sourceCallAuthority(*opFn, internalFnContractId(*opFn));
 			call["args"] = Json::array();
 			call["args"].emplace_back(exportExpr(unary->subExpression()));
 			return call;
@@ -7864,9 +8150,8 @@ Json exportExpr(Expression const& _expr)
 				observable = observable || evalOrderRelevant(*component);
 		auto exportComponent = [&](Expression const& component, char const* label, size_t index)
 		{
-			return observable
-					   ? captureMeasuredOrderChild(component, std::string(label) + "_" + std::to_string(index))
-					   : exportExpr(component);
+			return observable ? captureMeasuredOrderChild(component, std::string(label) + "_" + std::to_string(index))
+							  : exportExpr(component);
 		};
 
 		// Inline array literals use TupleExpression syntax too. Only the
@@ -7955,8 +8240,7 @@ Json exportExpr(Expression const& _expr)
 					FunctionDefinition const* constructor = targetContract.constructor();
 					size_t const constructorArity = constructor ? constructor->parameters().size() : 0;
 					Json constructorDisposition = exportConstructorDisposition(targetContract);
-					Json constructorArgAbi
-						= constructor ? exportConstructorParamsAbi(*constructor) : Json::array();
+					Json constructorArgAbi = constructor ? exportConstructorParamsAbi(*constructor) : Json::array();
 					if (call->arguments().size() != constructorArity)
 						throw UnsupportedSolCore(
 							"Contract deployment argument count disagrees with the "
@@ -8070,10 +8354,14 @@ Json exportExpr(Expression const& _expr)
 				Json result = Json::object();
 				result["kind"] = "internal_call";
 				result["function"] = "solcore_checked_enum_cast";
-				result["runtimeKind"] = "checked_enum_cast";
-				result["enumCardinality"] = cardinality;
+				result["authority"]
+					= runtimeCallAuthority("checked_enum_cast", {sourceType, TypeProvider::uint256()}, targetType);
 				result["args"] = Json::array();
 				result["args"].emplace_back(std::move(innerJson));
+				Json cardinalityValue = Json::object();
+				cardinalityValue["kind"] = "u256";
+				cardinalityValue["value"] = std::to_string(cardinality);
+				result["args"].emplace_back(std::move(cardinalityValue));
 				return result;
 			}
 			if (targetType && sourceType && targetType->category() == Type::Category::Integer
@@ -8221,8 +8509,9 @@ Json exportExpr(Expression const& _expr)
 								  "(the type checker should have rejected this).");
 						Json result = Json::object();
 						result["kind"] = "internal_call";
-						result["function"]
-							= "byte_array_to_bytesn__" + std::to_string(targetFB->numBytes());
+						result["function"] = "byte_array_to_bytesn__" + std::to_string(targetFB->numBytes());
+						result["authority"] = runtimeCallAuthority(
+							"byte_array_to_bytesn__" + std::to_string(targetFB->numBytes()), {sourceType}, targetType);
 						result["args"] = Json::array();
 						result["args"].emplace_back(innerJson);
 						return result;
@@ -8236,25 +8525,64 @@ Json exportExpr(Expression const& _expr)
 						"(narrow-bytesN campaign residual): the result is a byte-array "
 						"value the word carrier cannot pass through. Refusing fail-closed.");
 			}
+			if (targetType && targetType->category() == Type::Category::Address && innerJson.is_object()
+				&& innerJson.value("kind", ""s) == "u256")
+			{
+				Json result = Json::object();
+				result["kind"] = "identity_word_reinterpret";
+				result["sourceType"] = "u256";
+				result["targetType"] = exportResolvedType(targetType);
+				result["value"] = std::move(innerJson);
+				return result;
+			}
 			return innerJson;
 		}
 
 		// Struct constructor calls: S(field1, field2, ...)
 		if (*call->annotation().kind == FunctionCallKind::StructConstructorCall)
 		{
+			auto const* structType = dynamic_cast<StructType const*>(call->annotation().type);
+			if (!structType)
+				throw UnsupportedSolCore("Struct constructor has no compiler-resolved struct type.");
+			StructDefinition const& definition = structType->structDefinition();
+			if (definition.members().size() != call->arguments().size())
+				throw UnsupportedSolCore("Struct constructor argument count does not match its declaration.");
 			Json result = Json::object();
 			result["kind"] = "struct_constructor";
-			// Name the constructed record from the compiler-resolved struct
-			// type (never the callee's surface spelling): the exported record
-			// name is disambiguated when bare struct names collide.
-			if (auto const* structType = dynamic_cast<StructType const*>(call->annotation().type))
-				result["name"] = exportedStructName(structType->structDefinition());
-			else if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
-				result["name"] = callee->name();
-			else if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&call->expression()))
-				result["name"] = memberAccess->memberName();
+			result["declarationId"] = std::to_string(definition.id());
+			result["structType"] = exportResolvedType(call->annotation().type);
+			result["fieldNames"] = Json::array();
+			result["fieldTypes"] = Json::array();
+			auto emitFieldMetadata = [&](VariableDeclaration const& field)
+			{
+				result["fieldNames"].emplace_back(field.name());
+				result["fieldTypes"].emplace_back(exportResolvedType(field.annotation().type, false, false));
+			};
+			if (call->names().empty())
+				for (auto const& field: definition.members())
+					emitFieldMetadata(*field);
 			else
-				result["name"] = "Unknown";
+			{
+				if (call->names().size() != call->arguments().size())
+					throw UnsupportedSolCore(
+						"Named struct constructor arguments have inconsistent name/value cardinality.");
+				std::set<std::string> seenFields;
+				for (auto const& fieldNamePtr: call->names())
+				{
+					std::string const& fieldName = *fieldNamePtr;
+					if (!seenFields.insert(fieldName).second)
+						throw UnsupportedSolCore("Named struct constructor repeats field '" + fieldName + "'.");
+					auto const field = std::find_if(
+						definition.members().begin(),
+						definition.members().end(),
+						[&](auto const& candidate) { return candidate->name() == fieldName; });
+					if (field == definition.members().end())
+						throw UnsupportedSolCore(
+							"Named struct constructor references unknown field '" + fieldName + "'.");
+					emitFieldMetadata(**field);
+				}
+			}
+			result["resultType"] = exportResolvedType(call->annotation().type);
 			result["args"] = Json::array();
 			// [SolCore audit finding #9] No catch-and-substitute-0 here: an
 			// unlowerable struct-constructor argument must propagate to
@@ -8339,6 +8667,14 @@ Json exportExpr(Expression const& _expr)
 				// hashing/recovering over an untraceable zero.
 				for (auto const& arg: call->arguments())
 					result["args"].emplace_back(exportExpr(*arg));
+				Json authority = Json::object();
+				authority["kind"] = "runtime";
+				authority["runtimeKind"] = callee->name();
+				authority["inputTypes"] = Json::array();
+				for (auto const& arg: call->arguments())
+					authority["inputTypes"].emplace_back(exportByteHelperArgumentType(arg->annotation().type));
+				authority["resultType"] = exportResolvedType(call->annotation().type);
+				result["authority"] = std::move(authority);
 				return result;
 			}
 
@@ -8364,12 +8700,15 @@ Json exportExpr(Expression const& _expr)
 			auto const* funcDef = dynamic_cast<FunctionDefinition const*>(callee->annotation().referencedDeclaration);
 			if (funcDef)
 			{
-				std::string plainName = virtualCallTargetName(*funcDef);
 				FunctionDefinition const& resolvedImpl = resolveInternalCallImplementation(*funcDef);
+				std::string plainName = isPublicLibraryStructuralStorageFunction(resolvedImpl)
+											? storageRefInternalEntryName(resolvedImpl)
+											: virtualCallTargetName(*funcDef);
 				auto [calleeName, callArgs] = lowerInternalCalleeAndArgs(*call, resolvedImpl, plainName);
 				Json result = Json::object();
 				result["kind"] = "internal_call";
 				result["function"] = std::move(calleeName);
+				result["authority"] = sourceCallAuthority(resolvedImpl, std::nullopt, callArgs.size());
 				result["args"] = std::move(callArgs);
 				return result;
 			}
@@ -8393,7 +8732,8 @@ Json exportExpr(Expression const& _expr)
 				Json result = Json::object();
 				result["kind"] = "internal_call";
 				result["function"] = std::move(calleeName);
-				addStaticBaseCallTarget(result, *resolved);
+				result["authority"]
+					= sourceCallAuthority(*resolved->target, internalFnContractId(*resolved->target), callArgs.size());
 				result["args"] = std::move(callArgs);
 				return result;
 			}
@@ -8476,6 +8816,8 @@ Json exportExpr(Expression const& _expr)
 							result["function"] = "abi_decode";
 							result["args"] = Json::array();
 							result["args"].emplace_back(exportExpr(*call->arguments()[0]));
+							result["authority"] = runtimeCallAuthority(
+								"abi_decode", {call->arguments()[0]->annotation().type}, call->annotation().type);
 
 							Json decodeTypes = Json::array();
 							for (auto const& component: typesTuple->components())
@@ -8509,10 +8851,8 @@ Json exportExpr(Expression const& _expr)
 								Json decodeAbi = Json::array();
 								for (auto const& component: typesTuple->components())
 								{
-									auto const* typeType
-										= dynamic_cast<TypeType const*>(component->annotation().type);
-									decodeAbi.emplace_back(exportAbiDescriptor(
-										"", typeType->actualType(), false));
+									auto const* typeType = dynamic_cast<TypeType const*>(component->annotation().type);
+									decodeAbi.emplace_back(exportAbiDescriptor("", typeType->actualType(), false));
 								}
 								result["decode_abi"] = std::move(decodeAbi);
 							}
@@ -8536,13 +8876,6 @@ Json exportExpr(Expression const& _expr)
 						// Bound members and function-typed VALUES are untouched
 						// (exportDeclaredCalleeSelector returns nullopt for
 						// Kind::External) and keep their extfn_pack lowering.
-						if (memberAccess->memberName() == "encodePacked")
-						{
-							result["argTypes"] = Json::array();
-							for (auto const& arg: call->arguments())
-								result["argTypes"].emplace_back(
-									exportByteHelperArgumentType(arg->annotation().type));
-						}
 						size_t abiArgIndex = 0;
 						bool declaredCalleeSelectorEmitted = false;
 						if (memberAccess->memberName() == "encodeCall" && !call->arguments().empty())
@@ -8568,8 +8901,7 @@ Json exportExpr(Expression const& _expr)
 							{
 								Json argValue
 									= observable
-										  ? captureMeasuredOrderChild(
-												*arg, "abi_arg_" + std::to_string(abiArgIndex))
+										  ? captureMeasuredOrderChild(*arg, "abi_arg_" + std::to_string(abiArgIndex))
 										  : exportExpr(*arg);
 
 								// abi.encodePacked contributes each argument's
@@ -8594,6 +8926,14 @@ Json exportExpr(Expression const& _expr)
 									wrapped["function"] = "bytesn_packed__" + std::to_string(argFB->numBytes());
 									wrapped["args"] = Json::array();
 									wrapped["args"].emplace_back(std::move(argValue));
+									Json packedAuthority = Json::object();
+									packedAuthority["kind"] = "runtime";
+									packedAuthority["runtimeKind"]
+										= "bytesn_packed__" + std::to_string(argFB->numBytes());
+									packedAuthority["inputTypes"] = Json::array({exportResolvedType(argType)});
+									packedAuthority["resultType"]
+										= exportByteHelperArgumentType(TypeProvider::bytesMemory());
+									wrapped["authority"] = std::move(packedAuthority);
 									result["args"].emplace_back(std::move(wrapped));
 								}
 								else
@@ -8601,6 +8941,27 @@ Json exportExpr(Expression const& _expr)
 							}
 							++abiArgIndex;
 						}
+						Json authority = Json::object();
+						authority["kind"] = "runtime";
+						authority["runtimeKind"] = "abi_" + memberAccess->memberName();
+						authority["inputTypes"] = Json::array();
+						for (size_t i = 0; i < call->arguments().size(); ++i)
+						{
+							if (declaredCalleeSelectorEmitted && i == 0)
+								authority["inputTypes"].emplace_back(Json("u256"));
+							else if (
+								auto const* fixedBytes
+								= dynamic_cast<FixedBytesType const*>(call->arguments()[i]->annotation().type);
+								memberAccess->memberName() == "encodePacked" && fixedBytes
+								&& fixedBytes->numBytes() < 32)
+								authority["inputTypes"].emplace_back(
+									exportByteHelperArgumentType(TypeProvider::bytesMemory()));
+							else
+								authority["inputTypes"].emplace_back(
+									exportByteHelperArgumentType(call->arguments()[i]->annotation().type));
+						}
+						authority["resultType"] = exportByteHelperArgumentType(call->annotation().type);
+						result["authority"] = std::move(authority);
 						return result;
 					}
 				}
@@ -8671,7 +9032,7 @@ Json exportExpr(Expression const& _expr)
 											: exportedFunctionName(*funcDef);
 				auto [calleeName, callArgs] = lowerInternalCalleeAndArgs(*call, *funcDef, std::move(plainName));
 				result["function"] = std::move(calleeName);
-				addInternalLibraryCallContractId(result, *funcDef);
+				result["authority"] = sourceCallAuthority(*funcDef, internalFnContractId(*funcDef), callArgs.size());
 				result["args"] = std::move(callArgs);
 				return result;
 			}
@@ -8767,14 +9128,18 @@ Json exportExpr(Expression const& _expr)
 				lowLevel["data"] = emptyBytesLiteral();
 
 				Json result = Json::object();
-				result["kind"] = "internal_call";
-				result["function"] = "tuple_get";
-				result["args"] = Json::array();
-				result["args"].emplace_back(std::move(lowLevel));
+				result["kind"] = "tuple_get";
+				result["tuple"] = std::move(lowLevel);
 				Json index = Json::object();
 				index["kind"] = "u256";
 				index["value"] = "0";
-				result["args"].emplace_back(std::move(index));
+				result["index"] = std::move(index);
+				Json tupleType = Json::object();
+				tupleType["kind"] = "tuple";
+				tupleType["elements"] = Json::array({"bool", "bytes"});
+				result["tupleType"] = std::move(tupleType);
+				result["indexType"] = "u256";
+				result["resultType"] = "bool";
 				return result;
 			}
 			// `.transfer` has revert-on-failure semantics `.send` does not;
@@ -8859,6 +9224,8 @@ Json exportExpr(Expression const& _expr)
 						Json result = Json::object();
 						result["kind"] = "internal_call";
 						result["function"] = bindingIt->second->targetExportedName;
+						result["authority"] = sourceCallAuthority(
+							*bindingIt->second->target, internalFnContractId(*bindingIt->second->target));
 						result["args"] = Json::array();
 						for (auto const& arg: call->arguments())
 							result["args"].emplace_back(exportExpr(*arg));
@@ -8967,18 +9334,29 @@ Json exportExpr(Expression const& _expr)
 				"modeled. Refusing instead of exporting an unresolvable callee name that would "
 				"be modeled as an unconditional revert.");
 		}
-		if (
-			internalCalleeType
-			&& (
-				internalCalleeType->kind() == FunctionType::Kind::BytesConcat
-				|| internalCalleeType->kind() == FunctionType::Kind::StringConcat
-			)
-		)
+		FunctionDefinition const* sourceTarget = nullptr;
+		if (auto const* callee = dynamic_cast<Identifier const*>(&call->expression()))
+			sourceTarget = dynamic_cast<FunctionDefinition const*>(callee->annotation().referencedDeclaration);
+		else if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&call->expression()))
+			sourceTarget = dynamic_cast<FunctionDefinition const*>(memberAccess->annotation().referencedDeclaration);
+		if (sourceTarget)
+			result["authority"] = sourceCallAuthority(*sourceTarget, internalFnContractId(*sourceTarget));
+		else
 		{
-			result["argTypes"] = Json::array();
+			Json authority = Json::object();
+			authority["kind"] = "runtime";
+			authority["runtimeKind"] = result["function"];
+			authority["inputTypes"] = Json::array();
+			bool const byteHelper = internalCalleeType
+									&& (internalCalleeType->kind() == FunctionType::Kind::BytesConcat
+										|| internalCalleeType->kind() == FunctionType::Kind::StringConcat);
 			for (auto const& arg: call->arguments())
-				result["argTypes"].emplace_back(
-					exportByteHelperArgumentType(arg->annotation().type));
+				authority["inputTypes"].emplace_back(
+					byteHelper ? exportByteHelperArgumentType(arg->annotation().type)
+							   : exportResolvedType(arg->annotation().type));
+			authority["resultType"] = byteHelper ? exportByteHelperArgumentType(call->annotation().type)
+												 : exportResolvedType(call->annotation().type);
+			result["authority"] = std::move(authority);
 		}
 		result["args"] = Json::array();
 		for (auto const& arg: call->arguments())
@@ -9008,10 +9386,7 @@ Json exportExpr(Expression const& _expr)
 	throw UnsupportedSolCore("exportExpr: unrecognized expression node (no matching Expression subtype)");
 }
 
-Json exportRevertPayload(
-	FunctionCall const& _call,
-	bool _unconditionalPayload,
-	bool _includeRuntimeArgs)
+Json exportRevertPayload(FunctionCall const& _call, bool _unconditionalPayload, bool _includeRuntimeArgs)
 {
 	// `_errorCall` is the CALL WHOSE ARGUMENTS BELONG TO THE ERROR: the outer
 	// `_call` itself when its callee IS the error (`revert Err(x)` routed
@@ -9079,8 +9454,7 @@ Json exportRevertPayload(
 			for (size_t i = 0; i < _errorCall.arguments().size(); ++i)
 				args.emplace_back(
 					pinLegacyOrder
-						? captureMeasuredOrderChild(
-							  *_errorCall.arguments()[i], "custom_error_arg_" + std::to_string(i))
+						? captureMeasuredOrderChild(*_errorCall.arguments()[i], "custom_error_arg_" + std::to_string(i))
 						: exportExpr(*_errorCall.arguments()[i]));
 			if (!args.empty())
 				result["error"]["args"] = std::move(args);
@@ -9442,9 +9816,6 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 			= dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration);
 		if (declaration && storageRefValueLocals.count(declaration))
 		{
-			if (isStorageRefParameter(declaration))
-				throw UnsupportedSolCore(
-					"Whole-root assignment cannot reseat a storage-reference parameter.");
 			if (_op != Token::Assign)
 				throw UnsupportedSolCore("Compound assignment cannot rebind a storage-reference value.");
 			auto reference = exportStorageRefValue(_rhs);
@@ -9479,16 +9850,46 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 	// A member/index assignment rooted at `arr.push()` must retain the
 	// returned slot as a first-class storage reference. Direct
 	// `arr.push() = value` keeps the cheaper typed-push lowering below.
-	FunctionCall const* pushReturnedStorageLvalue
-		= typedPushLvalue ? nullptr : storageArrayPushLValueRoot(_lhs);
+	FunctionCall const* pushReturnedStorageLvalue = typedPushLvalue ? nullptr : storageArrayPushLValueRoot(_lhs);
 
 	auto const* lhsTuple = dynamic_cast<TupleExpression const*>(&_lhs);
-	bool const structuralTupleAssignment
-		= _op == Token::Assign && lhsTuple && !lhsTuple->isInlineArray();
-	bool const ordered = evalOrderRelevant(_rhs)
-						 || evalOrderRelevant(typedPushLvalue ? typedPushLvalue->expression() : _lhs);
+	bool const structuralTupleAssignment = _op == Token::Assign && lhsTuple && !lhsTuple->isInlineArray();
+	bool const ordered
+		= evalOrderRelevant(_rhs) || evalOrderRelevant(typedPushLvalue ? typedPushLvalue->expression() : _lhs);
 	Json rhsJson;
-	if (ordered && !structuralTupleAssignment)
+	if (structuralTupleAssignment)
+		if (auto const* rhsTuple = dynamic_cast<TupleExpression const*>(&_rhs);
+			rhsTuple && !rhsTuple->isInlineArray() && rhsTuple->components().size() == lhsTuple->components().size())
+		{
+			bool const tupleOrdered = evalOrderRelevant(_rhs) || evalOrderRelevant(_lhs);
+			std::vector<Json> componentValues(lhsTuple->components().size());
+			for (size_t i = 0; i < rhsTuple->components().size(); ++i)
+			{
+				auto const& rhsComponent = rhsTuple->components()[i];
+				if (!rhsComponent)
+					throw UnsupportedSolCore("Tuple assignment RHS contains an omitted component.");
+				auto const& lhsComponent = lhsTuple->components()[i];
+				if (!lhsComponent)
+				{
+					if (evalOrderRelevant(*rhsComponent))
+						appendDiscardedMeasuredExpression(*rhsComponent);
+					continue;
+				}
+				componentValues[i] = pinExpressionOnce(
+					*rhsComponent, "tuple_assignment_rhs_" + std::to_string(i), lhsComponent->annotation().type);
+			}
+			if (tupleOrdered)
+				pinAssignmentLValueChildren(_lhs, "assignment_lhs");
+			Json statements = Json::array();
+			for (size_t i = lhsTuple->components().size(); i-- > 0;)
+				if (lhsTuple->components()[i])
+					statements.emplace_back(exportDirectAssignment(*lhsTuple->components()[i], componentValues[i]));
+			Json result = Json::object();
+			result["kind"] = "block";
+			result["statements"] = std::move(statements);
+			return result;
+		}
+	if (ordered)
 	{
 		// Legacy and via-IR agree here: Assignment evaluates the RHS before
 		// visiting its lvalue, and IndexAccess visits base before key. The
@@ -9502,16 +9903,12 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 			pinAssignmentLValueChildren(_lhs, "assignment_lhs");
 	}
 	else
-		// tuple_assign must retain its structural RHS/destination trees: the
-		// TupleExpression arm pins RHS components left-to-right, while the
-		// dedicated tuple-assignment lowering owns destination evaluation and
-		// right-to-left stores.
 		rhsJson = exportExpr(_rhs);
 	bool const residualStorageLvalue = hasResidualStorageRefRoot(_lhs);
 	if (pushReturnedStorageLvalue || residualStorageLvalue)
 	{
-		auto reference = pushReturnedStorageLvalue ? exportOrderedStorageRefValueUse(_lhs)
-												  : exportStorageRefValue(_lhs);
+		auto reference
+			= pushReturnedStorageLvalue ? exportOrderedStorageRefValueUse(_lhs) : exportStorageRefValue(_lhs);
 		if (!reference)
 			throw UnsupportedSolCore(
 				pushReturnedStorageLvalue
@@ -9556,13 +9953,16 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		Json push = Json::object();
 		push["kind"] = "internal_call";
 		push["function"] = "array_push_expr";
+		push["authority"] = runtimeCallAuthority(
+			"array_push_expr",
+			{typedPushLvalue->expression().annotation().type, _rhs.annotation().type},
+			typedPushLvalue->expression().annotation().type);
 		push["args"] = Json::array();
 		push["args"].emplace_back(std::move(*rootedBase));
 		push["args"].emplace_back(std::move(rhsJson));
 		result["value"] = std::move(push);
 		return result;
 	}
-
 
 
 	if (auto const* identifier = dynamic_cast<Identifier const*>(&_lhs))
@@ -9629,6 +10029,7 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 				storageRefAliasTargets[decl] = resolved->first;
 				Json result = Json::object();
 				result["kind"] = "block";
+				result["_solcoreSyntheticSequence"] = true;
 				result["statements"] = Json::array();
 				for (Json const& snapshotLet: resolved->second)
 					result["statements"].emplace_back(snapshotLet);
@@ -9712,6 +10113,12 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 					Json callExpr = Json::object();
 					callExpr["kind"] = "internal_call";
 					callExpr["function"] = "array_set_local";
+					callExpr["authority"] = runtimeCallAuthority(
+						"array_set_local",
+						{indexAccess->baseExpression().annotation().type,
+						 aggregateIndexCarrierType(*indexAccess),
+						 indexAccess->annotation().type},
+						indexAccess->baseExpression().annotation().type);
 					callExpr["args"] = Json::array();
 					callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
 					callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
@@ -9734,18 +10141,39 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 			}
 			else
 			{
-				// Complex base expression (e.g. result[expr] = val)
-				// Export as an expr statement with internal_call array_set_local
+				// Complex aggregate bases must preserve their exact data location:
+				// storage arrays use the structural slot update, while memory/calldata
+				// arrays remain value updates for the parent writeback pass.
 				requireLoweredStorageWriteRootOrThrow(_lhs, "array element write");
+				auto const* arrayType = dynamic_cast<ArrayType const*>(baseType);
+				if (!arrayType)
+					throw UnsupportedSolCore("Complex fixed-bytes index assignment has no exact array carrier.");
 				Json result = Json::object();
 				result["kind"] = "expr";
 				Json callExpr = Json::object();
-				callExpr["kind"] = "internal_call";
-				callExpr["function"] = "array_set_expr";
-				callExpr["args"] = Json::array();
-				callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
-				callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
-				callExpr["args"].emplace_back(effectiveRhs);
+				if (arrayType->location() == DataLocation::Storage)
+				{
+					callExpr["kind"] = "storage_array_slot_set";
+					callExpr["base"] = exportExpr(indexAccess->baseExpression());
+					callExpr["index"] = exportExpr(*indexAccess->indexExpression());
+					callExpr["value"] = effectiveRhs;
+					callExpr["arrayType"] = exportResolvedType(baseType);
+					callExpr["indexType"] = exportResolvedType(aggregateIndexCarrierType(*indexAccess));
+					callExpr["elementType"] = exportResolvedType(indexAccess->annotation().type);
+				}
+				else
+				{
+					callExpr["kind"] = "internal_call";
+					callExpr["function"] = "array_set_expr";
+					callExpr["authority"] = runtimeCallAuthority(
+						"array_set_expr",
+						{baseType, aggregateIndexCarrierType(*indexAccess), indexAccess->annotation().type},
+						baseType);
+					callExpr["args"] = Json::array();
+					callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
+					callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
+					callExpr["args"].emplace_back(effectiveRhs);
+				}
 				result["value"] = callExpr;
 				return result;
 			}
@@ -9810,7 +10238,14 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 				}
 				Json nestedUpdate = Json::object();
 				nestedUpdate["kind"] = "internal_call";
-				nestedUpdate["function"] = "array_set_expr";
+				char const* runtimeKind = aggregateSetRuntimeKind(indexAccess->baseExpression().annotation().type);
+				nestedUpdate["function"] = runtimeKind;
+				nestedUpdate["authority"] = runtimeCallAuthority(
+					runtimeKind,
+					{indexAccess->baseExpression().annotation().type,
+					 aggregateIndexCarrierType(*indexAccess),
+					 indexAccess->annotation().type},
+					indexAccess->baseExpression().annotation().type);
 				nestedUpdate["args"] = Json::array();
 				nestedUpdate["args"].emplace_back(innerBase);
 				nestedUpdate["args"].emplace_back(leafIndex);
@@ -9819,8 +10254,7 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 			}
 			catch (...)
 			{
-				// If nested mapping export also fails, fall back to generic array_set_expr
-				//
+				// Residual aggregate updates retain the exact mapping or array runtime kind.
 				// [storage-ref-alias review fix] A COMPOUND assignment
 				// (`m[k] += v` etc.) reaching this catch must expand to the
 				// read-modify-write value, exactly like the two try-paths
@@ -9851,7 +10285,16 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 				result["kind"] = "expr";
 				Json callExpr = Json::object();
 				callExpr["kind"] = "internal_call";
-				callExpr["function"] = "array_set_expr";
+				char const* runtimeKind = aggregateSetRuntimeKind(indexAccess->baseExpression().annotation().type);
+				callExpr["function"] = runtimeKind;
+				if (!indexAccess->indexExpression())
+					throw UnsupportedSolCore("Index assignment requires an exact index carrier.");
+				callExpr["authority"] = runtimeCallAuthority(
+					runtimeKind,
+					{indexAccess->baseExpression().annotation().type,
+					 aggregateIndexCarrierType(*indexAccess),
+					 indexAccess->annotation().type},
+					indexAccess->baseExpression().annotation().type);
 				callExpr["args"] = Json::array();
 				callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
 				if (indexAccess->indexExpression())
@@ -9948,31 +10391,31 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		return result;
 	}
 
-	// Tuple LHS: (a, b) = (1, 2) — export as a block of individual assignments
+	// Tuple LHS: project the already-evaluated RHS and perform each real lvalue write.
 	if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_lhs))
 	{
-		for (auto const& component: tuple->components())
-			if (component)
-				requireLoweredStorageWriteRootOrThrow(*component, "tuple assignment component");
-		Json result = Json::object();
-		result["kind"] = "expr";
-		Json callExpr = Json::object();
-		callExpr["kind"] = "internal_call";
-		callExpr["function"] = "tuple_assign";
-		callExpr["args"] = Json::array();
-		// [SolCore audit finding #9] No catch-and-substitute-0 here: an
-		// unlowerable tuple-assignment-target component must propagate to
-		// exportBody's catch-all rather than silently assigning through an
-		// untraceable zero target.
-		for (auto const& component: tuple->components())
+		Json statements = Json::array();
+		Json tupleType = exportResolvedType(_rhs.annotation().type);
+		for (size_t i = tuple->components().size(); i-- > 0;)
 		{
-			if (component)
-				callExpr["args"].emplace_back(exportExpr(*component));
-			else
-				callExpr["args"].emplace_back(Json());
+			auto const& component = tuple->components()[i];
+			if (!component)
+				continue;
+			Json projection = Json::object();
+			projection["kind"] = "tuple_get";
+			projection["tuple"] = rhsJson;
+			Json index = Json::object();
+			index["kind"] = "u256";
+			index["value"] = std::to_string(i);
+			projection["index"] = std::move(index);
+			projection["tupleType"] = tupleType;
+			projection["indexType"] = "u256";
+			projection["resultType"] = tupleType["elements"][i];
+			statements.emplace_back(exportDirectAssignment(*component, projection));
 		}
-		callExpr["args"].emplace_back(rhsJson);
-		result["value"] = callExpr;
+		Json result = Json::object();
+		result["kind"] = "block";
+		result["statements"] = std::move(statements);
 		return result;
 	}
 
@@ -9984,6 +10427,8 @@ Json exportAssignment(Expression const& _lhs, Token _op, Expression const& _rhs)
 		Json callExpr = Json::object();
 		callExpr["kind"] = "internal_call";
 		callExpr["function"] = "generic_assign";
+		callExpr["authority"] = runtimeCallAuthority(
+			"generic_assign", {_lhs.annotation().type, _rhs.annotation().type}, _lhs.annotation().type);
 		callExpr["args"] = Json::array();
 		// [SolCore audit finding #9] No catch-and-substitute-0 here: an
 		// unlowerable assignment target must propagate to exportBody's
@@ -10070,6 +10515,12 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 					Json callExpr = Json::object();
 					callExpr["kind"] = "internal_call";
 					callExpr["function"] = "array_set_local";
+					callExpr["authority"] = runtimeCallAuthority(
+						"array_set_local",
+						{indexAccess->baseExpression().annotation().type,
+						 aggregateIndexCarrierType(*indexAccess),
+						 indexAccess->annotation().type},
+						indexAccess->baseExpression().annotation().type);
 					callExpr["args"] = Json::array();
 					callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
 					callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
@@ -10090,15 +10541,35 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 				return result;
 			}
 			requireLoweredStorageWriteRootOrThrow(_lhs, "array element write");
+			auto const* arrayType = dynamic_cast<ArrayType const*>(baseType);
+			if (!arrayType)
+				throw UnsupportedSolCore("Complex fixed-bytes index assignment has no exact array carrier.");
 			Json result = Json::object();
 			result["kind"] = "expr";
 			Json callExpr = Json::object();
-			callExpr["kind"] = "internal_call";
-			callExpr["function"] = "array_set_expr";
-			callExpr["args"] = Json::array();
-			callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
-			callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
-			callExpr["args"].emplace_back(_value);
+			if (arrayType->location() == DataLocation::Storage)
+			{
+				callExpr["kind"] = "storage_array_slot_set";
+				callExpr["base"] = exportExpr(indexAccess->baseExpression());
+				callExpr["index"] = exportExpr(*indexAccess->indexExpression());
+				callExpr["value"] = _value;
+				callExpr["arrayType"] = exportResolvedType(baseType);
+				callExpr["indexType"] = exportResolvedType(aggregateIndexCarrierType(*indexAccess));
+				callExpr["elementType"] = exportResolvedType(indexAccess->annotation().type);
+			}
+			else
+			{
+				callExpr["kind"] = "internal_call";
+				callExpr["function"] = "array_set_expr";
+				callExpr["authority"] = runtimeCallAuthority(
+					"array_set_expr",
+					{baseType, aggregateIndexCarrierType(*indexAccess), indexAccess->annotation().type},
+					baseType);
+				callExpr["args"] = Json::array();
+				callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
+				callExpr["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
+				callExpr["args"].emplace_back(_value);
+			}
 			result["value"] = callExpr;
 			return result;
 		}
@@ -10128,7 +10599,14 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 				auto [outerPath, outerKey] = exportStorageMapLValue(indexAccess->baseExpression());
 				Json nestedUpdate = Json::object();
 				nestedUpdate["kind"] = "internal_call";
-				nestedUpdate["function"] = "array_set_expr";
+				char const* runtimeKind = aggregateSetRuntimeKind(indexAccess->baseExpression().annotation().type);
+				nestedUpdate["function"] = runtimeKind;
+				nestedUpdate["authority"] = runtimeCallAuthority(
+					runtimeKind,
+					{indexAccess->baseExpression().annotation().type,
+					 aggregateIndexCarrierType(*indexAccess),
+					 indexAccess->annotation().type},
+					indexAccess->baseExpression().annotation().type);
 				nestedUpdate["args"] = Json::array();
 				nestedUpdate["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
 				nestedUpdate["args"].emplace_back(exportExpr(*indexAccess->indexExpression()));
@@ -10142,7 +10620,16 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 				result["kind"] = "expr";
 				Json callExpr = Json::object();
 				callExpr["kind"] = "internal_call";
-				callExpr["function"] = "array_set_expr";
+				char const* runtimeKind = aggregateSetRuntimeKind(indexAccess->baseExpression().annotation().type);
+				callExpr["function"] = runtimeKind;
+				if (!indexAccess->indexExpression())
+					throw UnsupportedSolCore("Index assignment requires an exact index carrier.");
+				callExpr["authority"] = runtimeCallAuthority(
+					runtimeKind,
+					{indexAccess->baseExpression().annotation().type,
+					 aggregateIndexCarrierType(*indexAccess),
+					 indexAccess->annotation().type},
+					indexAccess->baseExpression().annotation().type);
 				callExpr["args"] = Json::array();
 				callExpr["args"].emplace_back(exportExpr(indexAccess->baseExpression()));
 				if (indexAccess->indexExpression())
@@ -10205,28 +10692,28 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 
 	if (auto const* tuple = dynamic_cast<TupleExpression const*>(&_lhs))
 	{
-		for (auto const& component: tuple->components())
-			if (component)
-				requireLoweredStorageWriteRootOrThrow(*component, "tuple assignment component");
-		Json result = Json::object();
-		result["kind"] = "expr";
-		Json callExpr = Json::object();
-		callExpr["kind"] = "internal_call";
-		callExpr["function"] = "tuple_assign";
-		callExpr["args"] = Json::array();
-		// [SolCore audit finding #9] No catch-and-substitute-0 here: an
-		// unlowerable tuple-assignment-target component must propagate to
-		// exportBody's catch-all rather than silently assigning through an
-		// untraceable zero target.
-		for (auto const& component: tuple->components())
+		Json statements = Json::array();
+		Json tupleType = exportResolvedType(_lhs.annotation().type);
+		for (size_t i = tuple->components().size(); i-- > 0;)
 		{
-			if (component)
-				callExpr["args"].emplace_back(exportExpr(*component));
-			else
-				callExpr["args"].emplace_back(Json());
+			auto const& component = tuple->components()[i];
+			if (!component)
+				continue;
+			Json projection = Json::object();
+			projection["kind"] = "tuple_get";
+			projection["tuple"] = _value;
+			Json index = Json::object();
+			index["kind"] = "u256";
+			index["value"] = std::to_string(i);
+			projection["index"] = std::move(index);
+			projection["tupleType"] = tupleType;
+			projection["indexType"] = "u256";
+			projection["resultType"] = tupleType["elements"][i];
+			statements.emplace_back(exportDirectAssignment(*component, projection));
 		}
-		callExpr["args"].emplace_back(_value);
-		result["value"] = callExpr;
+		Json result = Json::object();
+		result["kind"] = "block";
+		result["statements"] = std::move(statements);
 		return result;
 	}
 
@@ -10236,6 +10723,8 @@ Json exportDirectAssignment(Expression const& _lhs, Json const& _value)
 	Json callExpr = Json::object();
 	callExpr["kind"] = "internal_call";
 	callExpr["function"] = "generic_assign";
+	callExpr["authority"] = runtimeCallAuthority(
+		"generic_assign", {_lhs.annotation().type, _lhs.annotation().type}, _lhs.annotation().type);
 	callExpr["args"] = Json::array();
 	// [SolCore audit finding #9] No catch-and-substitute-0 here: an
 	// unlowerable assignment target must propagate to exportBody's
@@ -10307,13 +10796,14 @@ Json exportUnaryMutation(Expression const& _target, Token _op)
 // here would be a silent-mismatch bug, not just a style difference.
 // Fails closed (throws UnsupportedSolCore) on any category it does not
 // explicitly recognize, per [SolCore audit finding #9]: no zero-substitution.
-Json exportResolvedType(Type const* _type, bool _storage)
+Json exportResolvedType(Type const* _type, bool _storage, bool _respectResolvedLocation)
 {
 	if (!_type)
 		throw UnsupportedSolCore("Unresolved type in SolCore exporter.");
 	bool storage = _storage || _type->category() == Type::Category::Mapping;
-	if (auto const* reference = dynamic_cast<ReferenceType const*>(_type))
-		storage = storage || reference->location() == DataLocation::Storage;
+	if (_respectResolvedLocation)
+		if (auto const* reference = dynamic_cast<ReferenceType const*>(_type))
+			storage = storage || reference->location() == DataLocation::Storage;
 
 	switch (_type->category())
 	{
@@ -10322,6 +10812,16 @@ Json exportResolvedType(Type const* _type, bool _storage)
 		return Json("address");
 	case Type::Category::Bool:
 		return Json("bool");
+	case Type::Category::RationalNumber:
+	{
+		auto const* rationalType = dynamic_cast<RationalNumberType const*>(_type);
+		if (!rationalType || rationalType->isFractional())
+			throw UnsupportedSolCore("Fractional resolved rational type has no exact integer carrier.");
+		IntegerType const* integerType = rationalType->integerType();
+		if (!integerType)
+			throw UnsupportedSolCore("Resolved integer constant is outside the Solidity integer range.");
+		return exportResolvedType(integerType, _storage, _respectResolvedLocation);
+	}
 	case Type::Category::Integer:
 	{
 		auto const* intType = dynamic_cast<IntegerType const*>(_type);
@@ -10397,6 +10897,13 @@ Json exportResolvedType(Type const* _type, bool _storage)
 		result["name"] = exportedStructName(structType->structDefinition());
 		return result;
 	}
+	case Type::Category::ArraySlice:
+	{
+		auto const* sliceType = dynamic_cast<ArraySliceType const*>(_type);
+		if (!sliceType)
+			throw UnsupportedSolCore("Resolved array slice type has no array carrier.");
+		return exportResolvedType(&sliceType->arrayType(), storage, _respectResolvedLocation);
+	}
 	case Type::Category::Array:
 	{
 		auto const* arrayType = dynamic_cast<ArrayType const*>(_type);
@@ -10405,8 +10912,9 @@ Json exportResolvedType(Type const* _type, bool _storage)
 		// is what makes `new bytes(0)`-shaped and delete-shaped u8-array
 		// values monomorphize to the same `new_array__u8` helper as an
 		// actual `bytes`/`string` declaration.
-		Json element
-			= arrayType->isByteArrayOrString() ? Json("u8") : exportResolvedType(arrayType->baseType(), storage);
+		Json element = arrayType->isByteArrayOrString()
+						   ? Json("u8")
+						   : exportResolvedType(arrayType->baseType(), storage, _respectResolvedLocation);
 		Json result = Json::object();
 		if (arrayType->isDynamicallySized())
 		{
@@ -10435,9 +10943,9 @@ Json exportResolvedType(Type const* _type, bool _storage)
 			Type const* component = tupleType->components()[i];
 			if (!component)
 				throw UnsupportedSolCore(
-					"Resolved tuple type contains an omitted placeholder component at index " + std::to_string(i) + "."
-				);
-			result["elements"].emplace_back(exportResolvedType(component, storage));
+					"Resolved tuple type contains an omitted placeholder component at index " + std::to_string(i)
+					+ ".");
+			result["elements"].emplace_back(exportResolvedType(component, storage, _respectResolvedLocation));
 		}
 		return result;
 	}
@@ -10453,7 +10961,7 @@ Json exportResolvedType(Type const* _type, bool _storage)
 	case Type::Category::UserDefinedValueType:
 	{
 		auto const* udvt = dynamic_cast<UserDefinedValueType const*>(_type);
-		return exportResolvedType(&udvt->underlyingType(), storage);
+		return exportResolvedType(&udvt->underlyingType(), storage, _respectResolvedLocation);
 	}
 	case Type::Category::Function:
 	{
@@ -10514,9 +11022,8 @@ Json exportResolvedType(Type const* _type, bool _storage)
 		break;
 	}
 	throw UnsupportedSolCore(
-		"Unsupported resolved type in SolCore exporter: " +
-		_type->humanReadableName() + " (category " +
-		std::to_string(static_cast<int>(_type->category())) + ")");
+		"Unsupported resolved type in SolCore exporter: " + _type->humanReadableName() + " (category "
+		+ std::to_string(static_cast<int>(_type->category())) + ")");
 }
 
 Json typedDefaultValueForResolvedType(Type const* _type, bool _storage = false)
@@ -10645,6 +11152,7 @@ Json exportDelete(Expression const& _target)
 		Json call = Json::object();
 		call["kind"] = "internal_call";
 		call["function"] = "memory_delete";
+		call["authority"] = runtimeCallAuthority("memory_delete", {_target.annotation().type}, nullptr);
 		call["args"] = Json::array();
 		call["args"].emplace_back(exportExpr(_target));
 		result["value"] = std::move(call);
@@ -10670,14 +11178,15 @@ Json exportDelete(Expression const& _target)
 		{
 			deletedValue["kind"] = "internal_call";
 			deletedValue["function"] = "storage_array_clear";
+			deletedValue["authority"] = runtimeCallAuthority("storage_array_clear", {type}, type);
 			deletedValue["args"] = Json::array();
 			deletedValue["args"].emplace_back(storageRefGetJson(localReference, type));
 		}
 		else if (type->category() == Type::Category::Struct)
 		{
 			auto const* structType = dynamic_cast<StructType const*>(type);
-			deletedValue = exportDeleteStructSpine(
-				storageRefGetJson(localReference, type), structType->structDefinition());
+			deletedValue
+				= exportDeleteStructSpine(storageRefGetJson(localReference, type), structType->structDefinition());
 		}
 		else
 			deletedValue = deleteDefaultValueForResolvedType(type);
@@ -10698,8 +11207,7 @@ Json exportDelete(Expression const& _target)
 
 	if (hasSlotPreservingDynamicStorageArraySemantics(type))
 	{
-		auto rootedTarget
-			= exportResolvedStorageRefUse(_target, StorageRefKeySnapshotMode::DirectMappingKey);
+		auto rootedTarget = exportResolvedStorageRefUse(_target, StorageRefKeySnapshotMode::DirectMappingKey);
 		if (!rootedTarget)
 			throw UnsupportedSolCore("delete on a dynamic storage array requires a resolved rooted storage lvalue.");
 
@@ -10708,6 +11216,7 @@ Json exportDelete(Expression const& _target)
 		Json call = Json::object();
 		call["kind"] = "internal_call";
 		call["function"] = "storage_array_clear";
+		call["authority"] = runtimeCallAuthority("storage_array_clear", {type}, type);
 		call["args"] = Json::array();
 		call["args"].emplace_back(std::move(*rootedTarget));
 		result["value"] = std::move(call);
@@ -11239,9 +11748,7 @@ Json exportHoistedAssignExpr(Assignment const& _assignment)
 	return localExpr(tempName);
 }
 
-bool inlineAssemblyOperationIs(
-	std::string_view _operation,
-	std::initializer_list<std::string_view> _candidates)
+bool inlineAssemblyOperationIs(std::string_view _operation, std::initializer_list<std::string_view> _candidates)
 {
 	return std::find(_candidates.begin(), _candidates.end(), _operation) != _candidates.end();
 }
@@ -11265,8 +11772,7 @@ public:
 		if (_statement.declarations().size() == 1 && _statement.declarations().front() && _statement.initialValue())
 		{
 			VariableDeclaration const& declaration = *_statement.declarations().front();
-			auto const* fixedBytes =
-				dynamic_cast<FixedBytesType const*>(declaration.annotation().type);
+			auto const* fixedBytes = dynamic_cast<FixedBytesType const*>(declaration.annotation().type);
 			if (fixedBytes && fixedBytes->numBytes() == 4)
 				activeSelectorLocalInitializers[&declaration] = _statement.initialValue();
 		}
@@ -11287,14 +11793,15 @@ public:
 		auto const& references = _assembly.annotation().externalReferences;
 		yul::forEach<yul::Assignment const>(
 			_assembly.operations().root(),
-			[&](yul::Assignment const& _yulAssignment) {
+			[&](yul::Assignment const& _yulAssignment)
+			{
 				for (yul::Identifier const& name: _yulAssignment.variableNames)
 				{
 					auto reference = references.find(&name);
 					if (reference == references.end())
 						continue;
-					if (auto const* declaration =
-						dynamic_cast<VariableDeclaration const*>(reference->second.declaration))
+					if (auto const* declaration
+						= dynamic_cast<VariableDeclaration const*>(reference->second.declaration))
 						activeSelectorLocalInitializers.erase(declaration);
 				}
 			});
@@ -11312,8 +11819,8 @@ private:
 			return;
 		}
 		if (auto const* identifier = dynamic_cast<Identifier const*>(&_lhs))
-			if (auto const* declaration =
-				dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration))
+			if (auto const* declaration
+				= dynamic_cast<VariableDeclaration const*>(identifier->annotation().referencedDeclaration))
 				activeSelectorLocalInitializers.erase(declaration);
 	}
 };
@@ -11327,14 +11834,12 @@ private:
 class InlineAssemblyInterfaceCollector: private yul::ASTWalker
 {
 public:
-	explicit InlineAssemblyInterfaceCollector(InlineAssembly const& _assembly):
-		m_dialect(_assembly.dialect()),
-		m_externalReferences(_assembly.annotation().externalReferences)
+	explicit InlineAssemblyInterfaceCollector(InlineAssembly const& _assembly)
+		: m_dialect(_assembly.dialect()), m_externalReferences(_assembly.annotation().externalReferences)
 	{
 		yul::Block const& root = _assembly.operations().root();
-		yul::forEach<yul::FunctionDefinition const>(root, [&](yul::FunctionDefinition const& _function) {
-			m_localFunctions.insert(_function.name.str());
-		});
+		yul::forEach<yul::FunctionDefinition const>(
+			root, [&](yul::FunctionDefinition const& _function) { m_localFunctions.insert(_function.name.str()); });
 
 		// OpenZeppelin SafeERC20 v5.4 is the motivating witness: _safeTransfer
 		// materializes transfer.selector and its two ABI words with mstore,
@@ -11351,8 +11856,7 @@ public:
 		for (auto const& [identifier, information]: m_externalReferences)
 		{
 			if (!identifier || !information.declaration)
-				throw UnsupportedSolCore(
-					"Inline assembly contains an unresolved compiler external reference.");
+				throw UnsupportedSolCore("Inline assembly contains an unresolved compiler external reference.");
 			if (!m_seenExternalReferences.count(identifier))
 				throw UnsupportedSolCore(
 					"Inline assembly external-reference metadata does not correspond "
@@ -11369,8 +11873,7 @@ public:
 			auto const& [declarationId, name, suffix] = key;
 			auto declaration = m_declarations.find(declarationId);
 			if (declaration == m_declarations.end())
-				throw UnsupportedSolCore(
-					"Inline assembly local interface lost its declaration-owned carrier type.");
+				throw UnsupportedSolCore("Inline assembly local interface lost its declaration-owned carrier type.");
 
 			Json row = Json::object();
 			row["declarationId"] = declarationId;
@@ -11388,8 +11891,7 @@ public:
 				row["access"] = "read_write";
 				break;
 			default:
-				throw UnsupportedSolCore(
-					"Inline assembly local interface contains an invalid access classification.");
+				throw UnsupportedSolCore("Inline assembly local interface contains an invalid access classification.");
 			}
 			row["suffix"] = suffix;
 			result["locals"].emplace_back(std::move(row));
@@ -11433,10 +11935,7 @@ private:
 	static std::optional<u256> yulNumber(yul::Expression const& _expression)
 	{
 		auto const* literal = std::get_if<yul::Literal>(&_expression);
-		if (
-			!literal
-			|| literal->kind != yul::LiteralKind::Number
-			|| literal->value.unlimited())
+		if (!literal || literal->kind != yul::LiteralKind::Number || literal->value.unlimited())
 			return std::nullopt;
 		return literal->value.value();
 	}
@@ -11460,8 +11959,8 @@ private:
 	{
 		if (auto const* memberAccess = dynamic_cast<MemberAccess const*>(&_initializer))
 			if (memberAccess->memberName() == "selector")
-				if (auto const* functionType =
-					dynamic_cast<FunctionType const*>(memberAccess->expression().annotation().type))
+				if (auto const* functionType
+					= dynamic_cast<FunctionType const*>(memberAccess->expression().annotation().type))
 				{
 					try
 					{
@@ -11515,12 +12014,10 @@ private:
 		auto reference = m_externalReferences.find(identifier);
 		if (reference == m_externalReferences.end() || !reference->second.suffix.empty())
 			return std::nullopt;
-		auto const* variable =
-			dynamic_cast<VariableDeclaration const*>(reference->second.declaration);
-		auto const* fixedBytes =
-			variable && variable->annotation().type
-				? dynamic_cast<FixedBytesType const*>(variable->annotation().type)
-				: nullptr;
+		auto const* variable = dynamic_cast<VariableDeclaration const*>(reference->second.declaration);
+		auto const* fixedBytes = variable && variable->annotation().type
+									 ? dynamic_cast<FixedBytesType const*>(variable->annotation().type)
+									 : nullptr;
 		if (!fixedBytes || fixedBytes->numBytes() != 4)
 			return std::nullopt;
 		// State constants carry their initializer on the declaration; a LOCAL
@@ -11541,7 +12038,7 @@ private:
 	bool isBuiltin(yul::FunctionCall const& _call, std::string_view _name) const
 	{
 		return yul::resolveBuiltinFunction(_call.functionName, m_dialect)
-			&& yul::resolveFunctionName(_call.functionName, m_dialect) == _name;
+			   && yul::resolveFunctionName(_call.functionName, m_dialect) == _name;
 	}
 
 	bool isZeroLiteral(yul::Expression const& _expression) const
@@ -11557,28 +12054,17 @@ private:
 			return std::nullopt;
 		auto const* root = std::get_if<yul::Identifier>(&andCall->arguments[0]);
 		auto const* shrCall = std::get_if<yul::FunctionCall>(&andCall->arguments[1]);
-		if (
-			!root
-			|| !shrCall
-			|| !isBuiltin(*shrCall, "shr")
-			|| shrCall->arguments.size() != 2)
+		if (!root || !shrCall || !isBuiltin(*shrCall, "shr") || shrCall->arguments.size() != 2)
 			return std::nullopt;
 		auto shift = yulNumber(shrCall->arguments[0]);
 		auto const* notCall = std::get_if<yul::FunctionCall>(&shrCall->arguments[1]);
-		if (
-			!shift
-			|| *shift != 96
-			|| !notCall
-			|| !isBuiltin(*notCall, "not")
-			|| notCall->arguments.size() != 1
+		if (!shift || *shift != 96 || !notCall || !isBuiltin(*notCall, "not") || notCall->arguments.size() != 1
 			|| !isZeroLiteral(notCall->arguments[0]))
 			return std::nullopt;
 		return externalLocalName(*root);
 	}
 
-	std::optional<Json> staticArgument(
-		u256 const& _byteOffset,
-		yul::Expression const& _expression) const
+	std::optional<Json> staticArgument(u256 const& _byteOffset, yul::Expression const& _expression) const
 	{
 		std::optional<std::string> source = maskedAddressRoot(_expression);
 		std::string abiType = "address";
@@ -11600,39 +12086,25 @@ private:
 		return result;
 	}
 
-	void tryDecodeStaticExternalCall(
-		yul::FunctionCall const& _call,
-		MemoryPrefix const& _prefix)
+	void tryDecodeStaticExternalCall(yul::FunctionCall const& _call, MemoryPrefix const& _prefix)
 	{
 		std::string operation(yul::resolveFunctionName(_call.functionName, m_dialect));
 		bool const isCall = operation == "call";
 		bool const isStaticCall = operation == "staticcall";
-		if (
-			(!isCall && !isStaticCall)
-			|| !yul::resolveBuiltinFunction(_call.functionName, m_dialect)
-			|| _call.arguments.size() != (isCall ? 7 : 6)
-			|| _prefix.unknownWrite)
+		if ((!isCall && !isStaticCall) || !yul::resolveBuiltinFunction(_call.functionName, m_dialect)
+			|| _call.arguments.size() != (isCall ? 7 : 6) || _prefix.unknownWrite)
 			return;
 
 		size_t const targetIndex = 1;
 		size_t const valueIndex = 2;
 		size_t const inputOffsetIndex = isCall ? 3 : 2;
 		size_t const inputSizeIndex = isCall ? 4 : 3;
-		auto const* targetIdentifier =
-			std::get_if<yul::Identifier>(&_call.arguments[targetIndex]);
-		auto target = targetIdentifier
-			? externalLocalName(*targetIdentifier)
-			: std::nullopt;
+		auto const* targetIdentifier = std::get_if<yul::Identifier>(&_call.arguments[targetIndex]);
+		auto target = targetIdentifier ? externalLocalName(*targetIdentifier) : std::nullopt;
 		auto inputOffset = yulNumber(_call.arguments[inputOffsetIndex]);
 		auto inputSize = yulNumber(_call.arguments[inputSizeIndex]);
-		if (
-			!target
-			|| (isCall && !isZeroLiteral(_call.arguments[valueIndex]))
-			|| !inputOffset
-			|| !inputSize
-			|| *inputSize < 4
-			|| (*inputSize - 4) % 32 != 0
-			|| *inputOffset > std::numeric_limits<uint64_t>::max())
+		if (!target || (isCall && !isZeroLiteral(_call.arguments[valueIndex])) || !inputOffset || !inputSize
+			|| *inputSize < 4 || (*inputSize - 4) % 32 != 0 || *inputOffset > std::numeric_limits<uint64_t>::max())
 			return;
 		u256 const inputEnd = *inputOffset + *inputSize;
 		if (inputEnd < *inputOffset)
@@ -11661,14 +12133,11 @@ private:
 
 		for (auto const& [offset, value]: _prefix.stores)
 		{
-			(void)value;
+			(void) value;
 			u256 const storeEnd = offset + 32;
 			if (storeEnd < offset)
 				return;
-			if (
-				offset < inputEnd
-				&& storeEnd > *inputOffset
-				&& !expectedStoreOffsets.count(offset))
+			if (offset < inputEnd && storeEnd > *inputOffset && !expectedStoreOffsets.count(offset))
 				return;
 		}
 
@@ -11683,17 +12152,14 @@ private:
 		m_staticExternalCalls.emplace_back(std::move(result));
 	}
 
-	bool scanExpressionForStaticCall(
-		yul::Expression const& _expression,
-		MemoryPrefix const& _prefix)
+	bool scanExpressionForStaticCall(yul::Expression const& _expression, MemoryPrefix const& _prefix)
 	{
 		auto const* call = std::get_if<yul::FunctionCall>(&_expression);
 		if (!call)
 			return false;
 		std::string operation(yul::resolveFunctionName(call->functionName, m_dialect));
-		bool const isExternalCall =
-			yul::resolveBuiltinFunction(call->functionName, m_dialect)
-			&& (operation == "call" || operation == "staticcall");
+		bool const isExternalCall = yul::resolveBuiltinFunction(call->functionName, m_dialect)
+									&& (operation == "call" || operation == "staticcall");
 		if (isExternalCall)
 			tryDecodeStaticExternalCall(*call, _prefix);
 		bool found = isExternalCall;
@@ -11705,9 +12171,8 @@ private:
 	void recordMemoryStore(yul::Statement const& _statement, MemoryPrefix& _prefix)
 	{
 		auto const* expressionStatement = std::get_if<yul::ExpressionStatement>(&_statement);
-		auto const* call = expressionStatement
-			? std::get_if<yul::FunctionCall>(&expressionStatement->expression)
-			: nullptr;
+		auto const* call
+			= expressionStatement ? std::get_if<yul::FunctionCall>(&expressionStatement->expression) : nullptr;
 		if (!call)
 			return;
 		std::string operation(yul::resolveFunctionName(call->functionName, m_dialect));
@@ -11729,9 +12194,8 @@ private:
 			_prefix.stores[*offset] = &call->arguments[1];
 		}
 		else if (inlineAssemblyOperationIs(
-			operation,
-			{"mstore8", "calldatacopy", "codecopy", "extcodecopy",
-				"returndatacopy", "mcopy", "datacopy"}))
+					 operation,
+					 {"mstore8", "calldatacopy", "codecopy", "extcodecopy", "returndatacopy", "mcopy", "datacopy"}))
 			_prefix.unknownWrite = true;
 	}
 
@@ -11747,18 +12211,14 @@ private:
 				if (auto const* expression = std::get_if<yul::ExpressionStatement>(&statement))
 					foundCall = scanExpressionForStaticCall(expression->expression, prefix);
 				else if (auto const* assignment = std::get_if<yul::Assignment>(&statement))
-					foundCall = assignment->value
-						&& scanExpressionForStaticCall(*assignment->value, prefix);
+					foundCall = assignment->value && scanExpressionForStaticCall(*assignment->value, prefix);
 				else if (auto const* declaration = std::get_if<yul::VariableDeclaration>(&statement))
-					foundCall = declaration->value
-						&& scanExpressionForStaticCall(*declaration->value, prefix);
+					foundCall = declaration->value && scanExpressionForStaticCall(*declaration->value, prefix);
 			}
 
-			bool const branch =
-				std::holds_alternative<yul::If>(statement)
-				|| std::holds_alternative<yul::ForLoop>(statement)
-				|| std::holds_alternative<yul::Switch>(statement)
-				|| std::holds_alternative<yul::Block>(statement);
+			bool const branch
+				= std::holds_alternative<yul::If>(statement) || std::holds_alternative<yul::ForLoop>(statement)
+				  || std::holds_alternative<yul::Switch>(statement) || std::holds_alternative<yul::Block>(statement);
 			if (collecting && !foundCall && !branch)
 				recordMemoryStore(statement, prefix);
 			if (foundCall || branch)
@@ -11782,10 +12242,7 @@ private:
 		}
 	}
 
-	void operator()(yul::Identifier const& _identifier) override
-	{
-		recordExternalIdentifier(_identifier, ReadAccess);
-	}
+	void operator()(yul::Identifier const& _identifier) override { recordExternalIdentifier(_identifier, ReadAccess); }
 
 	void operator()(yul::Assignment const& _assignment) override
 	{
@@ -11816,8 +12273,7 @@ private:
 			return;
 		m_seenExternalReferences.insert(&_identifier);
 
-		auto const* variable
-			= dynamic_cast<VariableDeclaration const*>(reference->second.declaration);
+		auto const* variable = dynamic_cast<VariableDeclaration const*>(reference->second.declaration);
 		if (!variable || !variable->annotation().type)
 			throw UnsupportedSolCore(
 				"Inline assembly external reference '" + _identifier.name.str()
@@ -11829,46 +12285,36 @@ private:
 		// solc, while ordinary calldata arrays remain outside this closed shape;
 		// non-calldata `.offset` retains the existing storage-layout admission.
 		auto const* arrayType = dynamic_cast<ArrayType const*>(variable->annotation().type);
-		bool const isCalldataArray =
-			arrayType && arrayType->location() == DataLocation::CallData;
-		bool const isCalldataBytesString =
-			isCalldataArray
-			&& arrayType->isDynamicallySized()
-			&& arrayType->isByteArrayOrString();
-		bool const isCalldataBytesStringLength =
-			reference->second.suffix == "length" && isCalldataBytesString;
-		bool const isRepresentableOffset =
-			reference->second.suffix == "offset"
-			&& (!isCalldataArray || isCalldataBytesString);
+		bool const isCalldataArray = arrayType && arrayType->location() == DataLocation::CallData;
+		bool const isCalldataBytesString
+			= isCalldataArray && arrayType->isDynamicallySized() && arrayType->isByteArrayOrString();
+		bool const isCalldataBytesStringLength = reference->second.suffix == "length" && isCalldataBytesString;
+		bool const isRepresentableOffset
+			= reference->second.suffix == "offset" && (!isCalldataArray || isCalldataBytesString);
 		std::string suffix;
 		if (reference->second.suffix.empty())
 			suffix = "none";
-		else if (
-			reference->second.suffix == "slot"
-			|| isRepresentableOffset
-			|| isCalldataBytesStringLength)
+		else if (reference->second.suffix == "slot" || isRepresentableOffset || isCalldataBytesStringLength)
 			suffix = reference->second.suffix;
 		else
 			throw UnsupportedSolCore(
-				"Inline assembly external reference '" + _identifier.name.str()
-				+ "' uses unsupported suffix '." + reference->second.suffix
-				+ "'; only none, .slot, non-calldata .offset, and calldata bytes/string .offset/.length are representable.");
+				"Inline assembly external reference '" + _identifier.name.str() + "' uses unsupported suffix '."
+				+ reference->second.suffix
+				+ "'; only none, .slot, non-calldata .offset, and calldata bytes/string .offset/.length are "
+				  "representable.");
 
 		std::string declarationId = std::to_string(variable->id());
 		auto declaration = m_declarations.find(declarationId);
 		if (declaration == m_declarations.end())
 		{
 			Json carrierType = exportAssemblyCaptureType(*variable);
-			m_declarations.emplace(
-				declarationId,
-				DeclarationInfo{variable, std::move(carrierType)});
+			m_declarations.emplace(declarationId, DeclarationInfo{variable, std::move(carrierType)});
 		}
 		else if (declaration->second.declaration != variable)
 			throw UnsupportedSolCore(
 				"Inline assembly external references contain a duplicate producer declaration id.");
 
-		m_localAccesses[
-			std::make_tuple(declarationId, variable->name(), std::move(suffix))] |= _access;
+		m_localAccesses[std::make_tuple(declarationId, variable->name(), std::move(suffix))] |= _access;
 	}
 
 	void classifyBuiltin(yul::BuiltinFunction const& _builtin)
@@ -11881,10 +12327,17 @@ private:
 
 		bool const isCall = inlineAssemblyOperationIs(
 			operation,
-			{"call", "callcode", "delegatecall", "staticcall", "create", "create2",
-				"extcall", "extdelegatecall", "extstaticcall", "eofcreate"});
-		bool const isLog
-			= inlineAssemblyOperationIs(operation, {"log0", "log1", "log2", "log3", "log4"});
+			{"call",
+			 "callcode",
+			 "delegatecall",
+			 "staticcall",
+			 "create",
+			 "create2",
+			 "extcall",
+			 "extdelegatecall",
+			 "extstaticcall",
+			 "eofcreate"});
+		bool const isLog = inlineAssemblyOperationIs(operation, {"log0", "log1", "log2", "log3", "log4"});
 		bool const readsStorage = operation == "sload";
 		bool const writesStorage = operation == "sstore";
 		bool const readsTransient = operation == "tload";
@@ -11892,19 +12345,17 @@ private:
 		bool const readsReturndata = operation == "returndatasize";
 		bool const copiesReturndata = operation == "returndatacopy";
 		bool const terminates = inlineAssemblyOperationIs(
-			operation,
-			{"stop", "return", "revert", "invalid", "selfdestruct", "returncontract"});
-		bool const readsEnvironment = inlineAssemblyOperationIs(
-			operation,
-			{"address", "balance", "origin", "caller", "callvalue",
-				"calldataload", "calldatasize", "calldatacopy",
-				"codesize", "codecopy", "gasprice",
-				"extcodesize", "extcodecopy", "extcodehash",
-				"blockhash", "coinbase", "timestamp", "number",
-				"difficulty", "prevrandao", "gaslimit", "chainid",
-				"selfbalance", "basefee", "blobhash", "blobbasefee",
-				"pc", "gas", "dataload", "dataloadn", "auxdataloadn",
-				"datasize", "dataoffset", "datacopy"});
+			operation, {"stop", "return", "revert", "invalid", "selfdestruct", "returncontract"});
+		bool const readsEnvironment
+			= inlineAssemblyOperationIs(operation, {"address",	   "balance",	   "origin",	   "caller",
+													"callvalue",   "calldataload", "calldatasize", "calldatacopy",
+													"codesize",	   "codecopy",	   "gasprice",	   "extcodesize",
+													"extcodecopy", "extcodehash",  "blockhash",	   "coinbase",
+													"timestamp",   "number",	   "difficulty",   "prevrandao",
+													"gaslimit",	   "chainid",	   "selfbalance",  "basefee",
+													"blobhash",	   "blobbasefee",  "pc",		   "gas",
+													"dataload",	   "dataloadn",	   "auxdataloadn", "datasize",
+													"dataoffset",  "datacopy"});
 
 		if (isCall)
 			m_effects.insert("call");
@@ -11932,12 +12383,18 @@ private:
 			m_memoryReads = true;
 		else if (sideEffects.memory == yul::SideEffects::Write)
 		{
-			bool const readsAndWritesMemory = inlineAssemblyOperationIs(
-				operation, {"mcopy", "call", "callcode", "delegatecall", "staticcall"});
+			bool const readsAndWritesMemory
+				= inlineAssemblyOperationIs(operation, {"mcopy", "call", "callcode", "delegatecall", "staticcall"});
 			bool const writesOnlyMemory = inlineAssemblyOperationIs(
 				operation,
-				{"mstore", "mstore8", "calldatacopy", "codecopy", "extcodecopy",
-					"returndatacopy", "datacopy", "setimmutable"});
+				{"mstore",
+				 "mstore8",
+				 "calldatacopy",
+				 "codecopy",
+				 "extcodecopy",
+				 "returndatacopy",
+				 "datacopy",
+				 "setimmutable"});
 			if (!readsAndWritesMemory && !writesOnlyMemory)
 				throw UnsupportedSolCore(
 					"Inline assembly dialect operation '" + operation
@@ -11949,48 +12406,36 @@ private:
 		bool const representsStorage = isCall || readsStorage || writesStorage;
 		bool const representsTransient = isCall || readsTransient || writesTransient;
 		bool const representsOtherState
-			= isCall || isLog || terminates || readsEnvironment
-			  || readsReturndata || copiesReturndata;
-		if (
-			sideEffects.storage != yul::SideEffects::None
-			&& !representsStorage)
+			= isCall || isLog || terminates || readsEnvironment || readsReturndata || copiesReturndata;
+		if (sideEffects.storage != yul::SideEffects::None && !representsStorage)
 			throw UnsupportedSolCore(
 				"Inline assembly dialect operation '" + operation
 				+ "' has persistent-storage semantics outside the closed effect set.");
-		if (
-			sideEffects.transientStorage != yul::SideEffects::None
-			&& !representsTransient)
+		if (sideEffects.transientStorage != yul::SideEffects::None && !representsTransient)
 			throw UnsupportedSolCore(
 				"Inline assembly dialect operation '" + operation
 				+ "' has transient-storage semantics outside the closed effect set.");
-		if (
-			sideEffects.otherState != yul::SideEffects::None
-			&& !representsOtherState)
+		if (sideEffects.otherState != yul::SideEffects::None && !representsOtherState)
 			throw UnsupportedSolCore(
 				"Inline assembly dialect operation '" + operation
 				+ "' has environment semantics outside the closed interface.");
 
-		if (
-			(readsStorage && sideEffects.storage != yul::SideEffects::Read)
+		if ((readsStorage && sideEffects.storage != yul::SideEffects::Read)
 			|| (writesStorage && sideEffects.storage != yul::SideEffects::Write)
 			|| (readsTransient && sideEffects.transientStorage != yul::SideEffects::Read)
 			|| (writesTransient && sideEffects.transientStorage != yul::SideEffects::Write))
 			throw UnsupportedSolCore(
-				"Inline assembly dialect metadata disagrees with the resolved operation '"
-				+ operation + "'.");
+				"Inline assembly dialect metadata disagrees with the resolved operation '" + operation + "'.");
 
 		auto const& controlFlow = _builtin.controlFlowSideEffects;
-		if (
-			(controlFlow.canTerminate || controlFlow.canRevert || !controlFlow.canContinue)
-			&& !terminates)
+		if ((controlFlow.canTerminate || controlFlow.canRevert || !controlFlow.canContinue) && !terminates)
 			throw UnsupportedSolCore(
 				"Inline assembly dialect operation '" + operation
 				+ "' has control-flow semantics outside the closed termination effect.");
 	}
 
 	yul::Dialect const& m_dialect;
-	std::map<yul::Identifier const*, InlineAssemblyAnnotation::ExternalIdentifierInfo> const&
-		m_externalReferences;
+	std::map<yul::Identifier const*, InlineAssemblyAnnotation::ExternalIdentifierInfo> const& m_externalReferences;
 	std::set<std::string> m_localFunctions;
 	std::set<yul::Identifier const*> m_seenExternalReferences;
 	std::map<std::string, DeclarationInfo> m_declarations;
@@ -12208,17 +12653,14 @@ std::optional<Json> exportInternalFnIdentityReinterpret(InlineAssembly const& _a
 		return std::nullopt;
 	auto lhsReference = references.find(&assignment->variableNames.front());
 	auto rhsReference = references.find(rhs);
-	if (lhsReference == references.end() || rhsReference == references.end()
-		|| !lhsReference->second.suffix.empty() || !rhsReference->second.suffix.empty())
+	if (lhsReference == references.end() || rhsReference == references.end() || !lhsReference->second.suffix.empty()
+		|| !rhsReference->second.suffix.empty())
 		return std::nullopt;
-	auto const* targetDeclaration
-		= dynamic_cast<VariableDeclaration const*>(lhsReference->second.declaration);
-	auto const* sourceDeclaration
-		= dynamic_cast<VariableDeclaration const*>(rhsReference->second.declaration);
+	auto const* targetDeclaration = dynamic_cast<VariableDeclaration const*>(lhsReference->second.declaration);
+	auto const* sourceDeclaration = dynamic_cast<VariableDeclaration const*>(rhsReference->second.declaration);
 	if (!sourceDeclaration || !targetDeclaration || sourceDeclaration == targetDeclaration
-		|| sourceDeclaration->scope() != targetDeclaration->scope()
-		|| !sourceDeclaration->isCallableOrCatchParameter() || sourceDeclaration->isReturnParameter()
-		|| !targetDeclaration->isReturnParameter())
+		|| sourceDeclaration->scope() != targetDeclaration->scope() || !sourceDeclaration->isCallableOrCatchParameter()
+		|| sourceDeclaration->isReturnParameter() || !targetDeclaration->isReturnParameter())
 		return std::nullopt;
 	auto const* function = dynamic_cast<FunctionDefinition const*>(sourceDeclaration->scope());
 	if (!function || function->parameters().size() != 1 || function->returnParameters().size() != 1
@@ -12260,7 +12702,14 @@ Json exportStmtDispatch(Statement const& _stmt)
 			result["unchecked"] = true;
 		result["statements"] = Json::array();
 		for (auto const& statement: block->statements())
-			result["statements"].emplace_back(exportStmt(*statement));
+		{
+			Json exported = exportStmt(*statement);
+			if (exported.value("_solcoreSyntheticSequence", false))
+				for (Json& nested: exported["statements"])
+					result["statements"].emplace_back(std::move(nested));
+			else
+				result["statements"].emplace_back(std::move(exported));
+		}
 		return result;
 	}
 
@@ -12352,22 +12801,32 @@ Json exportStmtDispatch(Statement const& _stmt)
 			{
 				if (auto resolved = resolveStorageRefInitializer(*varDecl->initialValue(), decl))
 				{
-					// Keep the existing fail-closed gate until dynamic-array
-					// delete is lowered through StorageArray.clear rather than
-					// replacing the backing sparse slot map.
 					if (storageRefTargetRacesArrayShrink(resolved->first))
-						throw UnsupportedSolCore(
-							"Storage reference bound to an element of `" + resolved->first.root
-							+ "`, which this function can shrink (`pop()`/`delete`/whole "
-							  "reassignment), is not modeled until every shrink path preserves "
-							  "the bound slot identity.");
-					storageRefAliasTargets[&decl] = resolved->first;
-					Json result = Json::object();
-					result["kind"] = "block";
-					result["statements"] = Json::array();
-					for (Json const& snapshotLet: resolved->second)
-						result["statements"].emplace_back(snapshotLet);
-					return result;
+					{
+						// A read-only pointer must keep the exact slot selected at
+						// binding time when its source array later shrinks.  The
+						// first-class StorageRef carrier does exactly that; live
+						// path substitution would re-check the shorter array and
+						// diverge from solc.  Writes through such a pointer remain
+						// fail-closed until raw-slot writeback is modeled.
+						if (storageRefWriteThroughLocals.count(&decl))
+							throw UnsupportedSolCore(
+								"Writable storage reference bound to an element of `"
+								+ resolved->first.root
+								+ "` races an array shrink and has no exact raw-slot writeback.");
+						storageRefNeverTrack.insert(&decl);
+					}
+					else
+					{
+						storageRefAliasTargets[&decl] = resolved->first;
+						Json result = Json::object();
+						result["kind"] = "block";
+						result["_solcoreSyntheticSequence"] = true;
+						result["statements"] = Json::array();
+						for (Json const& snapshotLet: resolved->second)
+							result["statements"].emplace_back(snapshotLet);
+						return result;
+					}
 				}
 				// Unresolved: fall through to the status-quo copy-`let` lowering
 				// below (§3.6 fallback policy — zero-regression guarantee).
@@ -12391,6 +12850,14 @@ Json exportStmtDispatch(Statement const& _stmt)
 				}
 		}
 		// --- End general storage-reference-variable alias tracking ---
+		// A storage-located component of a tuple declaration receives an
+		// identity-carrying reference from the compiler-typed tuple result. Keep
+		// it first-class: a value-copy fallback would lose every later write
+		// through the local.
+		if (varDecl->declarations().size() > 1 && varDecl->initialValue())
+			for (auto const& declaration: varDecl->declarations())
+				if (declaration && declaration->referenceLocation() == VariableDeclaration::Location::Storage)
+					storageRefValueLocals.insert(declaration.get());
 
 		// [P0 fail-closed: E0(a')] Every storage-located declaration that
 		// reaches this point is UNTRACKED — the namespaced-alias arm and the
@@ -12411,7 +12878,8 @@ Json exportStmtDispatch(Statement const& _stmt)
 				// E0(a') refusal — is owned by its assignment statement (see
 				// exportAssignment); the guard must not fire before the bind
 				// site has been reached.
-				if (!storageRefSingleAssignBindable.count(declaredVar.get()))
+				if (!storageRefSingleAssignBindable.count(declaredVar.get())
+					&& !storageRefValueLocals.count(declaredVar.get()))
 					requireNoWriteThroughUntrackedStorageLocalOrThrow(*declaredVar);
 
 		// Single variable declaration with initializer (common case)
@@ -12468,13 +12936,22 @@ Json exportStmtDispatch(Statement const& _stmt)
 		{
 			Json result = Json::object();
 			result["kind"] = "block";
+			result["_solcoreSyntheticSequence"] = true;
 			result["statements"] = Json::array();
 
-			// First, evaluate the initializer expression (if any) to a temporary
+			// Evaluate the initializer once in the surrounding statement scope.
+			// A source call's declaration carrier includes storage-reference
+			// tuple components that the AST's value type alone cannot express.
 			Json initValue;
+			Json initType;
 			if (varDecl->initialValue())
+			{
 				initValue = exportExpr(*varDecl->initialValue());
-
+				initType = exportResolvedType(varDecl->initialValue()->annotation().type);
+				if (auto const* call = dynamic_cast<FunctionCall const*>(varDecl->initialValue()))
+					if (auto const* function = calledFunctionDefinition(*call))
+						initType = effectiveDeclarationResultCarrier(*function);
+			}
 			for (size_t i = 0; i < varDecl->declarations().size(); ++i)
 			{
 				auto const& decl = varDecl->declarations()[i];
@@ -12488,26 +12965,36 @@ Json exportStmtDispatch(Statement const& _stmt)
 				bool storage = location.is_string() && location.get<std::string>() == "storage";
 				if (!location.is_null())
 					letStmt["location"] = location;
-				try
-				{
-					letStmt["type"] = exportTypeName(decl->typeName(), storage);
-				}
-				catch (...)
-				{
-					letStmt["type"] = Json("u256");
-				}
+				if (storage)
+					letStmt["type"] = storageRefWireType(decl->annotation().type);
+				else
+					try
+					{
+						letStmt["type"] = exportTypeName(decl->typeName(), false);
+					}
+					catch (...)
+					{
+						letStmt["type"] = Json("u256");
+					}
 				if (varDecl->initialValue())
 				{
-					// For tuple returns, extract the i-th element
+					// For tuple returns, extract the i-th element with the
+					// declaration-owned carrier. The AST value type omits memory
+					// and storage-reference identity.
+					if (!initType.is_object() || initType.value("kind", ""s) != "tuple"
+						|| !initType["elements"].is_array() || i >= initType["elements"].size())
+						throw UnsupportedSolCore(
+							"Tuple declaration initializer has no exact declaration-owned component carrier.");
 					Json extractExpr = Json::object();
-					extractExpr["kind"] = "internal_call";
-					extractExpr["function"] = "tuple_get";
-					extractExpr["args"] = Json::array();
-					extractExpr["args"].emplace_back(initValue);
+					extractExpr["kind"] = "tuple_get";
+					extractExpr["tuple"] = initValue;
 					Json idx = Json::object();
 					idx["kind"] = "u256";
 					idx["value"] = std::to_string(i);
-					extractExpr["args"].emplace_back(idx);
+					extractExpr["index"] = idx;
+					extractExpr["tupleType"] = initType;
+					extractExpr["indexType"] = "u256";
+					extractExpr["resultType"] = initType["elements"][i];
 					letStmt["value"] = extractExpr;
 				}
 				else
@@ -12605,14 +13092,17 @@ Json exportStmtDispatch(Statement const& _stmt)
 					= dynamic_cast<FunctionDefinition const*>(callee->annotation().referencedDeclaration);
 				if (funcDef)
 				{
-					std::string plainName = virtualCallTargetName(*funcDef);
 					FunctionDefinition const& resolvedImpl = resolveInternalCallImplementation(*funcDef);
+					std::string plainName = isPublicLibraryStructuralStorageFunction(resolvedImpl)
+												? storageRefInternalEntryName(resolvedImpl)
+												: virtualCallTargetName(*funcDef);
 					auto [calleeName, callArgs] = lowerInternalCalleeAndArgs(*call, resolvedImpl, plainName);
 					Json result = Json::object();
 					result["kind"] = "expr";
 					Json callExpr = Json::object();
 					callExpr["kind"] = "internal_call";
 					callExpr["function"] = std::move(calleeName);
+					callExpr["authority"] = sourceCallAuthority(resolvedImpl, std::nullopt, callArgs.size());
 					callExpr["args"] = std::move(callArgs);
 					result["value"] = callExpr;
 					return result;
@@ -12636,7 +13126,8 @@ Json exportStmtDispatch(Statement const& _stmt)
 					Json callExpr = Json::object();
 					callExpr["kind"] = "internal_call";
 					callExpr["function"] = std::move(calleeName);
-					addStaticBaseCallTarget(callExpr, *resolved);
+					callExpr["authority"] = sourceCallAuthority(
+						*resolved->target, internalFnContractId(*resolved->target), callArgs.size());
 					callExpr["args"] = std::move(callArgs);
 					result["value"] = callExpr;
 					return result;
@@ -12681,6 +13172,15 @@ Json exportStmtDispatch(Statement const& _stmt)
 								update["function"] = "array_push_default_expr";
 							else
 								update["function"] = "array_push_expr";
+							Json updateAuthority = Json::object();
+							updateAuthority["kind"] = "runtime";
+							updateAuthority["runtimeKind"] = update["function"];
+							updateAuthority["inputTypes"] = Json::array({exportResolvedType(baseType, true)});
+							if (memberAccess->memberName() == "push" && !call->arguments().empty())
+								updateAuthority["inputTypes"].emplace_back(
+									exportResolvedType(call->arguments().front()->annotation().type));
+							updateAuthority["resultType"] = exportResolvedType(baseType, true);
+							update["authority"] = std::move(updateAuthority);
 							update["args"] = Json::array();
 							update["args"].emplace_back(storageRefGetJson(localExpr(tempName), baseType));
 							if (memberAccess->memberName() == "push" && !call->arguments().empty())
@@ -12739,6 +13239,15 @@ Json exportStmtDispatch(Statement const& _stmt)
 									callExpr["function"] = "array_push_default_expr";
 								else
 									callExpr["function"] = "array_push_expr";
+								Json callAuthority = Json::object();
+								callAuthority["kind"] = "runtime";
+								callAuthority["runtimeKind"] = callExpr["function"];
+								callAuthority["inputTypes"] = Json::array({exportResolvedType(baseType, true)});
+								if (hasPushedValue)
+									callAuthority["inputTypes"].emplace_back(
+										exportResolvedType(call->arguments().front()->annotation().type));
+								callAuthority["resultType"] = exportResolvedType(baseType, true);
+								callExpr["authority"] = std::move(callAuthority);
 								callExpr["args"] = Json::array();
 								callExpr["args"].emplace_back(std::move(*rootedBase));
 								if (hasPushedValue)
@@ -12820,7 +13329,8 @@ Json exportStmtDispatch(Statement const& _stmt)
 												: exportedFunctionName(*funcDef);
 					auto [calleeName, callArgs] = lowerInternalCalleeAndArgs(*call, *funcDef, std::move(plainName));
 					callExpr["function"] = std::move(calleeName);
-					addInternalLibraryCallContractId(callExpr, *funcDef);
+					callExpr["authority"]
+						= sourceCallAuthority(*funcDef, internalFnContractId(*funcDef), callArgs.size());
 					callExpr["args"] = std::move(callArgs);
 					result["value"] = std::move(callExpr);
 					return result;
@@ -12950,14 +13460,18 @@ Json exportStmtDispatch(Statement const& _stmt)
 					lowLevel["data"] = emptyBytesLiteral();
 
 					Json okValue = Json::object();
-					okValue["kind"] = "internal_call";
-					okValue["function"] = "tuple_get";
-					okValue["args"] = Json::array();
-					okValue["args"].emplace_back(std::move(lowLevel));
+					okValue["kind"] = "tuple_get";
+					okValue["tuple"] = std::move(lowLevel);
 					Json index = Json::object();
 					index["kind"] = "u256";
 					index["value"] = "0";
-					okValue["args"].emplace_back(std::move(index));
+					okValue["index"] = std::move(index);
+					Json tupleType = Json::object();
+					tupleType["kind"] = "tuple";
+					tupleType["elements"] = Json::array({"bool", "bytes"});
+					okValue["tupleType"] = std::move(tupleType);
+					okValue["indexType"] = "u256";
+					okValue["resultType"] = "bool";
 
 					std::string tempName = "__solcore_transfer_ok_" + std::to_string(stableSyntheticNodeId(*call));
 					Json letStmt = Json::object();
@@ -13019,15 +13533,13 @@ Json exportStmtDispatch(Statement const& _stmt)
 		auto const* eventDef = dynamic_cast<EventDefinition const*>(eventDecl);
 		if (!eventDef)
 			throw UnsupportedSolCore(
-				"emit of event '" + rawEventName
-				+ "' could not be resolved to its declaration-owned parameter types.");
+				"emit of event '" + rawEventName + "' could not be resolved to its declaration-owned parameter types.");
 		result["event"] = exportedEventName(*eventDef);
 		result["eventDeclarationId"] = std::to_string(static_cast<int64_t>(eventDef->id()));
 
 		auto const& parameters = eventDef->parameters();
 		if (call.arguments().size() != parameters.size())
-			throw UnsupportedSolCore(
-				"emit argument count does not match its compiler-resolved event declaration.");
+			throw UnsupportedSolCore("emit argument count does not match its compiler-resolved event declaration.");
 
 		bool observable = false;
 		bool hasIndexed = false;
@@ -13046,8 +13558,8 @@ Json exportStmtDispatch(Statement const& _stmt)
 			std::vector<Json> evaluated(call.arguments().size());
 			auto captureArgument = [&](size_t index)
 			{
-				evaluated[index] = captureMeasuredOrderChild(
-					*call.arguments()[index], "emit_arg_" + std::to_string(index));
+				evaluated[index]
+					= captureMeasuredOrderChild(*call.arguments()[index], "emit_arg_" + std::to_string(index));
 			};
 
 			if (hasIndexed)
@@ -13083,8 +13595,7 @@ Json exportStmtDispatch(Statement const& _stmt)
 		for (auto const& parameter: parameters)
 		{
 			if (!parameter->annotation().type)
-				throw UnsupportedSolCore(
-					"Emit declaration parameter has no compiler-resolved type.");
+				throw UnsupportedSolCore("Emit declaration parameter has no compiler-resolved type.");
 			result["argTypes"].emplace_back(exportResolvedType(parameter->annotation().type));
 		}
 		return result;
@@ -13154,21 +13665,30 @@ Json exportStmtDispatch(Statement const& _stmt)
 		if (whileStmt->isDoWhile())
 			if (auto const* cond = dynamic_cast<BinaryOperation const*>(&whileStmt->condition()))
 			{
-				auto comparisonKind = [&](Token _op, Type const* _commonType) -> char const* {
+				auto comparisonKind = [&](Token _op, Type const* _commonType) -> char const*
+				{
 					auto const* integerType = dynamic_cast<IntegerType const*>(_commonType);
 					bool const signedType = integerType && integerType->isSigned();
 					switch (_op)
 					{
-					case Token::Equal: return "u256_eq";
-					case Token::NotEqual: return "u256_ne";
-					case Token::LessThan: return signedType ? "i256_lt" : "u256_lt";
-					case Token::LessThanOrEqual: return signedType ? "i256_le" : "u256_le";
-					case Token::GreaterThan: return signedType ? "i256_gt" : "u256_gt";
-					case Token::GreaterThanOrEqual: return signedType ? "i256_ge" : "u256_ge";
-					default: return nullptr;
+					case Token::Equal:
+						return "u256_eq";
+					case Token::NotEqual:
+						return "u256_ne";
+					case Token::LessThan:
+						return signedType ? "i256_lt" : "u256_lt";
+					case Token::LessThanOrEqual:
+						return signedType ? "i256_le" : "u256_le";
+					case Token::GreaterThan:
+						return signedType ? "i256_gt" : "u256_gt";
+					case Token::GreaterThanOrEqual:
+						return signedType ? "i256_ge" : "u256_ge";
+					default:
+						return nullptr;
 					}
 				};
-				auto prefixMutation = [](Expression const& _operand) -> UnaryOperation const* {
+				auto prefixMutation = [](Expression const& _operand) -> UnaryOperation const*
+				{
 					auto const* unary = dynamic_cast<UnaryOperation const*>(&_operand);
 					if (unary && unary->isPrefixOperation()
 						&& (unary->getOperator() == Token::Inc || unary->getOperator() == Token::Dec))
@@ -13184,26 +13704,27 @@ Json exportStmtDispatch(Statement const& _stmt)
 				}
 				Type const* commonType = cond->annotation().commonType;
 				char const* kind = comparisonKind(cond->getOperator(), commonType);
-				auto const* mutatedIdent = mutation
-					? dynamic_cast<Identifier const*>(&mutation->subExpression())
-					: nullptr;
-				auto const* mutatedDecl = mutatedIdent
-					? dynamic_cast<VariableDeclaration const*>(mutatedIdent->annotation().referencedDeclaration)
-					: nullptr;
-				bool const plainStackLocal = mutatedDecl && !mutatedDecl->isStateVariable()
-					&& mutatedDecl->referenceLocation() != VariableDeclaration::Location::Storage
-					&& namespacedStorageAliases.count(mutatedDecl->name()) == 0;
+				auto const* mutatedIdent
+					= mutation ? dynamic_cast<Identifier const*>(&mutation->subExpression()) : nullptr;
+				auto const* mutatedDecl
+					= mutatedIdent
+						  ? dynamic_cast<VariableDeclaration const*>(mutatedIdent->annotation().referencedDeclaration)
+						  : nullptr;
+				bool const plainStackLocal
+					= mutatedDecl && !mutatedDecl->isStateVariable()
+					  && mutatedDecl->referenceLocation() != VariableDeclaration::Location::Storage
+					  && namespacedStorageAliases.count(mutatedDecl->name()) == 0;
 				// The independent operand may be side-effect-free directly or a
 				// pure elementary-type conversion of one (the witness family
 				// compares against `uint256(0)`); the cast neither reads nor
 				// writes anything its argument does not.
-				auto sideEffectFreeOrPureCast = [](Expression const& _expr) -> Expression const* {
+				auto sideEffectFreeOrPureCast = [](Expression const& _expr) -> Expression const*
+				{
 					if (isSideEffectFreeExpr(_expr))
 						return &_expr;
 					if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
 						if (*call->annotation().kind == FunctionCallKind::TypeConversion
-							&& call->arguments().size() == 1
-							&& isSideEffectFreeExpr(*call->arguments().front()))
+							&& call->arguments().size() == 1 && isSideEffectFreeExpr(*call->arguments().front()))
 							return call->arguments().front().get();
 					return nullptr;
 				};
@@ -13227,7 +13748,8 @@ Json exportStmtDispatch(Statement const& _stmt)
 					otherIndependent = !scanner.found;
 				}
 				bool const integerFamily = commonType
-					&& (dynamic_cast<IntegerType const*>(commonType) || dynamic_cast<RationalNumberType const*>(commonType));
+										   && (dynamic_cast<IntegerType const*>(commonType)
+											   || dynamic_cast<RationalNumberType const*>(commonType));
 				// `continue` transfers to the CONDITION, whose embedded
 				// mutation still runs on the EVM; the desugared form places
 				// the mutation at the body tail, which `continue` would skip.
@@ -13239,9 +13761,17 @@ Json exportStmtDispatch(Statement const& _stmt)
 				{
 					bool found = false;
 					unsigned depth = 0;
-					bool visit(WhileStatement const&) override { ++depth; return true; }
+					bool visit(WhileStatement const&) override
+					{
+						++depth;
+						return true;
+					}
 					void endVisit(WhileStatement const&) override { --depth; }
-					bool visit(ForStatement const&) override { ++depth; return true; }
+					bool visit(ForStatement const&) override
+					{
+						++depth;
+						return true;
+					}
 					void endVisit(ForStatement const&) override { --depth; }
 					bool visit(Continue const&) override
 					{
@@ -13252,17 +13782,18 @@ Json exportStmtDispatch(Statement const& _stmt)
 				} continueScanner;
 				whileStmt->body().accept(continueScanner);
 				bool const noOwnContinue = !continueScanner.found;
-				if (mutation && kind && plainStackLocal && otherIndependent && integerFamily
-					&& noOwnContinue)
+				if (mutation && kind && plainStackLocal && otherIndependent && integerFamily && noOwnContinue)
 				{
 					Json condition = Json::object();
 					condition["kind"] = kind;
 					Json mutatedRead = exportExpr(mutation->subExpression());
 					Json otherValue = exportExpr(*other);
 					condition["lhs"] = (&cond->leftExpression() == static_cast<Expression const*>(other))
-						? std::move(otherValue) : std::move(mutatedRead);
+										   ? std::move(otherValue)
+										   : std::move(mutatedRead);
 					condition["rhs"] = (&cond->leftExpression() == static_cast<Expression const*>(other))
-						? exportExpr(mutation->subExpression()) : exportExpr(*other);
+										   ? exportExpr(mutation->subExpression())
+										   : exportExpr(*other);
 					Json bodyBlock = Json::object();
 					bodyBlock["kind"] = "block";
 					bodyBlock["statements"] = Json::array();
@@ -13292,7 +13823,38 @@ Json exportStmtDispatch(Statement const& _stmt)
 			result["init"] = exportStmt(*forStmt->initializationExpression());
 		else
 			result["init"] = Json();
-		if (forStmt->condition())
+		bool conditionRunsInBody = false;
+		if (forStmt->condition() && evalOrderRelevant(*forStmt->condition()))
+		{
+			// A for-condition is re-evaluated after every post expression, so
+			// its hoisted prefixes cannot escape before the loop.  Run the
+			// exact condition at the top of each iteration and gate the
+			// original body there.  A continue from the original body still
+			// reaches the for-post expression; a false condition breaks
+			// before that post, exactly as the source loop does.
+			Json condition;
+			std::vector<Json> conditionStatements;
+			{
+				HoistScopeGuard conditionScope({forStmt->condition()});
+				condition = exportExpr(*forStmt->condition());
+				conditionStatements = conditionScope.takeStatements();
+			}
+			Json breakStatement = Json::object();
+			breakStatement["kind"] = "break";
+			Json gate = Json::object();
+			gate["kind"] = "if";
+			gate["cond"] = std::move(condition);
+			gate["then"] = exportStmt(forStmt->body());
+			gate["else"] = blockFromStatements({std::move(breakStatement)});
+			conditionStatements.emplace_back(std::move(gate));
+			Json always = Json::object();
+			always["kind"] = "bool";
+			always["value"] = true;
+			result["cond"] = std::move(always);
+			result["body"] = blockFromStatements(std::move(conditionStatements));
+			conditionRunsInBody = true;
+		}
+		else if (forStmt->condition())
 			result["cond"] = exportExpr(*forStmt->condition());
 		else
 			result["cond"] = Json();
@@ -13303,7 +13865,8 @@ Json exportStmtDispatch(Statement const& _stmt)
 		}
 		else
 			result["post"] = Json();
-		result["body"] = exportStmt(forStmt->body());
+		if (!conditionRunsInBody)
+			result["body"] = exportStmt(forStmt->body());
 		return result;
 	}
 
@@ -13870,11 +14433,12 @@ bool isKnownStorageSlotHelperOracle(FunctionDefinition const& _function)
 
 // [storage-ref-alias review fix] Resolve a slot-getter call argument to a
 // compile-time constant u256, or nullopt. Deliberately minimal (fail
-// closed): a plain number/hex literal, or an Identifier/MemberAccess chain
-// of `constant` variable declarations bottoming out in such a literal —
-// exactly the shape the OZ EIP-1967 slot constants use
-// (`bytes32 internal constant _ADMIN_SLOT = 0xb531...;`). Anything else
-// (arithmetic, keccak256 calls, non-constant variables) returns nullopt.
+// closed): a plain number/hex literal, an Identifier/MemberAccess chain of
+// `constant` variable declarations bottoming out in such a literal, or a
+// zero-argument pure wrapper whose sole statement returns one of those
+// forms. This covers OZ's direct EIP-1967 constants and its
+// `_reentrancyGuardStorageSlot()` wrapper without accepting arithmetic,
+// keccak256 calls, stateful calls, or non-constant variables.
 std::optional<u256> resolveCompileTimeSlotConstant(Expression const& _expr, size_t _depth = 0)
 {
 	if (_depth > 16)
@@ -13885,6 +14449,19 @@ std::optional<u256> resolveCompileTimeSlotConstant(Expression const& _expr, size
 			if (!rational->isFractional())
 				return rational->literalValue(literal);
 		return std::nullopt;
+	}
+	if (auto const* call = dynamic_cast<FunctionCall const*>(&_expr))
+	{
+		if (!call->arguments().empty())
+			return std::nullopt;
+		FunctionDefinition const* target = resolveWriteOracleCallTarget(call->expression(), activeExportContract);
+		if (!target || target->stateMutability() != StateMutability::Pure || !target->parameters().empty()
+			|| !target->isImplemented() || target->body().statements().size() != 1)
+			return std::nullopt;
+		auto const* returnStatement = dynamic_cast<Return const*>(target->body().statements().front().get());
+		if (!returnStatement || !returnStatement->expression())
+			return std::nullopt;
+		return resolveCompileTimeSlotConstant(*returnStatement->expression(), _depth + 1);
 	}
 	Declaration const* declaration = nullptr;
 	if (auto const* identifier = dynamic_cast<Identifier const*>(&_expr))
@@ -13913,9 +14490,10 @@ std::optional<u256> resolveCompileTimeSlotConstant(Expression const& _expr, size
 // zero-regression).
 bool isDisjointConstantSlotArgument(FunctionCall const& _call)
 {
-	if (_call.arguments().size() != 1 || !_call.arguments().front())
+	Expression const* slotArgument = ozStorageRefSelfArgument(_call);
+	if (!slotArgument)
 		return false;
-	auto slotValue = resolveCompileTimeSlotConstant(*_call.arguments().front());
+	auto slotValue = resolveCompileTimeSlotConstant(*slotArgument);
 	if (!slotValue.has_value())
 		return false;
 	return *slotValue >= (u256(1) << 64);
@@ -14609,8 +15187,7 @@ std::vector<VariableDeclaration const*> inlineAssemblyConstantDeclarations(Funct
 		{
 			for (auto const& entry: _assembly.annotation().externalReferences)
 			{
-				auto const* declaration
-					= dynamic_cast<VariableDeclaration const*>(entry.second.declaration);
+				auto const* declaration = dynamic_cast<VariableDeclaration const*>(entry.second.declaration);
 				if (!declaration || !declaration->isConstant())
 					continue;
 				if (!declaration->value())
@@ -14621,8 +15198,7 @@ std::vector<VariableDeclaration const*> inlineAssemblyConstantDeclarations(Funct
 				std::string declarationId = std::to_string(declaration->id());
 				auto [it, inserted] = declarations.emplace(declarationId, declaration);
 				if (!inserted && it->second != declaration)
-					throw UnsupportedSolCore(
-						"Inline assembly constant declaration ID is not unique.");
+					throw UnsupportedSolCore("Inline assembly constant declaration ID is not unique.");
 			}
 			return true;
 		}
@@ -14632,8 +15208,7 @@ std::vector<VariableDeclaration const*> inlineAssemblyConstantDeclarations(Funct
 	_function.body().accept(collector);
 	for (auto const& modifierInvocation: _function.modifiers())
 	{
-		ModifierDefinition const* modifierDefinition
-			= resolveModifierDefinition(_function, *modifierInvocation);
+		ModifierDefinition const* modifierDefinition = resolveModifierDefinition(_function, *modifierInvocation);
 		if (modifierDefinition && modifierDefinition->isImplemented())
 			modifierDefinition->body().accept(collector);
 	}
@@ -14723,6 +15298,10 @@ Json exportBody(FunctionDefinition const& _function)
 	for (auto const& parameter: _function.parameters())
 		if (isStructuralStorageRefParameter(_function, parameter.get()))
 			storageRefValueLocals.insert(parameter.get());
+	for (auto const& returnParameter: _function.returnParameters())
+		if (Json location = dataLocationEntry(*returnParameter);
+			location.is_string() && location.get<std::string>() == "storage")
+			storageRefValueLocals.insert(returnParameter.get());
 
 
 	Json body;
@@ -14864,21 +15443,36 @@ Json exportBody(FunctionDefinition const& _function)
 				letStmt["kind"] = "let";
 				letStmt["sourceDeclarationId"] = std::to_string(retParam->id());
 				letStmt["name"] = retParam->name();
-				if (Json location = dataLocationEntry(*retParam); !location.is_null())
-					letStmt["location"] = std::move(location);
-				try
+				Json location = dataLocationEntry(*retParam);
+				bool const storage = location.is_string() && location.get<std::string>() == "storage";
+				if (!location.is_null())
+					letStmt["location"] = location;
+				if (storage)
 				{
-					letStmt["type"] = exportTypeName(retParam->typeName());
-					letStmt["value"] = defaultValueForTypeName(retParam->typeName());
-				}
-				catch (...)
-				{
-					letStmt["type"] = Json("u256");
+					letStmt["type"] = storageRefWireType(retParam->annotation().type);
 					Json zero = Json::object();
 					zero["kind"] = "u256";
 					zero["value"] = "0";
-					letStmt["value"] = zero;
+					Json defaultReference = Json::object();
+					defaultReference["kind"] = "storage_ref_raw_slot";
+					defaultReference["referentType"] = exportResolvedType(retParam->annotation().type, true);
+					defaultReference["slot"] = std::move(zero);
+					letStmt["value"] = std::move(defaultReference);
 				}
+				else
+					try
+					{
+						letStmt["type"] = exportTypeName(retParam->typeName());
+						letStmt["value"] = defaultValueForTypeName(retParam->typeName());
+					}
+					catch (...)
+					{
+						letStmt["type"] = Json("u256");
+						Json zero = Json::object();
+						zero["kind"] = "u256";
+						zero["value"] = "0";
+						letStmt["value"] = zero;
+					}
 				// Prepend at the beginning of the block
 				Json newStatements = Json::array();
 				newStatements.emplace_back(letStmt);
@@ -14918,8 +15512,8 @@ Json exportBody(FunctionDefinition const& _function)
 			{
 				// Unnamed return parameter — preserve the resolved type and its
 				// memory/storage location in the compiler-inserted default.
-				ret["value"] = typedDefaultValueForResolvedType(
-					_function.returnParameters().front()->annotation().type);
+				ret["value"]
+					= typedDefaultValueForResolvedType(_function.returnParameters().front()->annotation().type);
 			}
 			else
 			{
@@ -14936,8 +15530,7 @@ Json exportBody(FunctionDefinition const& _function)
 						tuple["elements"].emplace_back(std::move(local));
 					}
 					else
-						tuple["elements"].emplace_back(
-							typedDefaultValueForResolvedType(retParam->annotation().type));
+						tuple["elements"].emplace_back(typedDefaultValueForResolvedType(retParam->annotation().type));
 				}
 				ret["value"] = std::move(tuple);
 			}
@@ -14986,6 +15579,8 @@ Json exportFunction(
 
 
 	Json result = Json::object();
+	result["declarationId"] = std::to_string(_function.id());
+	result["declarationContractId"] = internalFnContractId(_function);
 	if (_storageRefCompanion)
 	{
 		result["name"] = storageRefInternalEntryName(_function);
@@ -15022,13 +15617,12 @@ Json exportFunction(
 			Json param = Json::object();
 			param["sourceDeclarationId"] = std::to_string(parameter->id());
 			param["name"] = parameter->name().empty() ? ("arg" + std::to_string(parameter->id())) : parameter->name();
-			param["type"] = rawSlotParams.count(parameter.get()) ? Json("u256")
-																 : storageRefWireType(parameter->annotation().type);
+			param["type"] = effectiveDeclarationParameterCarrier(
+				_function, *parameter, rawSlotParams.count(parameter.get()) != 0);
 			if (Json location = dataLocationEntry(*parameter); !location.is_null())
 				param["location"] = std::move(location);
 			if (abiVisible)
-				param["abi"] = exportAbiDescriptor(
-					parameter->name(), parameter->annotation().type, abiForLibrary);
+				param["abi"] = exportAbiDescriptor(parameter->name(), parameter->annotation().type, abiForLibrary);
 			result["params"].emplace_back(std::move(param));
 			continue;
 		}
@@ -15047,7 +15641,8 @@ Json exportFunction(
 				// descriptor is invented for this fallback.
 				Json param = Json::object();
 				param["sourceDeclarationId"] = std::to_string(parameter->id());
-				param["name"] = parameter->name().empty() ? ("arg" + std::to_string(parameter->id())) : parameter->name();
+				param["name"]
+					= parameter->name().empty() ? ("arg" + std::to_string(parameter->id())) : parameter->name();
 				param["type"] = Json("u256");
 				result["params"].emplace_back(param);
 			}
@@ -15058,7 +15653,7 @@ Json exportFunction(
 	else if (_function.returnParameters().size() == 1)
 	{
 		if (isResidualStorageRefFunction(_function))
-			result["return"] = storageRefWireType(_function.returnParameters().front()->annotation().type);
+			result["return"] = effectiveDeclarationResultCarrier(_function);
 		else
 		{
 			if (abiVisible)
@@ -15104,8 +15699,8 @@ Json exportFunction(
 	{
 		result["returnAbi"] = Json::array();
 		for (auto const& retParam: _function.returnParameters())
-			result["returnAbi"].emplace_back(exportAbiDescriptor(
-				retParam->name(), retParam->annotation().type, abiForLibrary));
+			result["returnAbi"].emplace_back(
+				exportAbiDescriptor(retParam->name(), retParam->annotation().type, abiForLibrary));
 	}
 	// Additive schema field, symmetric with exportParam's `location`: the
 	// RESOLVED data locations of the RETURN parameters, aligned
@@ -15192,6 +15787,46 @@ Json exportFunction(
 	return result;
 }
 
+Json exportReadonlyVariableGetter(FunctionType const& _functionType, VariableDeclaration const& _variable)
+{
+	if (!_variable.isStateVariable() || (!_variable.isConstant() && !_variable.immutable()))
+		throw UnsupportedSolCore("Readonly getter export requires a constant or immutable state declaration.");
+	auto const* owner = dynamic_cast<ContractDefinition const*>(_variable.scope());
+	if (!owner)
+		throw UnsupportedSolCore("Readonly getter declaration has no compiler-resolved contract owner.");
+	auto abi = exportFunctionAbiDescriptors(_functionType);
+	auto returnType = exportReturnType(_functionType.returnParameterTypes());
+	if (!abi.params.empty() || abi.returns.size() != 1 || !returnType)
+		throw UnsupportedSolCore("Readonly getter does not have its expected zero-argument, single-result interface.");
+
+	Json value;
+	if (_variable.immutable())
+		value = immutableGet(_variable);
+	else
+	{
+		if (!_variable.value())
+			throw UnsupportedSolCore("Constant getter declaration has no initializer.");
+		NarrowBytesWideningScanner::checkFlow(*_variable.value(), _variable.type());
+		value = exportExpr(*_variable.value());
+	}
+
+	Json result = Json::object();
+	result["declarationId"] = std::to_string(_variable.id());
+	result["declarationContractId"] = exportedContractId(*owner);
+	result["name"] = _variable.name();
+	result["params"] = Json::array();
+	result["paramsAbi"] = std::move(abi.params);
+	result["return"] = std::move(*returnType);
+	result["returnAbi"] = std::move(abi.returns);
+	if (Json location = dataLocationEntry(_functionType.returnParameterTypes().front()); !location.is_null())
+		result["returnLocations"] = Json::array({std::move(location)});
+	result["stateMutability"] = stateMutabilityToString(_functionType.stateMutability());
+	result["sourceLocation"] = sourceLocation(_variable.location());
+	result["body"] = Json{{"kind", "block"}, {"statements", Json::array({Json{{"kind", "return"}, {"value", std::move(value)}}})}};
+	result["ast_write_oracle"] = Json{{"writes", Json::array()}, {"unknown", false}};
+	return result;
+}
+
 std::vector<ASTPointer<Expression>> const* constructorArguments(ASTNode const& _node)
 {
 	if (auto const* inheritance = dynamic_cast<InheritanceSpecifier const*>(&_node))
@@ -15213,10 +15848,8 @@ void appendConstructorBodyStatements(
 				   : "body did not have the required block shape"));
 	Json const& bodyStatements = _body["statements"];
 	for (size_t i = 0; i < bodyStatements.size(); ++i)
-		if (
-			_includeTerminalReturn || i + 1 != bodyStatements.size() || !bodyStatements[i].is_object()
-			|| bodyStatements[i].value("kind", ""s) != "return"
-		)
+		if (_includeTerminalReturn || i + 1 != bodyStatements.size() || !bodyStatements[i].is_object()
+			|| bodyStatements[i].value("kind", ""s) != "return")
 			_statements.emplace_back(bodyStatements[i]);
 }
 void appendStateVariableInitializers(Json& _statements, ContractDefinition const& _contract)
@@ -15261,13 +15894,23 @@ Json exportConstructorChainBody(ContractDefinition const& _mostDerived)
 
 			if (_index != 0)
 				if (FunctionDefinition const* constructor = current->constructor())
-					for (auto const& parameter: constructor->parameters())
+				{
+					auto missingArgument = std::find_if(
+						constructor->parameters().begin(),
+						constructor->parameters().end(),
+						[&](auto const& _parameter) { return !argumentTemps.count(_parameter.get()); });
+					if (missingArgument != constructor->parameters().end())
 					{
-						auto temp = argumentTemps.find(parameter.get());
-						if (temp == argumentTemps.end())
+						if (!_mostDerived.abstract())
 							throw UnsupportedSolCore(
 								"No evaluated argument was available for base constructor parameter '"
-								+ parameter->name() + "' of '" + current->name() + "'.");
+								+ (*missingArgument)->name() + "' of '" + current->name() + "'.");
+						if (_index + 1 < derivedFirst.size())
+							statements.emplace_back(self(self, _index + 1));
+						return frame;
+					}
+					for (auto const& parameter: constructor->parameters())
+					{
 						Json binding = Json::object();
 						binding["kind"] = "let";
 						binding["sourceDeclarationId"] = std::to_string(parameter->id());
@@ -15275,17 +15918,17 @@ Json exportConstructorChainBody(ContractDefinition const& _mostDerived)
 											  ? ("constructor_arg" + std::to_string(parameter->id()))
 											  : parameter->name();
 						binding["type"] = exportTypeName(parameter->typeName());
-						binding["value"] = localExpr(temp->second);
+						binding["value"] = localExpr(argumentTemps.at(parameter.get()));
 						statements.emplace_back(std::move(binding));
 					}
+				}
 
 			for (ContractDefinition const* target: derivedFirst)
 			{
 				FunctionDefinition const* targetConstructor = target->constructor();
 				if (!targetConstructor)
 					continue;
-				auto annotated
-					= _mostDerived.annotation().baseConstructorArguments.find(targetConstructor);
+				auto annotated = _mostDerived.annotation().baseConstructorArguments.find(targetConstructor);
 				if (annotated == _mostDerived.annotation().baseConstructorArguments.end()
 					|| !current->location().contains(annotated->second->location()))
 					continue;
@@ -15316,10 +15959,8 @@ Json exportConstructorChainBody(ContractDefinition const& _mostDerived)
 			if (FunctionDefinition const* constructor = current->constructor())
 			{
 				if (!constructor->isImplemented())
-					throw UnsupportedSolCore(
-						"Base constructor for '" + current->name() + "' has no exportable body.");
-				appendConstructorBodyStatements(
-					statements, exportBody(*constructor), current->name(), _index == 0);
+					throw UnsupportedSolCore("Base constructor for '" + current->name() + "' has no exportable body.");
+				appendConstructorBodyStatements(statements, exportBody(*constructor), current->name(), _index == 0);
 			}
 			else if (_index == 0)
 				statements.emplace_back(Json{{"kind", "return"}, {"value", Json{{"kind", "unit"}}}});
@@ -15841,6 +16482,8 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	callEnvFields.emplace_back(Json{{"name", "msgSender"}, {"type", "address"}});
 	callEnvFields.emplace_back(Json{{"name", "origin"}, {"type", "address"}});
 	callEnvFields.emplace_back(Json{{"name", "msgValue"}, {"type", "u256"}});
+	callEnvFields.emplace_back(Json{{"name", "gasPrice"}, {"type", "u256"}});
+	callEnvFields.emplace_back(Json{{"name", "baseFee"}, {"type", "u256"}});
 	callEnvFields.emplace_back(Json{{"name", "blockTimestamp"}, {"type", "u256"}});
 	callEnvFields.emplace_back(Json{{"name", "blockNumber"}, {"type", "u256"}});
 	callEnvFields.emplace_back(Json{{"name", "chainId"}, {"type", "u256"}});
@@ -16035,8 +16678,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	{
 		auto it = foreignSummaryCache.find(candidate);
 		if (it == foreignSummaryCache.end())
-			it = foreignSummaryCache.emplace(
-				candidate, exportForeignContractSummary(_compilerStack, candidate)).first;
+			it = foreignSummaryCache.emplace(candidate, exportForeignContractSummary(_compilerStack, candidate)).first;
 		foreignContracts.emplace_back(it->second);
 	}
 	solcore["foreign_contracts"] = std::move(foreignContracts);
@@ -16268,15 +16910,26 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 		(void) selector;
 		if (!functionType)
 			throw UnsupportedSolCore(
-				"Contract '" + contract.name()
-				+ "' has a dispatch entry without a compiler-resolved function type.");
-		dispatchEntries.emplace_back(exportDispatchEntry(
-			functionType, dynamic_cast<FunctionDefinition const*>(&functionType->declaration())));
+				"Contract '" + contract.name() + "' has a dispatch entry without a compiler-resolved function type.");
+		dispatchEntries.emplace_back(
+			exportDispatchEntry(functionType, dynamic_cast<FunctionDefinition const*>(&functionType->declaration())));
 	}
 	solcore["dispatch_entries"] = std::move(dispatchEntries);
+	solcore["special_dispatch_entries"] = Json::array();
 
 	Json functions = Json::array();
 	Json internalFunctions = Json::array();
+
+	// Storage getters are synthesized from the retained storage layout. Constants
+	// and immutables have no such slot: preserve their bodies while their resolved
+	// declarations and initializer expressions are still available.
+	for (auto const& [selector, functionType]: contract.interfaceFunctions())
+	{
+		(void) selector;
+		auto const* variable = dynamic_cast<VariableDeclaration const*>(&functionType->declaration());
+		if (variable && (variable->isConstant() || variable->immutable()))
+			functions.emplace_back(exportReadonlyVariableGetter(*functionType, *variable));
+	}
 
 	// Collect exported internal function names to avoid duplicates
 	std::set<std::string> exportedInternalNames;
@@ -16339,31 +16992,29 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 		if (f.contains("name") && f["name"].is_string())
 			exportedPublicNames.insert(f["name"].get<std::string>());
 
-	// Second pass: export inherited public functions from base contracts,
-	// iterating in reverse linearization order (most-base first) so that
-	// actual implementations are preferred over super-delegating overrides.
+	// Second pass: export inherited public functions from most-derived to
+	// most-base. The first declaration for an exported virtual slot must be
+	// the implementation selected by Solidity dispatch; choosing a base body
+	// would make the function declaration and ABI disagree with the compiler's
+	// dispatch entry.
+	for (auto const* baseContract: contract.annotation().linearizedBaseContracts)
 	{
-		auto const& bases = contract.annotation().linearizedBaseContracts;
-		for (auto it = bases.rbegin(); it != bases.rend(); ++it)
+		if (baseContract == &contract)
+			continue;
+		for (FunctionDefinition const* function: baseContract->definedFunctions())
 		{
-			auto const* baseContract = *it;
-			if (baseContract == &contract)
+			if (!function->isOrdinary() || !function->isImplemented())
 				continue;
-			for (FunctionDefinition const* function: baseContract->definedFunctions())
-			{
-				if (!function->isOrdinary() || !function->isImplemented())
-					continue;
-				if (namespacedGetterDefinitions.count(function))
-					continue;
-				if (function->visibility() != Visibility::Public && function->visibility() != Visibility::External)
-					continue;
-				if (superReferencedFunctions.count(function))
-					continue;
-				if (exportedPublicNames.count(exportedFunctionName(*function)))
-					continue;
-				functions.emplace_back(exportFunction(*function, contract));
-				exportedPublicNames.insert(exportedFunctionName(*function));
-			}
+			if (namespacedGetterDefinitions.count(function))
+				continue;
+			if (function->visibility() != Visibility::Public && function->visibility() != Visibility::External)
+				continue;
+			if (superReferencedFunctions.count(function))
+				continue;
+			if (exportedPublicNames.count(exportedFunctionName(*function)))
+				continue;
+			functions.emplace_back(exportFunction(*function, contract));
+			exportedPublicNames.insert(exportedFunctionName(*function));
 		}
 	}
 
@@ -16403,21 +17054,45 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	auto exportAbiSpecialFunction = [&](FunctionDefinition const& _function, std::string const& _name)
 	{
 		Json f = Json::object();
+		f["declarationId"] = std::to_string(_function.id());
+		f["declarationContractId"] = internalFnContractId(_function);
+		Json entry = Json::object();
+		if (_function.isReceive())
+			entry["kind"] = "receive";
+		else if (_function.isFallback())
+			entry["kind"] = "fallback";
+		else
+			throw UnsupportedSolCore("Special dispatch requires a receive or fallback AST declaration.");
+		entry["declarationId"] = f["declarationId"];
+		entry["declarationContractId"] = f["declarationContractId"];
+		entry["stateMutability"] = stateMutabilityToString(_function.stateMutability());
+		solcore["special_dispatch_entries"].emplace_back(std::move(entry));
 		f["name"] = _name;
 		f["params"] = Json::array();
 		for (auto const& parameter: _function.parameters())
 			f["params"].emplace_back(exportParam(*parameter, true, false));
 		f["returnAbi"] = Json::array();
 		for (auto const& parameter: _function.returnParameters())
-			f["returnAbi"].emplace_back(exportAbiDescriptor(
-				parameter->name(), parameter->annotation().type, false));
+			f["returnAbi"].emplace_back(exportAbiDescriptor(parameter->name(), parameter->annotation().type, false));
 		if (_function.returnParameters().empty())
 			f["return"] = Json("unit");
 		else if (_function.returnParameters().size() == 1)
 			f["return"] = exportTypeName(_function.returnParameters().front()->typeName());
 		else
-			throw UnsupportedSolCore(
-				"ABI-visible " + _name + " function has more than one return parameter.");
+			throw UnsupportedSolCore("ABI-visible " + _name + " function has more than one return parameter.");
+		{
+			Json returnLocations = Json::array();
+			bool anyLocation = false;
+			for (auto const& retParam: _function.returnParameters())
+			{
+				Json location = retParam ? dataLocationEntry(*retParam) : Json();
+				if (!location.is_null())
+					anyLocation = true;
+				returnLocations.emplace_back(std::move(location));
+			}
+			if (anyLocation)
+				f["returnLocations"] = std::move(returnLocations);
+		}
 		f["body"] = exportBody(_function);
 		f["ast_write_oracle"] = astWriteOracleJson(_function, contract);
 		return f;
@@ -16608,13 +17283,12 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	if (!internalFnTablesByFingerprint.empty()
 		&& (internalFnAssemblyTouchesValue
 			|| (internalFnContractContainsAssembly
-				&& (contractHasStoredInternalFnValue(contract)
-					|| contractHasAggregateInternalFnValue(contract)))))
+				&& (contractHasStoredInternalFnValue(contract) || contractHasAggregateInternalFnValue(contract)))))
 	{
-		std::string const poisonReason =
-			"Inline assembly can mutate an internal-function value outside its closed candidate table; "
-			"raw assembly code-pointer construction is open-world, so every function whose export "
-			"involves an internal-function value is refused.";
+		std::string const poisonReason
+			= "Inline assembly can mutate an internal-function value outside its closed candidate table; "
+			  "raw assembly code-pointer construction is open-world, so every function whose export "
+			  "involves an internal-function value is refused.";
 		std::set<std::string> tableNames;
 		for (auto const& [fingerprint, table]: internalFnTablesByFingerprint)
 		{
@@ -16706,6 +17380,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 					"Internal-function delegate name collision at '" + candidate.delegateName + "'.");
 			Json candidateJson = Json::object();
 			candidateJson["tag"] = tag;
+			candidateJson["declarationId"] = candidate.declarationId;
 			candidateJson["function"] = candidate.functionName;
 			candidateJson["declarationContractId"] = candidate.declarationContractId;
 			candidateJson["targetContractId"] = candidate.targetContractId;
@@ -16738,8 +17413,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	for (EventDefinition const* event: contract.interfaceEvents(false))
 	{
 		if (!event)
-			throw UnsupportedSolCore(
-				"Compiler-resolved event declaration closure contains a null declaration.");
+			throw UnsupportedSolCore("Compiler-resolved event declaration closure contains a null declaration.");
 		events.emplace_back(exportEvent(*event));
 	}
 	solcore["events"] = std::move(events);
@@ -16797,6 +17471,20 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	Json origins = exportOrigins(contract);
 	for (auto const& [key, value]: metadata.items())
 		origins[key] = value;
+	if (_compilerStack.compilationSuccessful())
+	{
+		auto references = [&](bool runtime) {
+			Json result = Json::array();
+			if (auto const* object = _compilerStack.unlinkedObject(_contractName, runtime))
+				for (auto const& [offset, library]: object->linkReferences)
+					result.push_back({{"offset", offset}, {"library", library}});
+			return result;
+		};
+		origins["libraryReferences"] = {
+			{"creation", references(false)},
+			{"runtime", references(true)}
+		};
+	}
 
 	return {std::move(solcore), std::move(origins)};
 }
