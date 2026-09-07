@@ -190,6 +190,10 @@ public:
 		: Code(std::move(_code))
 	{
 	}
+	explicit SolidityCode(std::initializer_list<std::map<std::string, Json>::value_type> _code)
+		: Code(std::map<std::string, Json>(_code))
+	{
+	}
 	[[nodiscard]] Json json() const override { return createLanguageAndSourcesSection("Solidity", m_code); }
 };
 
@@ -2270,6 +2274,70 @@ BOOST_AUTO_TEST_CASE(solcore_export_emit_binds_declaration_parameter_types)
 		addressEmit->at("eventDeclarationId").get<std::string>(), addressDecl->at("declarationId").get<std::string>());
 	BOOST_CHECK_EQUAL(
 		hiddenEmit->at("eventDeclarationId").get<std::string>(), hiddenDecl->at("declarationId").get<std::string>());
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_encode_only_record_abi)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Encode.sol", R"(
+		pragma solidity >=0.8.20;
+		contract Encoder {
+			struct Inner { bytes4 tag; uint128 amount; }
+			// Deliberately misleading names: source types, not field names,
+			// determine the wire distinction erased by execution carriers.
+			struct Message { bytes flags; uint8[] blob; Inner inner; }
+			function encode(bytes memory flags, uint8[] memory blob) external pure returns (bytes memory) {
+				Message memory message = Message(flags, blob, Inner(bytes4(0x01020304), 7));
+				return abi.encode(message, uint16(9));
+			}
+		}
+	)"}}));
+
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json contractResult = getContractResult(result, "Encode.sol", "Encoder");
+	Json const& solcore = contractResult["solcore"];
+	BOOST_REQUIRE(solcore.is_object());
+
+	Json const* encoded = nullptr;
+	auto visit = [&](auto const& _self, Json const& _node) -> void
+	{
+		if (_node.is_object())
+		{
+			if (_node.value("kind", ""s) == "internal_call" && _node.value("function", ""s) == "abi_encode")
+			{
+				BOOST_REQUIRE(encoded == nullptr);
+				encoded = &_node;
+			}
+			for (auto const& value: _node)
+				_self(_self, value);
+		}
+		else if (_node.is_array())
+			for (auto const& value: _node)
+				_self(_self, value);
+	};
+	visit(visit, solcore["functions"]);
+	BOOST_REQUIRE(encoded != nullptr);
+	Json const& descriptors = encoded->at("encode_abi");
+	Json expected = Json::parse(R"([
+		{"name":"","type":"tuple","internalType":"struct Encoder.Message","components":[
+			{"name":"flags","type":"bytes","internalType":"bytes","components":[]},
+			{"name":"blob","type":"uint8[]","internalType":"uint8[]","components":[]},
+			{"name":"inner","type":"tuple","internalType":"struct Encoder.Inner","components":[
+				{"name":"tag","type":"bytes4","internalType":"bytes4","components":[]},
+				{"name":"amount","type":"uint128","internalType":"uint128","components":[]}
+			]}
+		]},
+		{"name":"","type":"uint16","internalType":"uint16","components":[]}
+	])");
+	BOOST_CHECK_EQUAL(util::jsonCompactPrint(descriptors), util::jsonCompactPrint(expected));
+
+	// The witness belongs to the real encode operand, not a fabricated
+	// signature or decode. Its nominal identity must match the typed call.
+	Json const& inputTypes = encoded->at("authority")["inputTypes"];
+	BOOST_REQUIRE_EQUAL(inputTypes.size(), descriptors.size());
+	BOOST_CHECK_EQUAL(inputTypes[0]["kind"].get<std::string>(), "named");
+	BOOST_CHECK_EQUAL(inputTypes[0]["name"].get<std::string>(), "Message");
+	BOOST_CHECK_EQUAL(inputTypes[1].get<std::string>(), "u16");
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_recursive_abi_and_call_modes)

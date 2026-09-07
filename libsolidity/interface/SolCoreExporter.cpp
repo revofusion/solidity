@@ -8967,6 +8967,24 @@ Json exportExpr(Expression const& _expr)
 									exportByteHelperArgumentType(call->arguments()[i]->annotation().type));
 						}
 						authority["resultType"] = exportByteHelperArgumentType(call->annotation().type);
+						if (memberAccess->memberName() == "encode")
+						{
+							// Execution carriers erase ABI distinctions such as bytes
+							// versus uint8[]. Preserve the compiler's argument types at
+							// the encode site, including records that never occur in a
+							// function signature or an abi.decode in this contract.
+							// Entries pair positionally with authority.inputTypes; no
+							// descriptor is reconstructed from the exported record.
+							result["encode_abi"] = Json::array();
+							for (auto const& arg: call->arguments())
+							{
+								Type const* sourceType = arg->annotation().type;
+								Type const* mobileType = sourceType ? sourceType->mobileType() : nullptr;
+								if (!mobileType)
+									throw UnsupportedSolCore("abi.encode argument has no compiler-resolved mobile type.");
+								result["encode_abi"].emplace_back(exportAbiDescriptor("", mobileType, false));
+							}
+						}
 						result["authority"] = std::move(authority);
 						return result;
 					}
