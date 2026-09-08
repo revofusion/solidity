@@ -1981,6 +1981,72 @@ BOOST_AUTO_TEST_CASE(solcore_export_minimal_subset)
 	BOOST_CHECK_EQUAL(origins["entries"][0]["originId"].get<std::string>(), "state:balances");
 }
 
+BOOST_AUTO_TEST_CASE(solcore_export_eval_order_capability_matches_pipeline)
+{
+	for (bool viaIR: {false, true})
+		for (bool optimize: {false, true})
+		{
+			Json input = generateStandardJson(viaIR, Json(), Json::array({"solcore", "solcoreOrigins"}), SolidityCode({{"fileA", R"(
+				pragma solidity >=0.8.20;
+				contract C {
+					uint256 state;
+					event E(uint256 indexed x, uint256 y);
+					error Failure(uint256 x, uint256 y);
+					function left() internal returns (uint256) { state = 1; return state; }
+					function right() internal returns (uint256) { state = 2; return state; }
+					function pair(uint256 x, uint256 y) internal pure returns (uint256) { return x + y; }
+					function binary() external returns (bool) { return left() >= right(); }
+					function named() external returns (uint256) { return pair({y: right(), x: left()}); }
+					function customError() external { revert Failure(left(), right()); }
+					function indexedEmit() external { emit E(left(), right()); }
+				}
+			)"}}));
+			input["settings"]["optimizer"]["enabled"] = optimize;
+
+			Json result = compile(input.dump());
+			BOOST_REQUIRE(containsAtMostWarnings(result));
+			Json contractResult = getContractResult(result, "fileA", "C");
+			std::string const commitment = viaIR
+				? "via-ir-solc-0.8/evalorder-v4"
+				: "legacy-solc-0.8/evalorder-v4";
+			for (char const* output: {"solcore", "solcoreOrigins"})
+			{
+				BOOST_REQUIRE(contractResult[output].is_object());
+				BOOST_CHECK_EQUAL(contractResult[output]["codegen"].get<std::string>(), viaIR ? "via-ir" : "legacy");
+				BOOST_CHECK_EQUAL(contractResult[output]["evalOrderCommitment"].get<std::string>(), commitment);
+			}
+
+			Json const& functions = contractResult["solcore"]["functions"];
+			BOOST_REQUIRE(functions.is_array());
+			std::set<std::string> checked;
+			for (Json const& function: functions)
+			{
+				std::string const name = function["name"].get<std::string>();
+				Json const& body = function["body"];
+				if (name == "binary")
+				{
+					// The capability preserves both original call operands for the
+					// consumer's pipeline-specific scheduling; it does not replace
+					// the expression with a constant or reorder the wire operands.
+					BOOST_REQUIRE_EQUAL(body["kind"].get<std::string>(), "block");
+					Json const& value = body["statements"][0]["value"];
+					BOOST_CHECK_EQUAL(value["kind"].get<std::string>(), "u256_ge");
+					BOOST_CHECK_EQUAL(value["lhs"]["kind"].get<std::string>(), "internal_call");
+					BOOST_CHECK_EQUAL(value["lhs"]["function"].get<std::string>(), "left");
+					BOOST_CHECK_EQUAL(value["rhs"]["kind"].get<std::string>(), "internal_call");
+					BOOST_CHECK_EQUAL(value["rhs"]["function"].get<std::string>(), "right");
+				}
+				else if (name == "named" || name == "customError" || name == "indexedEmit")
+					// A via-IR binary capability must not license legacy-only rows.
+					BOOST_CHECK_EQUAL(body["kind"].get<std::string>(), viaIR ? "unsupported_body" : "block");
+				else
+					continue;
+				checked.insert(name);
+			}
+			BOOST_CHECK(checked == std::set<std::string>({"binary", "named", "customError", "indexedEmit"}));
+		}
+}
+
 BOOST_AUTO_TEST_CASE(solcore_export_inline_assembly_constant_capture_declaration)
 {
 	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"fileA", R"(
@@ -4635,11 +4701,26 @@ BOOST_AUTO_TEST_CASE(solcore_export_assembly_derived_raw_slot_storage_pointer)
 				}
 				contract Pool is Guard {}
 
-				contract Negative {
-					struct BadSlot { uint256 value; }
-					constructor() { _bad().value = 7; }
-					function _bad() private pure returns (BadSlot storage result) {
+				contract Computed {
+					struct Word { uint256 value; }
+					Word[] private words;
+					constructor() { _constant().value = 7; }
+					function _constant() private pure returns (Word storage result) {
 						assembly ("memory-safe") { result.slot := add(40, 2) }
+					}
+					function _at(Word[] storage self, uint256 pos)
+						private pure returns (Word storage result)
+					{
+						assembly ("memory-safe") {
+							mstore(0, self.slot)
+							result.slot := add(keccak256(0, 0x20), pos)
+						}
+					}
+					function writeUnchecked(uint256 pos, uint256 value) external {
+						_at(words, pos).value = value;
+					}
+					function readUnchecked(uint256 pos) external view returns (uint256) {
+						return _at(words, pos).value;
 					}
 				}
 			)"}}));
@@ -4655,20 +4736,208 @@ BOOST_AUTO_TEST_CASE(solcore_export_assembly_derived_raw_slot_storage_pointer)
 
 	Json reinterpret = getContractResult(result, "fileA", "ReinterpretSlot")["solcore"];
 	Json const* assign = nullptr;
-	for (Json const& function: reinterpret["functions"])
+	for (Json const& function: reinterpret["internal_functions"])
 		if (function.value("name", ""s) == "assign")
 			assign = &function;
 	BOOST_REQUIRE(assign != nullptr);
 	std::string assignBody = (*assign)["body"].dump();
-	BOOST_CHECK_NE(assignBody.find("__solcore_evalorder_assignment_lhs_base"), std::string::npos);
 	BOOST_CHECK_NE(assignBody.find("\"function\":\"getStringSlot\""), std::string::npos);
 	BOOST_CHECK_NE(assignBody.find("\"kind\":\"internal_call\""), std::string::npos);
 
-	Json negative = getContractResult(result, "fileA", "Negative")["solcore"];
-	BOOST_REQUIRE_EQUAL(negative["constructor"]["body"]["kind"].get<std::string>(), "unsupported_body");
-	BOOST_CHECK_NE(
-		negative["constructor"]["body"]["error"].get<std::string>().find("raw-slot provenance is unresolvable"),
-		std::string::npos);
+	Json computed = getContractResult(result, "fileA", "Computed")["solcore"];
+	std::string const computedConstructor = computed["constructor"]["body"].dump();
+	BOOST_CHECK_EQUAL(computedConstructor.find("\"kind\":\"unsupported_body\""), std::string::npos);
+	BOOST_CHECK_NE(computedConstructor.find("\"function\":\"_constant\""), std::string::npos);
+	Json const* at = nullptr;
+	Json const* writeUnchecked = nullptr;
+	Json const* readUnchecked = nullptr;
+	for (char const* collection: {"functions", "internal_functions"})
+	for (Json const& function: computed[collection])
+	{
+		if (function.value("name", ""s) == "_at")
+			at = &function;
+		if (function.value("name", ""s) == "writeUnchecked")
+			writeUnchecked = &function;
+		if (function.value("name", ""s) == "readUnchecked")
+			readUnchecked = &function;
+	}
+	BOOST_REQUIRE(at != nullptr);
+	BOOST_REQUIRE(writeUnchecked != nullptr);
+	BOOST_REQUIRE(readUnchecked != nullptr);
+	std::string const atBody = at->at("body").dump();
+	BOOST_CHECK_EQUAL(atBody.find("\"kind\":\"unsupported_body\""), std::string::npos);
+	BOOST_CHECK_NE(atBody.find("mstore"), std::string::npos);
+	BOOST_CHECK_NE(atBody.find("keccak256"), std::string::npos);
+	BOOST_CHECK_NE(atBody.find("add"), std::string::npos);
+	for (Json const* caller: {writeUnchecked, readUnchecked})
+	{
+		std::string const body = caller->at("body").dump();
+		BOOST_CHECK_EQUAL(body.find("\"kind\":\"unsupported_body\""), std::string::npos);
+		BOOST_CHECK_NE(body.find("\"kind\":\"internal_call\""), std::string::npos);
+		BOOST_CHECK_NE(body.find("\"function\":\"_at\""), std::string::npos);
+		BOOST_CHECK_NE(body.find("\"declarationId\":" + at->at("declarationId").dump()), std::string::npos);
+		BOOST_CHECK_EQUAL(body.find("\"kind\":\"storage_ref_array\""), std::string::npos);
+	}
+}
+
+BOOST_AUTO_TEST_CASE(solcore_export_computed_storage_return_packed_field_write)
+{
+	Json input = generateStandardJson(false, Json(), Json::array({"solcore"}), SolidityCode({{"Packed.sol", R"(
+				pragma solidity >=0.8.20;
+				library Packed {
+					struct Entry { uint32 key; uint224 value; }
+					function at(Entry[] storage self, uint256 pos)
+						private pure returns (Entry storage result)
+					{
+						assembly {
+							mstore(0, self.slot)
+							result.slot := add(keccak256(0, 0x20), pos)
+						}
+					}
+					function update(Entry[] storage self, uint256 pos, uint224 value) internal {
+						at(self, pos).value = value;
+					}
+				}
+				contract Consumer {
+					Packed.Entry[] private entries;
+					function update(uint256 pos, uint224 value) external {
+						Packed.update(entries, pos, value);
+					}
+				}
+			)"}}));
+	Json result = compile(input.dump());
+	BOOST_REQUIRE(containsAtMostWarnings(result));
+	Json const solcore = getContractResult(result, "Packed.sol", "Consumer")["solcore"];
+	auto findDeclaration = [&](std::string const& scope, std::string const& id) -> Json const* {
+		Json const* declaration = nullptr;
+		for (char const* collection: {"functions", "internal_functions"})
+			for (Json const& function: solcore[collection])
+				if (
+					function.value("declarationContractId", ""s) == scope &&
+					function.value("declarationId", ""s) == id
+				)
+				{
+					BOOST_REQUIRE(declaration == nullptr);
+					declaration = &function;
+				}
+		return declaration;
+	};
+	auto sourceCalls = [](Json const& body) {
+		std::vector<Json const*> found;
+		std::function<void(Json const&)> visit = [&](Json const& node) {
+			if (node.is_object())
+			{
+				if (
+					node.value("kind", ""s) == "internal_call" &&
+					node.contains("authority") &&
+					node["authority"].value("kind", ""s) == "source"
+				)
+					found.push_back(&node);
+			}
+			if (node.is_object() || node.is_array())
+				for (Json const& child: node)
+					visit(child);
+		};
+		visit(body);
+		return found;
+	};
+	BOOST_REQUIRE_EQUAL(solcore["dispatch_entries"].size(), 1);
+	Json const& dispatch = solcore["dispatch_entries"][0];
+	BOOST_CHECK_EQUAL(dispatch["signature"].get<std::string>(), "update(uint256,uint224)");
+	Json const* publicUpdate = findDeclaration(
+		solcore["contract"].get<std::string>(), dispatch["declarationId"].get<std::string>()
+	);
+	BOOST_REQUIRE(publicUpdate != nullptr);
+	auto publicCalls = sourceCalls(publicUpdate->at("body"));
+	BOOST_REQUIRE_EQUAL(publicCalls.size(), 1);
+	Json const& updateAuthority = publicCalls[0]->at("authority");
+	Json const* update = findDeclaration(
+		updateAuthority["declarationContractId"].get<std::string>(),
+		updateAuthority["declarationId"].get<std::string>()
+	);
+	BOOST_REQUIRE(update != nullptr);
+	auto updateCalls = sourceCalls(update->at("body"));
+	BOOST_REQUIRE_EQUAL(updateCalls.size(), 1);
+	Json const& atAuthority = updateCalls[0]->at("authority");
+	Json const* at = findDeclaration(
+		atAuthority["declarationContractId"].get<std::string>(),
+		atAuthority["declarationId"].get<std::string>()
+	);
+	BOOST_REQUIRE(at != nullptr);
+	BOOST_REQUIRE(at->at("returnLocations") == Json::array({"storage"}));
+	BOOST_REQUIRE_EQUAL(at->at("return")["kind"].get<std::string>(), "named");
+	Json const referent{{"kind", "storage_named"}, {"name", at->at("return")["name"]}};
+	Json const expectedReference{{"kind", "storage_ref"}, {"referent", referent}};
+	BOOST_CHECK_EQUAL(update->at("body").dump().find("\"kind\":\"unsupported_body\""), std::string::npos);
+	BOOST_CHECK_EQUAL(at->at("body").dump().find("\"kind\":\"unsupported_body\""), std::string::npos);
+	BOOST_CHECK_NE(at->at("body").dump().find("keccak256"), std::string::npos);
+	BOOST_CHECK_NE(at->at("body").dump().find("mstore"), std::string::npos);
+	BOOST_CHECK_NE(at->at("body").dump().find("add"), std::string::npos);
+
+	size_t calls = 0;
+	Json const* field = nullptr;
+	Json const* write = nullptr;
+	std::map<std::string, Json const*> bindings;
+	auto visit = [&](auto const& self, Json const& node) -> void {
+		if (node.is_object())
+		{
+			std::string const kind = node.value("kind", ""s);
+			BOOST_CHECK_NE(kind, "storage_ref_array");
+			if (kind == "internal_call" && node.contains("authority")
+				&& node["authority"].value("declarationId", ""s) == at->at("declarationId"))
+			{
+				++calls;
+				BOOST_CHECK(node["authority"]["resultType"] == expectedReference);
+				BOOST_CHECK_EQUAL(node["authority"]["resultType"]["kind"].get<std::string>(), "storage_ref");
+			}
+			if (kind == "let")
+				bindings.emplace(node.at("name").get<std::string>(), &node);
+			if (kind == "storage_ref_field")
+				field = &node;
+			if (kind == "storage_ref_set")
+				write = &node;
+		}
+		if (node.is_object() || node.is_array())
+			for (Json const& child: node)
+				self(self, child);
+	};
+	visit(visit, update->at("body"));
+	BOOST_CHECK_EQUAL(calls, 1u);
+	BOOST_REQUIRE(field != nullptr);
+	BOOST_REQUIRE(write != nullptr);
+	BOOST_REQUIRE_EQUAL(field->at("base")["kind"].get<std::string>(), "local");
+	auto base = bindings.find(field->at("base")["name"].get<std::string>());
+	BOOST_REQUIRE(base != bindings.end());
+	BOOST_CHECK_EQUAL(base->second->at("value")["kind"].get<std::string>(), "internal_call");
+	BOOST_CHECK(base->second->at("value")["authority"]["declarationId"] == at->at("declarationId"));
+	BOOST_CHECK(base->second->at("type") == expectedReference);
+	BOOST_CHECK_EQUAL(field->at("field").get<std::string>(), "value");
+	BOOST_CHECK(field->at("containerType") == referent);
+	BOOST_CHECK(field->at("referentType") == write->at("referentType"));
+	BOOST_CHECK_EQUAL(field->at("referentType")["bits"].get<unsigned>(), 224u);
+	BOOST_REQUIRE_EQUAL(write->at("reference")["kind"].get<std::string>(), "local");
+	auto reference = bindings.find(write->at("reference")["name"].get<std::string>());
+	BOOST_REQUIRE(reference != bindings.end());
+	BOOST_CHECK(reference->second->at("value") == *field);
+	BOOST_CHECK(reference->second->at("type")["referent"] == write->at("referentType"));
+
+	bool packedField = false;
+	auto checkLayout = [&](auto const& self, Json const& node) -> void {
+		if (node.is_object() && node.value("name", ""s) == "Entry" && node.contains("fields"))
+			for (Json const& member: node["fields"])
+				if (member.value("name", ""s) == "value")
+				{
+					packedField = true;
+					BOOST_CHECK_EQUAL(member.at("storageSlot").get<std::string>(), "0");
+					BOOST_CHECK_EQUAL(member.at("byteOffset").get<unsigned>(), 4u);
+					BOOST_CHECK_EQUAL(member.at("byteWidth").get<unsigned>(), 28u);
+				}
+		if (node.is_object() || node.is_array())
+			for (Json const& child: node)
+				self(self, child);
+	};
+	checkLayout(checkLayout, solcore);
+	BOOST_CHECK(packedField);
 }
 
 BOOST_AUTO_TEST_CASE(solcore_export_overloaded_sub_storage_getters_are_disambiguated)

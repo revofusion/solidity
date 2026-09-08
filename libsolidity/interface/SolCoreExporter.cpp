@@ -122,7 +122,8 @@ size_t stableSyntheticNodeId(ASTNode const& _node)
 	return it->second;
 }
 
-static constexpr char EvalOrderCommitment[] = "legacy-solc-0.8/evalorder-v3";
+static constexpr char LegacyEvalOrderCommitment[] = "legacy-solc-0.8/evalorder-v4";
+static constexpr char ViaIREvalOrderCommitment[] = "via-ir-solc-0.8/evalorder-v4";
 
 /// Contextual target type for each byte/string literal in the function being
 /// exported. Solidity's literal annotation is only `literal_string`; the
@@ -1881,6 +1882,9 @@ Json exporterMetadata(std::string const& _contractName, bool _viaIR)
 	// field names the pipeline its table row was verified against. Absent
 	// field (older artifact) must be treated as UNKNOWN, never defaulted.
 	metadata["codegen"] = _viaIR ? "via-ir" : "legacy";
+	// The version identifies the measured row set, not blanket admission of
+	// every expression shape. Legacy-only row guards remain enforced below.
+	metadata["evalOrderCommitment"] = _viaIR ? ViaIREvalOrderCommitment : LegacyEvalOrderCommitment;
 	if (VersionCompactBytes.size() >= 2)
 		metadata["exporterFamily"] = "solcore-solidity-"s
 									 + std::to_string(static_cast<unsigned>(VersionCompactBytes[0])) + "."
@@ -1966,8 +1970,6 @@ Json unsupportedExport(std::string const& _contractName, std::string const& _rea
 	Json metadata = exporterMetadata(_contractName, _viaIR);
 	for (auto const& [key, value]: metadata.items())
 		result[key] = value;
-	if (!_viaIR)
-		result["evalOrderCommitment"] = EvalOrderCommitment;
 	return result;
 }
 
@@ -4042,12 +4044,12 @@ Json exportStorageRefSnapshotValue(Expression const& _expr, std::vector<Json>& _
 ///         returns (string storage result)
 ///     { assembly { result.slot := store.slot } }
 ///
-/// Invariant: the exporter owns slot-word provenance.  Admission requires the
-/// RHS to be one exact compiler external reference, optionally copied through
-/// Yul identifier-only moves.  A bare value parameter is snapshotted as a raw
-/// slot word; a captured storage parameter's `.slot` carries the caller's
-/// structurally resolved storage path. Arithmetic, calls, literals, unknown
-/// locals, mixed suffixes, and every other statement shape fail closed.
+/// This is an optional path simplification, not an admission check for the
+/// assembly body. Simplification requires exact compiler external references,
+/// optionally copied through Yul identifier-only moves. A bare value parameter
+/// is snapshotted as a raw slot word; a captured storage parameter's `.slot`
+/// carries the caller's structurally resolved storage path. Other shapes defer
+/// to the typed residual call, whose full body must still export successfully.
 std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 	FunctionDefinition const& _callee,
 	std::map<VariableDeclaration const*, Expression const*> const& _paramBinding,
@@ -4149,12 +4151,10 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 			if (
 				argument == _paramBinding.end() || !argument->second || !isStorageRefParameter(slotParameter)
 				|| !seedDeclaration || !seedDeclaration->isConstant() || !seedDeclaration->value())
-				throw UnsupportedSolCore(
-					"Assembly-assigned storage-pointer return scratch hash lacks exact parameter or constant provenance.");
+				return std::nullopt;
 			auto reference = exportStorageRefValue(*argument->second);
 			if (!reference)
-				throw UnsupportedSolCore(
-					"Assembly-assigned storage-pointer return scratch hash has an unresolved storage-reference argument.");
+				return std::nullopt;
 			Json helper = Json::object();
 			helper["kind"] = "internal_call";
 			helper["function"] = "storage_ref_keccak_slot__" + std::to_string(returnSlot->id());
@@ -4211,16 +4211,11 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 		if (assignsReturnSlot)
 		{
 			if (sawReturnAssignment || !rhs)
-				throw UnsupportedSolCore(
-					"Assembly-assigned storage-pointer return `" + returnSlot->name()
-					+ ".slot` has a slot expression that is not a single compiler-owned Solidity value; "
-					  "raw-slot provenance is unresolvable.");
+				return std::nullopt;
 			sawReturnAssignment = true;
 			rhsOrigin = exactOrigin(*rhs);
 			if (!rhsOrigin)
-				throw UnsupportedSolCore(
-					"Assembly-assigned storage-pointer return `" + returnSlot->name()
-					+ ".slot` has no exact compiler-owned slot-word provenance.");
+				return std::nullopt;
 			continue;
 		}
 
@@ -4241,29 +4236,20 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 	if (!sawReturnAssignment)
 		return std::nullopt;
 	if (sawNonMove || !rhsOrigin)
-		throw UnsupportedSolCore(
-			"Assembly-assigned storage-pointer return `" + returnSlot->name()
-			+ ".slot` has no exact compiler-owned slot-word provenance.");
+		return std::nullopt;
 
 	auto const* slotParameter = dynamic_cast<VariableDeclaration const*>(rhsOrigin->declaration);
 	auto argument = slotParameter ? _paramBinding.find(slotParameter) : _paramBinding.end();
 	if (argument == _paramBinding.end() || !argument->second)
-		throw UnsupportedSolCore(
-			"Assembly-assigned storage-pointer return `" + returnSlot->name()
-			+ ".slot` depends on a value that is not an exactly bound helper parameter; "
-			  "raw-slot provenance is unresolvable.");
+		return std::nullopt;
 
 	if (rhsOrigin->suffix == "slot")
 	{
 		if (!isStorageRefParameter(slotParameter))
-			throw UnsupportedSolCore(
-				"Assembly-assigned storage-pointer return `" + returnSlot->name()
-				+ ".slot` has no exact compiler-owned slot-word provenance.");
+			return std::nullopt;
 		auto target = resolveStorageRefPathRec(*argument->second, _snapshotOwner, _snapshots);
 		if (!target)
-			throw UnsupportedSolCore(
-				"Assembly-assigned storage-pointer return `" + returnSlot->name()
-				+ ".slot` depends on a captured storage slot whose caller path is unresolved.");
+			return std::nullopt;
 		// A `.slot` return may reinterpret the caller root as a different
 		// storage referent (ShortStrings' string -> StringSlot). Pinning the
 		// resolved root as the callee return type would create an ill-typed
@@ -4272,9 +4258,7 @@ std::optional<StorageRefTarget> resolveAssemblyRawSlotReturnPath(
 		return target;
 	}
 	if (!rhsOrigin->suffix.empty())
-		throw UnsupportedSolCore(
-			"Assembly-assigned storage-pointer return `" + returnSlot->name()
-			+ ".slot` has no exact compiler-owned slot-word provenance.");
+		return std::nullopt;
 
 	std::string tempName = storageRefKeyTempName(_snapshotOwner, _snapshots.size());
 	Json letStmt = Json::object();
@@ -5383,6 +5367,9 @@ std::optional<Json> exportStorageRefValue(Expression const& _expr)
 			}
 			return reference;
 		}
+		// Failure to simplify a path must not reject computed assembly slots.
+		// Keep the typed call and real callee body; exportExpr still rejects calls
+		// without a supported residual representation.
 		if (auto const* function = calledFunctionDefinition(*call))
 			if (hasSingleStorageReferenceReturn(*function))
 			{
@@ -5431,8 +5418,12 @@ bool hasResidualStorageRefRoot(Expression const& _expr)
 		std::vector<Json> probeSnapshots;
 		if (auto target = resolveStorageRefCallRoot(*call, *call, probeSnapshots))
 			return target->rootKind != StorageRefTarget::RootKind::StateField || target->snapshotAsTypedCall;
+		// An unresolved path can still be an exact typed call result, notably
+		// an assembly-computed `.slot` return. Match exportStorageRefValue's
+		// fallback so writes use storage_ref_set rather than a discarded
+		// functional update. Call export retains its fail-closed authority checks.
 		if (auto const* function = calledFunctionDefinition(*call))
-			return isResidualStorageRefFunction(*function);
+			return hasSingleStorageReferenceReturn(*function);
 	}
 	return false;
 }
@@ -14259,15 +14250,10 @@ Expression const* ozStorageRefSelfArgument(FunctionCall const& _call)
 // (`derivePrefix(structDef->name()) + member->name()`). Anything that does
 // not match this exact shape keeps failing closed.
 //
-// isNamespacedStorageGetter (above, used by body export) only needs to
-// confirm the STATEMENT SHAPE of a getter, because each `$.field`
-// substitution it performs is scoped to one call site and one field. This
-// oracle is different: once it resolves a local pointer to a field name,
-// EVERY write through that pointer for the rest of the function is
-// attributed to that field, so it additionally demands the getter's
-// `.slot :=` target be a compile-time CONSTANT — otherwise two different
-// calls to the "same" getter could alias different real storage locations,
-// and folding them into one named field would be unsound.
+// Body export and the write oracle share this constant-slot recognizer.
+// Statement shape alone cannot justify replacing a call with a named field:
+// computed slots may depend on arguments, and the assembly may have effects.
+// Such helpers retain their declarations and ordinary typed calls.
 bool isKnownNamespacedStorageGetter(FunctionDefinition const& _funcDef, StructDefinition const** _outStructDef)
 {
 	if (!isNamespacedStorageGetter(_funcDef, _outStructDef))
@@ -16292,7 +16278,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	for (FunctionDefinition const* function: contract.definedFunctions())
 	{
 		StructDefinition const* structDef = nullptr;
-		if (isNamespacedStorageGetter(*function, &structDef))
+		if (isKnownNamespacedStorageGetter(*function, &structDef))
 		{
 			std::string prefix = derivePrefix(structDef->name());
 			std::string fieldName = deriveSubStorageFieldName(structDef->name());
@@ -16314,7 +16300,7 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 		for (FunctionDefinition const* function: baseContract->definedFunctions())
 		{
 			StructDefinition const* structDef = nullptr;
-			if (isNamespacedStorageGetter(*function, &structDef))
+			if (isKnownNamespacedStorageGetter(*function, &structDef))
 			{
 				// Avoid duplicates
 				bool alreadyFound = false;
@@ -17486,12 +17472,6 @@ solcore::ExportArtifacts exportContract(CompilerStack const& _compilerStack, std
 	if (!enumDecls.empty())
 		solcore["enum_decls"] = std::move(enumDecls);
 
-	// Producer capability stamp: every legacy artifact identifies the exact
-	// measured row-set version. Consumers reject legacy artifacts where this
-	// stamp is absent or differs, and separately record it only when a
-	// codegen-divergent row is used.
-	if (!_compilerStack.viaIR())
-		solcore["evalOrderCommitment"] = EvalOrderCommitment;
 	Json origins = exportOrigins(contract);
 	for (auto const& [key, value]: metadata.items())
 		origins[key] = value;
