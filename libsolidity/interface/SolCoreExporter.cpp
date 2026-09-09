@@ -2123,6 +2123,35 @@ bool isTransientStateVar(VariableDeclaration const* _decl)
 /// storageLayout, separate EIP-1153 address space). nullopt when the layout
 /// is unavailable or the variable is not in it — callers must fail closed,
 /// never guess a slot.
+/// Slot and intra-slot byte offset of a contract-level
+/// state variable, taken from solc's own persistent storage layout (the same
+/// JSON `lookupStorageSlot` reads). The occupied width is NOT taken from that
+/// layout's `numberOfBytes`, which is the variable's total size (a 65535-entry
+/// array reports megabytes): the intra-slot width is `Type::storageBytes()`,
+/// exactly as `exportStructMemberField` uses, so whole-slot and reference
+/// typed variables report 32. nullopt when the layout or the variable is
+/// unavailable: consumers fail closed on absence and never re-derive a
+/// layout.
+std::optional<std::pair<std::string, int>> lookupStorageSlotOffset(
+	CompilerStack const& _compilerStack, ContractDefinition const& _contract, std::string const& _fieldName)
+{
+	try
+	{
+		Json const& layout = _compilerStack.storageLayout(_contract.fullyQualifiedName());
+		for (auto const& entry: layout.at("storage"))
+			if (entry.value("label", "") == _fieldName)
+			{
+				return std::make_pair(
+					entry.value("slot", std::string("0")),
+					entry.value("offset", 0));
+			}
+	}
+	catch (...)
+	{
+	}
+	return std::nullopt;
+}
+
 std::optional<std::pair<std::string, int>> lookupTransientSlotOffset(
 	CompilerStack const& _compilerStack, ContractDefinition const& _contract, std::string const& _fieldName)
 {
@@ -3428,6 +3457,28 @@ Json exportStorageField(
 	result["type"] = exportTypeName(_decl.typeName(), true);
 	if (auto slot = lookupStorageSlot(_compilerStack, _contract, _decl.name()))
 		result["storageSlot"] = *slot;
+	// Additive intra-slot placement, mirroring `exportStructMemberField`: the
+	// two are emitted together and omitted together, so a consumer either has
+	// solc's full packing for this variable or none of it. Without them a
+	// storage codec cannot tell two variables sharing a slot apart.
+	if (auto placement = lookupStorageSlotOffset(_compilerStack, _contract, _decl.name()))
+	{
+		Type const* declType = _decl.annotation().type ? _decl.annotation().type : _decl.type();
+		if (declType)
+			try
+			{
+				unsigned const width = declType->storageBytes();
+				if (width >= 1 && width <= 32)
+				{
+					result["byteOffset"] = placement->second;
+					result["byteWidth"] = static_cast<int>(width);
+				}
+			}
+			catch (...)
+			{
+				// No storage width for this type: omit both, fail closed.
+			}
+	}
 	return result;
 }
 
