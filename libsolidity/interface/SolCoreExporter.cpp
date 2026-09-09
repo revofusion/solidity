@@ -1901,6 +1901,11 @@ Json featureFlags()
 	flags["events"] = true;
 	flags["constructors"] = true;
 	flags["externalCalls"] = true;
+	// High-level external calls carry their `{value: ...}` option as an
+	// explicit `value` expression (literal `0` when absent). Artifacts
+	// without this flag predate the fix and silently modeled every
+	// `{value: ...}` call as zero-value.
+	flags["externalCallValue"] = true;
 	flags["multipleReturns"] = false;
 	flags["structs"] = false;
 	flags["enums"] = false;
@@ -5485,6 +5490,35 @@ exportExternalContractCall(FunctionCall const& _call, MemberAccess const& _membe
 	callExpr["args"] = Json::array();
 	for (Json& argument: evaluation.arguments)
 		callExpr["args"].emplace_back(std::move(argument));
+
+	// [call-value fidelity] A high-level external call may carry `{value: e}`.
+	// `exportCallEvaluation` already evaluated every option in source order,
+	// but emitting only the arguments dropped the transferred native value, so
+	// `IWETH9(WETH9).deposit{value: v}()` exported as a zero-value call and the
+	// generated model never moved the ether. Emit the value expression
+	// explicitly (literal `0` when the call carries none, matching the
+	// low-level `address.call{value: v}(data)` path), and refuse any option
+	// that is neither modeled here nor deliberately abstracted, so a future
+	// option cannot be silently discarded the same way.
+	//
+	// `gas` stays abstracted: its expression is still evaluated exactly once
+	// in source order by `exportCallEvaluation`, and the model does not meter
+	// gas, which is the same treatment `validateLowLevelCallOptions` documents
+	// for low-level `staticcall`.
+	Json callValue = u256Literal("0");
+	if (options)
+		for (size_t i = 0; i < options->names().size(); ++i)
+		{
+			std::string const& optionName = *options->names()[i];
+			if (optionName == "value")
+				callValue = std::move(evaluation.options[i]);
+			else if (optionName != "gas")
+				throw UnsupportedSolCore(
+					"High-level external call option `" + optionName
+					+ "` is not modeled; only `{value: ...}` (exported) and "
+					  "`{gas: ...}` (evaluated once, then abstracted) are supported.");
+		}
+	callExpr["value"] = std::move(callValue);
 
 	bool const statefulCall = callType->stateMutability() > StateMutability::View;
 	if (activeCompilerStack)
